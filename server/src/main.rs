@@ -1453,6 +1453,9 @@ fn scoped_collection_dir(local_root: &str, tenant: &str, database: &str, collect
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use tower::util::ServiceExt;
 
     fn mk_state_with_jobs(max_concurrent_jobs: Option<usize>, jobs: Vec<JobRecord>) -> AppState {
         let mut tenant_quotas = HashMap::new();
@@ -1584,5 +1587,110 @@ mod tests {
         assert_eq!(err.code, "quota_exceeded");
         assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
     }
+
+    fn mk_state_for_http(max_concurrent_jobs: Option<usize>, jobs: Vec<JobRecord>) -> AppState {
+        let mut api_key_subjects = HashMap::new();
+        api_key_subjects.insert("dev-key".to_string(), "dev-user".to_string());
+        let mut principals = HashMap::new();
+        principals.insert(
+            "dev-user".to_string(),
+            Principal {
+                subject: "dev-user".to_string(),
+                tenant_id: Some("dev".to_string()),
+                roles: HashSet::from(["tenant_admin".to_string()]),
+                scopes: HashSet::from(["read".to_string(), "write".to_string(), "admin".to_string()]),
+            },
+        );
+
+        let mut tenant_quotas = HashMap::new();
+        tenant_quotas.insert(
+            "dev".to_string(),
+            TenantQuota {
+                tenant: "dev".to_string(),
+                max_collections: None,
+                max_vectors: None,
+                max_disk_bytes: None,
+                max_concurrent_jobs,
+            },
+        );
+
+        let mut job_map = HashMap::new();
+        for j in jobs {
+            job_map.insert(j.job_id.clone(), j);
+        }
+
+        AppState {
+            auth: Arc::new(AuthStore {
+                api_key_subjects,
+                principals,
+                role_bindings: vec![RoleBinding {
+                    subject: "dev-user".to_string(),
+                    tenant: Some("dev".to_string()),
+                    database: Some("db".to_string()),
+                    collection: None,
+                    actions: HashSet::from(["read".to_string(), "write".to_string(), "admin".to_string()]),
+                }],
+            }),
+            quotas: Arc::new(QuotaStore {
+                tenant_quotas,
+                database_quotas: HashMap::new(),
+            }),
+            jobs: Arc::new(Mutex::new(JobStore { jobs: job_map, next_id: 2 })),
+            storage: StorageConfig {
+                uri: ".".to_string(),
+                local_root: ".".to_string(),
+                auth_store_path: "auth_store.json".to_string(),
+                quota_store_path: "quota_store.json".to_string(),
+                job_store_path: "job_store.json".to_string(),
+            },
+            job_worker_concurrency: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_usage_endpoint_returns_limits_and_usage() {
+        let state = mk_state_for_http(None, vec![mk_job("job_1", JobStatus::Queued)]);
+        let app = build_app(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/tenants/dev/databases/db/quota_usage")
+            .header("Authorization", "ApiKey dev-key")
+            .body(Body::empty())
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("request should execute");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(payload["tenant"], "dev");
+        assert_eq!(payload["database"], "db");
+        assert_eq!(payload["queued_jobs"], 1);
+        assert_eq!(payload["running_jobs"], 0);
+    }
+
+    #[tokio::test]
+    async fn compact_endpoint_enforces_job_quota() {
+        let state = mk_state_for_http(Some(1), vec![mk_job("job_1", JobStatus::Queued)]);
+        let app = build_app(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/tenants/dev/databases/db/collections/c1/compact")
+            .header("Authorization", "ApiKey dev-key")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"async": true}"#))
+            .expect("request build");
+        let resp = app.oneshot(req).await.expect("request should execute");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.expect("body bytes");
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(payload["error"]["code"], "quota_exceeded");
+    }
 }
+
+
+
+
 
