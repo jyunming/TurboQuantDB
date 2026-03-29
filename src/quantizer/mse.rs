@@ -41,54 +41,90 @@ impl MseQuantizer {
     pub fn quantize(&self, x: &Array1<f64>) -> Vec<usize> {
         assert_eq!(x.len(), self.d);
 
-        // Convert to nalgebra for matrix multiplication
-        let mut nalgebra_x = DMatrix::zeros(self.d, 1);
+        let mut x_mat = DMatrix::zeros(self.d, 1);
         for i in 0..self.d {
-            nalgebra_x[(i, 0)] = x[i];
+            x_mat[(i, 0)] = x[i];
         }
 
-        // y = Π * x
-        let y = &self.rotation * nalgebra_x;
-
-        // Quantize each coordinate using the codebook
-        let mut indices = Vec::with_capacity(self.d);
-        for i in 0..self.d {
-            let val = y[(i, 0)];
-            // Find nearest centroid
-            let mut min_dist = f64::MAX;
-            let mut min_idx = 0;
-            for (idx, &c) in self.centroids.iter().enumerate() {
-                let dist = (val - c).abs();
-                if dist < min_dist {
-                    min_dist = dist;
-                    min_idx = idx;
-                }
-            }
-            indices.push(min_idx);
-        }
-
-        indices
+        self.quantize_batch(&x_mat)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
     }
 
-    /// Dequantizes the index vector back to a real vector.
+    /// Quantizes a batch of vectors arranged as a (d, n) matrix.
+    /// Returns n vectors of centroid indices, each with length d.
+    pub fn quantize_batch(&self, xs: &DMatrix<f64>) -> Vec<Vec<usize>> {
+        assert_eq!(xs.nrows(), self.d);
+
+        let n = xs.ncols();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // y_batch = Pi * xs
+        let y_batch = &self.rotation * xs;
+
+        let mut all_indices = vec![vec![0usize; self.d]; n];
+        for col in 0..n {
+            for row in 0..self.d {
+                let val = y_batch[(row, col)];
+                all_indices[col][row] = self.nearest_centroid_index(val);
+            }
+        }
+
+        all_indices
+    }
+
+    fn nearest_centroid_index(&self, val: f64) -> usize {
+        let n = self.centroids.len();
+        if n == 0 {
+            return 0;
+        }
+        let pos = self.centroids.partition_point(|&c| c < val);
+        if pos == 0 {
+            0
+        } else if pos >= n {
+            n - 1
+        } else {
+            let lo = pos - 1;
+            let hi = pos;
+            if (val - self.centroids[lo]).abs() <= (self.centroids[hi] - val).abs() {
+                lo
+            } else {
+                hi
+            }
+        }
+    }
+
+    /// Dequantizes a single index vector back to a real vector.
     pub fn dequantize(&self, indices: &[usize]) -> Array1<f64> {
         assert_eq!(indices.len(), self.d);
+        let batch = vec![indices.to_vec()];
+        let x_tilde_batch = self.dequantize_batch(&batch);
 
-        // Construct y_tilde from codebook
-        let mut y_tilde = DMatrix::zeros(self.d, 1);
-        for i in 0..self.d {
-            y_tilde[(i, 0)] = self.centroids[indices[i]];
-        }
-
-        // x_tilde = Π^T * y_tilde
-        let x_tilde_nalg = self.rotation.transpose() * y_tilde;
-
-        // Convert back to ndarray
         let mut x_tilde = Array1::zeros(self.d);
         for i in 0..self.d {
-            x_tilde[i] = x_tilde_nalg[(i, 0)];
+            x_tilde[i] = x_tilde_batch[(i, 0)];
+        }
+        x_tilde
+    }
+
+    /// Dequantizes a batch of index vectors into a (d, n) matrix.
+    pub fn dequantize_batch(&self, indices_batch: &[Vec<usize>]) -> DMatrix<f64> {
+        let n = indices_batch.len();
+        if n == 0 {
+            return DMatrix::zeros(self.d, 0);
         }
 
-        x_tilde
+        let mut y_tilde_batch = DMatrix::zeros(self.d, n);
+        for (col, indices) in indices_batch.iter().enumerate() {
+            assert_eq!(indices.len(), self.d);
+            for row in 0..self.d {
+                y_tilde_batch[(row, col)] = self.centroids[indices[row]];
+            }
+        }
+
+        self.rotation.transpose() * y_tilde_batch
     }
 }
