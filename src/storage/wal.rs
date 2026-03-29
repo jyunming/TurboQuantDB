@@ -53,6 +53,12 @@ impl Wal {
             self.entry_count += 1;
         }
         self.writer.flush()?;
+        Ok(())
+    }
+
+
+    pub fn sync(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
         Ok(())
     }
@@ -60,8 +66,8 @@ impl Wal {
     pub fn replay<P: AsRef<Path>>(
         path: P,
     ) -> Result<Vec<WalEntry>, Box<dyn std::error::Error + Send + Sync>> {
-        use std::io::Read;
         let path = path.as_ref();
+        use std::io::Read;
         if !path.exists() {
             return Ok(Vec::new());
         }

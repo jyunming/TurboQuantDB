@@ -1,4 +1,5 @@
 use ndarray::Array1;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -391,7 +392,7 @@ impl TurboQuantEngine {
         records.sort_by(|a, b| a.id.cmp(&b.id));
         let indexed_ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
         let all_vectors: Vec<Array1<f64>> = indexed_ids
-            .iter()
+            .par_iter()
             .map(|id| {
                 self.live_vectors.get(id).cloned().unwrap_or_else(|| {
                     let r = &self.live_records[id];
@@ -547,14 +548,32 @@ impl TurboQuantEngine {
             })
             .collect();
 
+        for record in &records {
+            if record.is_deleted {
+                self.live_records.remove(&record.id);
+                self.live_vectors.remove(&record.id);
+                continue;
+            }
+            self.live_records.insert(record.id.clone(), record.clone());
+            self.live_vectors
+                .entry(record.id.clone())
+                .or_insert_with(|| {
+                    self.quantizer.dequantize(
+                        &record.quantized_indices,
+                        &record.qjl_bits,
+                        record.gamma as f64,
+                    )
+                });
+        }
+
         self.segments.flush_batch(records)?;
+        self.wal.sync()?;
         self.wal.truncate()?;
 
         if self.compactor.should_compact(self.segments.segments.len()) {
             self.compact_segments()?;
         }
 
-        self.rebuild_live_records_cache()?;
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_records.len() as u64;
         self.save_manifest()?;
@@ -619,12 +638,15 @@ impl TurboQuantEngine {
         let mut metadata_entries = Vec::with_capacity(items.len());
         let mut live_updates = Vec::with_capacity(items.len());
 
-        for item in items {
+        let vectors: Vec<Array1<f64>> = items.iter().map(|item| item.vector.clone()).collect();
+        let quantized: Vec<(Vec<usize>, Vec<i8>, f64)> =
+            self.quantizer.quantize_batch(&vectors);
+
+        for (item, (indices, qjl, gamma)) in items.into_iter().zip(quantized.into_iter()) {
             let meta = VectorMetadata {
                 properties: item.metadata,
                 document: item.document,
             };
-            let (indices, qjl, gamma) = self.quantizer.quantize(&item.vector);
             let metadata_json = serde_json::to_string(&meta)?;
             wal_entries.push(WalEntry {
                 id: item.id.clone(),
