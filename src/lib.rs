@@ -10,3 +10,4 @@ fn turboquantdb(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     python::register(py, m)?;
     Ok(())
 }
+
