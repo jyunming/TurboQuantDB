@@ -85,11 +85,16 @@ impl LiveCodesFile {
         Ok(())
     }
 
+    
     pub fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(mmap) = &self.mmap {
             mmap.flush()?;
         }
         Ok(())
+    }
+
+    pub fn release_mmap(&mut self) {
+        self.mmap = None; // needed on Windows before replacing the underlying file
     }
 
     pub fn len(&self) -> usize {
@@ -108,3 +113,5 @@ impl LiveCodesFile {
         Ok(())
     }
 }
+
+
