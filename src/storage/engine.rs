@@ -5,6 +5,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Arc as SharedStrArc;
 
 use super::backend::StorageBackend;
 use super::compaction::Compactor;
@@ -139,11 +140,11 @@ pub struct TurboQuantEngine {
     compactor: Compactor,
     local_dir: String,
 
-    index_ids: Vec<String>,
+    index_ids: Vec<SharedStrArc<str>>,
     ann_slots: Vec<u32>,
     live_codes: Vec<u8>,
-    live_slot_to_id: Vec<Option<String>>,
-    live_id_to_slot: HashMap<String, u32>,
+    live_slot_to_id: Vec<Option<SharedStrArc<str>>>,
+    live_id_to_slot: HashMap<SharedStrArc<str>, u32>,
     live_vectors: HashMap<String, Array1<f64>>,
     index_ids_dirty: bool,
     pending_manifest_updates: usize,
@@ -259,7 +260,11 @@ impl TurboQuantEngine {
             graph,
             compactor,
             local_dir: local_dir.to_string(),
-            index_ids: load_index_ids(local_dir).unwrap_or_default(),
+            index_ids: load_index_ids(local_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .map(SharedStrArc::<str>::from)
+                .collect(),
             ann_slots: Vec::new(),
             live_codes: Vec::new(),
             live_slot_to_id: Vec::new(),
@@ -305,7 +310,7 @@ impl TurboQuantEngine {
         metadata_props: HashMap<String, JsonValue>,
         document: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.live_id_to_slot.contains_key(&id) {
+        if self.live_id_to_slot.contains_key(id.as_str()) {
             return Err(format!("ID '{}' already exists; use upsert/update", id).into());
         }
         self.write_vector_entry(id, vector, metadata_props, document, false)
@@ -328,7 +333,7 @@ impl TurboQuantEngine {
         metadata_props: HashMap<String, JsonValue>,
         document: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self.live_id_to_slot.contains_key(&id) {
+        if !self.live_id_to_slot.contains_key(id.as_str()) {
             return Err(format!("ID '{}' does not exist; use insert/upsert", id).into());
         }
         self.write_vector_entry(id, vector, metadata_props, document, false)
@@ -359,11 +364,11 @@ impl TurboQuantEngine {
         &mut self,
         id: String,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        if !self.live_id_to_slot.contains_key(&id) {
+        if !self.live_id_to_slot.contains_key(id.as_str()) {
             return Ok(false);
         }
         let entry = WalEntry {
-            id: id.clone(),
+            id: id.to_string(),
             quantized_indices: Vec::new(),
             qjl_bits: Vec::new(),
             gamma: 0.0,
@@ -389,7 +394,7 @@ impl TurboQuantEngine {
         &self,
         id: &str,
     ) -> Result<Option<GetResult>, Box<dyn std::error::Error + Send + Sync>> {
-        if !self.live_id_to_slot.contains_key(id) {
+        if !self.live_id_to_slot.contains_key(id as &str) {
             return Ok(None);
         }
         let meta = self.metadata.get(id)?.unwrap_or_default();
@@ -415,13 +420,13 @@ impl TurboQuantEngine {
         }
         id_slot_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let indexed_ids: Vec<String> = id_slot_pairs.iter().map(|(id, _)| id.clone()).collect();
+        let indexed_ids: Vec<SharedStrArc<str>> = id_slot_pairs.iter().map(|(id, _)| id.clone()).collect();
         let indexed_slots: Vec<u32> = id_slot_pairs.iter().map(|(_, slot)| *slot).collect();
         let all_vectors: Vec<Array1<f64>> = indexed_ids
             .par_iter()
             .map(|id| {
-                self.live_vectors.get(id).cloned().unwrap_or_else(|| {
-                    let slot = self.live_id_to_slot[id] as usize;
+                self.live_vectors.get(id.as_ref()).cloned().unwrap_or_else(|| {
+                    let slot = self.live_id_to_slot[id.as_ref()] as usize;
                     let (indices, qjl, gamma) = self.live_codes_at_slot(slot);
                     self.quantizer.dequantize(indices, qjl, gamma as f64)
                 })
@@ -506,13 +511,13 @@ impl TurboQuantEngine {
 
             let ann_ids: Vec<String> = ann
                 .iter()
-                .map(|(node, _)| self.index_ids[*node as usize].clone())
+                .map(|(node, _)| self.index_ids[*node as usize].to_string())
                 .collect();
             let meta_map = self.metadata.get_many(&ann_ids)?;
 
             let mut out = Vec::with_capacity(ann.len());
             for (idx, (node, score)) in ann.into_iter().enumerate() {
-                let id = self.index_ids[node as usize].clone();
+                let id = self.index_ids[node as usize].to_string();
                 let meta = meta_map
                     .get(&ann_ids[idx])
                     .cloned()
@@ -534,23 +539,23 @@ impl TurboQuantEngine {
             return Ok(out);
         }
 
-        let live_ids: Vec<String> = self.live_id_to_slot.keys().cloned().collect();
+        let live_ids: Vec<String> = self.live_id_to_slot.keys().map(|id| id.to_string()).collect();
         let meta_map = self.metadata.get_many(&live_ids)?;
 
         let mut candidates = Vec::new();
         for (id, slot) in self.live_iter_id_slots() {
-            let meta = meta_map.get(&id).cloned().unwrap_or_default();
+            let meta = meta_map.get(id.as_ref()).cloned().unwrap_or_default();
             if let Some(f) = filter {
                 if !metadata_matches_filter(&meta.properties, f) {
                     continue;
                 }
             }
-            let v = self.live_vectors.get(&id).cloned().unwrap_or_else(|| {
+            let v = self.live_vectors.get(id.as_ref()).cloned().unwrap_or_else(|| {
                 let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
                 self.quantizer.dequantize(indices, qjl, gamma as f64)
             });
             candidates.push(SearchResult {
-                id: id.clone(),
+                id: id.to_string(),
                 score: self.score_vectors(query, &v),
                 metadata: meta.properties,
                 document: meta.document,
@@ -592,7 +597,7 @@ impl TurboQuantEngine {
                 continue;
             }
             self.live_alloc_or_update(
-                record.id.clone(),
+                record.id.clone().into(),
                 &record.quantized_indices,
                 &record.qjl_bits,
                 record.gamma,
@@ -687,7 +692,7 @@ impl TurboQuantEngine {
         (indices, qjl, gamma)
     }
 
-    fn live_alloc_slot(&mut self, id: String, indices: &[u8], qjl: &[u8], gamma: f32) -> u32 {
+    fn live_alloc_slot(&mut self, id: SharedStrArc<str>, indices: &[u8], qjl: &[u8], gamma: f32) -> u32 {
         let slot = self.live_slot_to_id.len() as u32;
         self.live_codes.extend_from_slice(indices);
         self.live_codes.extend_from_slice(qjl);
@@ -698,7 +703,7 @@ impl TurboQuantEngine {
         slot
     }
 
-    fn live_alloc_or_update(&mut self, id: String, indices: &[u8], qjl: &[u8], gamma: f32) -> u32 {
+    fn live_alloc_or_update(&mut self, id: SharedStrArc<str>, indices: &[u8], qjl: &[u8], gamma: f32) -> u32 {
         if let Some(&slot) = self.live_id_to_slot.get(&id) {
             let base = self.live_slot_base(slot as usize);
             let qjl_len = self.live_qjl_len();
@@ -724,7 +729,7 @@ impl TurboQuantEngine {
         }
     }
 
-    fn live_iter_id_slots(&self) -> Vec<(String, u32)> {
+    fn live_iter_id_slots(&self) -> Vec<(SharedStrArc<str>, u32)> {
         self.live_id_to_slot
             .iter()
             .map(|(id, slot)| (id.clone(), *slot))
@@ -734,8 +739,8 @@ impl TurboQuantEngine {
     fn live_compact_slab(&mut self) {
         let stride = self.live_stride();
         let mut new_codes = Vec::with_capacity(self.live_active_count() * stride);
-        let mut new_slots: Vec<Option<String>> = Vec::with_capacity(self.live_active_count());
-        let mut new_map: HashMap<String, u32> = HashMap::with_capacity(self.live_active_count());
+        let mut new_slots: Vec<Option<SharedStrArc<str>>> = Vec::with_capacity(self.live_active_count());
+        let mut new_map: HashMap<SharedStrArc<str>, u32> = HashMap::with_capacity(self.live_active_count());
 
         for (old_slot, maybe_id) in self.live_slot_to_id.iter().enumerate() {
             if let Some(id) = maybe_id {
@@ -791,10 +796,10 @@ impl TurboQuantEngine {
                 .into());
             }
             match mode {
-                BatchWriteMode::Insert if self.live_id_to_slot.contains_key(&item.id) => {
+                BatchWriteMode::Insert if self.live_id_to_slot.contains_key(item.id.as_str()) => {
                     return Err(format!("ID '{}' already exists; use upsert/update", item.id).into())
                 }
-                BatchWriteMode::Update if !self.live_id_to_slot.contains_key(&item.id) => {
+                BatchWriteMode::Update if !self.live_id_to_slot.contains_key(item.id.as_str()) => {
                     return Err(format!("ID '{}' does not exist; use insert/upsert", item.id).into())
                 }
                 _ => {}
@@ -831,7 +836,7 @@ impl TurboQuantEngine {
         self.wal_buffer.extend(wal_entries);
         self.metadata.put_many(&metadata_entries)?;
         for (id, indices, qjl, gamma) in live_updates {
-            self.live_alloc_or_update(id, &indices, &qjl, gamma);
+            self.live_alloc_or_update(SharedStrArc::<str>::from(id), &indices, &qjl, gamma);
         }
 
         self.invalidate_index_state()?;
@@ -863,7 +868,7 @@ impl TurboQuantEngine {
         };
 
         let entry = WalEntry {
-            id: id.clone(),
+            id: id.to_string(),
             quantized_indices: indices,
             qjl_bits: qjl,
             gamma: gamma as f32,
@@ -876,7 +881,7 @@ impl TurboQuantEngine {
 
         if !is_deleted {
             self.metadata.put(&id, &meta)?;
-            self.live_alloc_or_update(id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma);
+            self.live_alloc_or_update(SharedStrArc::<str>::from(id), &entry.quantized_indices, &entry.qjl_bits, entry.gamma);
         }
 
         self.invalidate_index_state()?;
@@ -894,7 +899,7 @@ impl TurboQuantEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut by_id: HashMap<String, SegmentRecord> = HashMap::new();
         for record in self.segments.iter_all_records()? {
-            by_id.insert(record.id.clone(), record);
+            by_id.insert(record.id.clone().into(), record);
         }
         for entry in &self.wal_buffer {
             by_id.insert(
@@ -918,7 +923,7 @@ impl TurboQuantEngine {
         let mut records: Vec<_> = by_id.into_values().collect();
         records.sort_by(|a, b| a.id.cmp(&b.id));
         for record in records {
-            self.live_alloc_or_update(record.id, &record.quantized_indices, &record.qjl_bits, record.gamma);
+            self.live_alloc_or_update(SharedStrArc::<str>::from(record.id), &record.quantized_indices, &record.qjl_bits, record.gamma);
         }
         Ok(())
     }
@@ -950,7 +955,7 @@ impl TurboQuantEngine {
         if self.index_ids_dirty {
             save_index_ids(&self.local_dir, &self.index_ids)?;
             self.backend
-                .write(INDEX_IDS_FILE, serde_json::to_vec_pretty(&self.index_ids)?)?;
+                .write(INDEX_IDS_FILE, serialize_index_ids(&self.index_ids)?)?;
             self.index_ids_dirty = false;
         }
 
@@ -988,7 +993,7 @@ impl TurboQuantEngine {
             .map(|(id, slot)| {
                 let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
                 SegmentRecord {
-                    id,
+                    id: id.to_string(),
                     quantized_indices: indices.to_vec(),
                     qjl_bits: qjl.to_vec(),
                     gamma,
@@ -1072,13 +1077,20 @@ fn load_quantizer_state(
 }
 fn save_index_ids(
     local_dir: &str,
-    ids: &[String],
+    ids: &[SharedStrArc<str>],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::write(
         format!("{}/{}", local_dir, INDEX_IDS_FILE),
-        serde_json::to_vec_pretty(ids)?,
+        serialize_index_ids(ids)?,
     )?;
     Ok(())
+}
+
+fn serialize_index_ids(
+    ids: &[SharedStrArc<str>],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let plain: Vec<&str> = ids.iter().map(|s| s.as_ref()).collect();
+    Ok(serde_json::to_vec_pretty(&plain)?)
 }
 
 fn load_index_ids(
@@ -1127,6 +1139,11 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
+
+
+
+
+
 
 
 
