@@ -63,19 +63,61 @@ impl Segment {
 
         let mut records = Vec::with_capacity(count);
         for _ in 0..count {
-            let mut len_buf = [0u8; 4];
-            if cursor.read_exact(&mut len_buf).is_err() {
-                break;
-            }
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut payload = vec![0u8; len];
-            if cursor.read_exact(&mut payload).is_err() {
-                break;
-            }
-            let record: SegmentRecord = bincode::deserialize(&payload)?;
+            let record = Self::read_one(&mut cursor)?;
             records.push(record);
         }
         Ok(records)
+    }
+
+    fn read_one<R: Read>(
+        reader: &mut R,
+    ) -> Result<SegmentRecord, Box<dyn std::error::Error + Send + Sync>> {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        reader.read_exact(&mut payload)?;
+        let record: SegmentRecord = bincode::deserialize(&payload)?;
+        Ok(record)
+    }
+}
+
+pub struct SegmentIterator<'a> {
+    backend: &'a StorageBackend,
+    segments: std::collections::vec_deque::VecDeque<Segment>,
+    current_cursor: Option<Cursor<Vec<u8>>>,
+    current_count: usize,
+    current_idx: usize,
+}
+
+impl<'a> Iterator for SegmentIterator<'a> {
+    type Item = Result<SegmentRecord, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(ref mut cursor) = self.current_cursor {
+                if self.current_idx < self.current_count {
+                    self.current_idx += 1;
+                    return Some(Segment::read_one(cursor));
+                }
+                self.current_cursor = None;
+            }
+
+            let next_seg = self.segments.pop_front()?;
+            match self.backend.read(&next_seg.name) {
+                Ok(data) => {
+                    let mut cursor = Cursor::new(data);
+                    let mut count_buf = [0u8; 8];
+                    if let Err(e) = cursor.read_exact(&mut count_buf) {
+                        return Some(Err(e.into()));
+                    }
+                    self.current_count = u64::from_le_bytes(count_buf) as usize;
+                    self.current_idx = 0;
+                    self.current_cursor = Some(cursor);
+                }
+                Err(e) => return Some(Err(e.into())),
+            }
+        }
     }
 }
 
@@ -179,6 +221,16 @@ impl SegmentManager {
             all.extend(records);
         }
         Ok(all)
+    }
+
+    pub fn iter_records_streaming(&self) -> SegmentIterator<'_> {
+        SegmentIterator {
+            backend: &self.backend,
+            segments: self.segments.clone().into(),
+            current_cursor: None,
+            current_count: 0,
+            current_idx: 0,
+        }
     }
 
     pub fn total_vectors(&self) -> usize {

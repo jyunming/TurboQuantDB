@@ -1,0 +1,108 @@
+use memmap2::{MmapMut, MmapOptions};
+use std::fs::{File, OpenOptions};
+use std::path::PathBuf;
+
+const GROW_SLOTS: usize = 4096;
+
+pub struct LiveCodesFile {
+    path: PathBuf,
+    file: File,
+    mmap: Option<MmapMut>,
+    stride: usize,
+    capacity: usize,
+    len: usize,
+}
+
+impl LiveCodesFile {
+    pub fn open(path: PathBuf, stride: usize) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)?;
+
+        let metadata = file.metadata()?;
+        let file_size = metadata.len() as usize;
+        let capacity = file_size / stride;
+        let len = capacity; // Assume existing file is fully in use initially
+
+        let mut live_codes = Self {
+            path,
+            file,
+            mmap: None,
+            stride,
+            capacity,
+            len,
+        };
+
+        if file_size > 0 {
+            live_codes.remap()?;
+        }
+
+        Ok(live_codes)
+    }
+
+    fn remap(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.mmap = None; // Drop old map
+        if self.capacity > 0 {
+            let mmap = unsafe { MmapOptions::new().map_mut(&self.file)? };
+            self.mmap = Some(mmap);
+        }
+        Ok(())
+    }
+
+    pub fn get_slot(&self, slot: usize) -> &[u8] {
+        let start = slot * self.stride;
+        let end = start + self.stride;
+        &self.mmap.as_ref().expect("mmap not initialized")[start..end]
+    }
+
+    pub fn get_slot_mut(&mut self, slot: usize) -> &mut [u8] {
+        let start = slot * self.stride;
+        let end = start + self.stride;
+        &mut self.mmap.as_mut().expect("mmap not initialized")[start..end]
+    }
+
+    pub fn alloc_slot(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        if self.len >= self.capacity {
+            let new_capacity = self.capacity + GROW_SLOTS;
+            self.file.set_len((new_capacity * self.stride) as u64)?;
+            self.capacity = new_capacity;
+            self.remap()?;
+        }
+        let slot = self.len;
+        self.len += 1;
+        Ok(slot)
+    }
+
+    pub fn truncate_to(&mut self, new_len: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.file.set_len((new_len * self.stride) as u64)?;
+        self.capacity = new_len;
+        self.len = new_len;
+        self.remap()?;
+        Ok(())
+    }
+
+    pub fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(mmap) = &self.mmap {
+            mmap.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.len * self.stride
+    }
+
+    pub fn clear(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.len = 0;
+        self.capacity = 0;
+        self.file.set_len(0)?;
+        self.mmap = None;
+        Ok(())
+    }
+}
