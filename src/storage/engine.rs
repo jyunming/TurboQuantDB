@@ -19,6 +19,9 @@ const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
 const INDEX_IDS_FILE: &str = "graph_ids.json";
 const MANIFEST_SAVE_INTERVAL_OPS: usize = 64;
 
+const LIVE_GAMMA_BYTES: usize = 4;
+const LIVE_DELETED_BYTES: usize = 1;
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DistanceMetric {
@@ -128,8 +131,10 @@ pub struct TurboQuantEngine {
     local_dir: String,
 
     index_ids: Vec<String>,
-    index_vectors: Vec<Array1<f64>>, // cached once per index build/open
-    live_records: HashMap<String, SegmentRecord>,
+    ann_slots: Vec<u32>,
+    live_codes: Vec<u8>,
+    live_slot_to_id: Vec<Option<String>>,
+    live_id_to_slot: HashMap<String, u32>,
     live_vectors: HashMap<String, Array1<f64>>,
     index_ids_dirty: bool,
     pending_manifest_updates: usize,
@@ -246,8 +251,10 @@ impl TurboQuantEngine {
             compactor,
             local_dir: local_dir.to_string(),
             index_ids: load_index_ids(local_dir).unwrap_or_default(),
-            index_vectors: Vec::new(),
-            live_records: HashMap::new(),
+            ann_slots: Vec::new(),
+            live_codes: Vec::new(),
+            live_slot_to_id: Vec::new(),
+            live_id_to_slot: HashMap::new(),
             live_vectors: HashMap::new(),
             index_ids_dirty: false,
             pending_manifest_updates: 0,
@@ -258,12 +265,12 @@ impl TurboQuantEngine {
             engine.wal_buffer.extend(pending);
             engine.flush_wal_to_segment()?;
         } else {
-            engine.rebuild_live_records_cache()?;
-            engine.manifest.vector_count = engine.live_records.len() as u64;
+            engine.rebuild_live_codes_cache()?;
+            engine.manifest.vector_count = engine.live_active_count() as u64;
             engine.save_manifest()?;
         }
+        engine.rebuild_ann_slots_from_index_ids();
 
-        engine.refresh_index_vectors_cache()?;
         save_quantizer_state(local_dir, &engine.backend, &engine.quantizer)?;
         if engine.manifest.quantizer.is_some() {
             engine.manifest.quantizer = None;
@@ -289,7 +296,7 @@ impl TurboQuantEngine {
         metadata_props: HashMap<String, JsonValue>,
         document: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.live_records.contains_key(&id) {
+        if self.live_id_to_slot.contains_key(&id) {
             return Err(format!("ID '{}' already exists; use upsert/update", id).into());
         }
         self.write_vector_entry(id, vector, metadata_props, document, false)
@@ -312,7 +319,7 @@ impl TurboQuantEngine {
         metadata_props: HashMap<String, JsonValue>,
         document: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self.live_records.contains_key(&id) {
+        if !self.live_id_to_slot.contains_key(&id) {
             return Err(format!("ID '{}' does not exist; use insert/upsert", id).into());
         }
         self.write_vector_entry(id, vector, metadata_props, document, false)
@@ -343,7 +350,7 @@ impl TurboQuantEngine {
         &mut self,
         id: String,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        if !self.live_records.contains_key(&id) {
+        if !self.live_id_to_slot.contains_key(&id) {
             return Ok(false);
         }
         let entry = WalEntry {
@@ -357,10 +364,10 @@ impl TurboQuantEngine {
         self.wal.append(&entry, false)?;
         self.wal_buffer.push(entry);
         self.metadata.delete(&id)?;
-        self.live_records.remove(&id);
+        self.live_delete_slot(&id);
         self.live_vectors.remove(&id);
         self.invalidate_index_state()?;
-        self.manifest.vector_count = self.live_records.len() as u64;
+        self.manifest.vector_count = self.live_active_count() as u64;
         self.pending_manifest_updates += 1;
         self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold {
@@ -373,7 +380,7 @@ impl TurboQuantEngine {
         &self,
         id: &str,
     ) -> Result<Option<GetResult>, Box<dyn std::error::Error + Send + Sync>> {
-        if !self.live_records.contains_key(id) {
+        if !self.live_id_to_slot.contains_key(id) {
             return Ok(None);
         }
         let meta = self.metadata.get(id)?.unwrap_or_default();
@@ -391,20 +398,23 @@ impl TurboQuantEngine {
         alpha: f64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
-        let mut records: Vec<SegmentRecord> = self.live_records.values().cloned().collect();
-        if records.is_empty() {
+        let mut id_slot_pairs = self.live_iter_id_slots();
+        if id_slot_pairs.is_empty() {
             self.invalidate_index_state()?;
             self.maybe_persist_state(true)?;
             return Ok(());
         }
-        records.sort_by(|a, b| a.id.cmp(&b.id));
-        let indexed_ids: Vec<String> = records.iter().map(|r| r.id.clone()).collect();
-        let all_vectors: Vec<Array1<f64>> = indexed_ids
+        id_slot_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let indexed_ids: Vec<String> = id_slot_pairs.iter().map(|(id, _)| id.clone()).collect();
+        let indexed_slots: Vec<u32> = id_slot_pairs.iter().map(|(_, slot)| *slot).collect();
+
+        let all_vectors: Vec<Array1<f64>> = id_slot_pairs
             .par_iter()
-            .map(|id| {
+            .map(|(id, slot)| {
                 self.live_vectors.get(id).cloned().unwrap_or_else(|| {
-                    let r = &self.live_records[id];
-                    self.quantizer.dequantize(&r.quantized_indices, &r.qjl_bits, r.gamma as f64)
+                    let (indices, qjl, gamma) = self.live_codes_at_slot(*slot as usize);
+                    self.quantizer.dequantize(indices, qjl, gamma as f64)
                 })
             })
             .collect();
@@ -415,10 +425,10 @@ impl TurboQuantEngine {
         };
 
         self.graph
-            .build(records.len(), max_degree, alpha, build_scorer)?;
+            .build(indexed_ids.len(), max_degree, alpha, build_scorer)?;
 
         self.index_ids = indexed_ids;
-        self.index_vectors = all_vectors;
+        self.ann_slots = indexed_slots;
         self.index_ids_dirty = true;
 
         self.manifest.index_state = Some(IndexState {
@@ -456,7 +466,7 @@ impl TurboQuantEngine {
         filter: Option<&HashMap<String, JsonValue>>,
         ann_search_list_size: Option<usize>,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
-        if self.live_records.is_empty() || top_k == 0 {
+        if self.live_id_to_slot.is_empty() || top_k == 0 {
             return Ok(Vec::new());
         }
 
@@ -468,11 +478,22 @@ impl TurboQuantEngine {
                     .map(|s| s.search_list_size)
                     .unwrap_or(100)
             });
-            let ann = self
-                .graph
-                .search(0, top_k, search_list_size.max(top_k.max(1)), |node| {
-                    self.score_vectors(query, &self.index_vectors[node as usize])
-                })?;
+            let ann = if matches!(self.metric, DistanceMetric::Ip) {
+                let prep = self.quantizer.prepare_ip_query(query);
+                self.graph.search(0, top_k, search_list_size.max(top_k.max(1)), |node| {
+                    let slot = self.ann_slots[node as usize];
+                    let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
+                    self.quantizer
+                        .score_ip_encoded(&prep, indices, qjl, gamma as f64)
+                })?
+            } else {
+                self.graph.search(0, top_k, search_list_size.max(top_k.max(1)), |node| {
+                    let slot = self.ann_slots[node as usize];
+                    let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
+                    let v = self.quantizer.dequantize(indices, qjl, gamma as f64);
+                    self.score_vectors(query, &v)
+                })?
+            };
 
             let ann_ids: Vec<String> = ann
                 .iter()
@@ -504,20 +525,20 @@ impl TurboQuantEngine {
             return Ok(out);
         }
 
-        let live_ids: Vec<String> = self.live_records.keys().cloned().collect();
+        let live_ids: Vec<String> = self.live_id_to_slot.keys().cloned().collect();
         let meta_map = self.metadata.get_many(&live_ids)?;
 
         let mut candidates = Vec::new();
-        for (id, record) in &self.live_records {
-            let meta = meta_map.get(id).cloned().unwrap_or_default();
+        for (id, slot) in self.live_iter_id_slots() {
+            let meta = meta_map.get(&id).cloned().unwrap_or_default();
             if let Some(f) = filter {
                 if !metadata_matches_filter(&meta.properties, f) {
                     continue;
                 }
             }
-            let v = self.live_vectors.get(id).cloned().unwrap_or_else(|| {
-                self.quantizer
-                    .dequantize(&record.quantized_indices, &record.qjl_bits, record.gamma as f64)
+            let v = self.live_vectors.get(&id).cloned().unwrap_or_else(|| {
+                let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
+                self.quantizer.dequantize(indices, qjl, gamma as f64)
             });
             candidates.push(SearchResult {
                 id: id.clone(),
@@ -557,13 +578,19 @@ impl TurboQuantEngine {
 
         for record in &records {
             if record.is_deleted {
-                self.live_records.remove(&record.id);
+                self.live_delete_slot(&record.id);
                 self.live_vectors.remove(&record.id);
                 continue;
             }
-            self.live_records.insert(record.id.clone(), record.clone());
+            self.live_alloc_or_update(
+                record.id.clone(),
+                &record.quantized_indices,
+                &record.qjl_bits,
+                record.gamma,
+            );
             self.live_vectors.remove(&record.id);
         }
+        self.live_compact_slab();
 
         self.segments.flush_batch(records)?;
         self.wal.truncate()?;
@@ -573,7 +600,7 @@ impl TurboQuantEngine {
         }
 
         self.invalidate_index_state()?;
-        self.manifest.vector_count = self.live_records.len() as u64;
+        self.manifest.vector_count = self.live_active_count() as u64;
         self.pending_manifest_updates += 1;
         self.maybe_persist_state(false)?;
         Ok(())
@@ -588,7 +615,7 @@ impl TurboQuantEngine {
     }
 
     pub fn vector_count(&self) -> u64 {
-        self.live_records.len() as u64
+        self.live_active_count() as u64
     }
 
     pub fn stats(&self) -> DbStats {
@@ -602,6 +629,119 @@ impl TurboQuantEngine {
             has_index: self.can_use_ann_index(),
             index_nodes: self.index_ids.len(),
         }
+    }
+
+    fn live_qjl_len(&self) -> usize {
+        self.d.div_ceil(8)
+    }
+
+    fn live_stride(&self) -> usize {
+        self.d + self.live_qjl_len() + LIVE_GAMMA_BYTES + LIVE_DELETED_BYTES
+    }
+
+    fn live_active_count(&self) -> usize {
+        self.live_id_to_slot.len()
+    }
+
+    fn live_slot_base(&self, slot: usize) -> usize {
+        slot * self.live_stride()
+    }
+
+    fn live_codes_at_slot(&self, slot: usize) -> (&[u8], &[u8], f32) {
+        let base = self.live_slot_base(slot);
+        let qjl_len = self.live_qjl_len();
+        let gamma_off = base + self.d + qjl_len;
+        let deleted_off = gamma_off + LIVE_GAMMA_BYTES;
+
+        let indices = &self.live_codes[base..base + self.d];
+        let qjl = &self.live_codes[base + self.d..base + self.d + qjl_len];
+        let gamma = f32::from_le_bytes(self.live_codes[gamma_off..gamma_off + 4].try_into().unwrap());
+        debug_assert_eq!(self.live_codes[deleted_off], 0u8);
+        (indices, qjl, gamma)
+    }
+
+    fn live_alloc_slot(&mut self, id: String, indices: &[u8], qjl: &[u8], gamma: f32) -> u32 {
+        let slot = self.live_slot_to_id.len() as u32;
+        self.live_codes.extend_from_slice(indices);
+        self.live_codes.extend_from_slice(qjl);
+        self.live_codes.extend_from_slice(&gamma.to_le_bytes());
+        self.live_codes.push(0u8);
+        self.live_id_to_slot.insert(id.clone(), slot);
+        self.live_slot_to_id.push(Some(id));
+        slot
+    }
+
+    fn live_alloc_or_update(&mut self, id: String, indices: &[u8], qjl: &[u8], gamma: f32) -> u32 {
+        if let Some(&slot) = self.live_id_to_slot.get(&id) {
+            let base = self.live_slot_base(slot as usize);
+            let qjl_len = self.live_qjl_len();
+            let gamma_off = base + self.d + qjl_len;
+            let deleted_off = gamma_off + LIVE_GAMMA_BYTES;
+            self.live_codes[base..base + self.d].copy_from_slice(indices);
+            self.live_codes[base + self.d..base + self.d + qjl_len].copy_from_slice(qjl);
+            self.live_codes[gamma_off..gamma_off + 4].copy_from_slice(&gamma.to_le_bytes());
+            self.live_codes[deleted_off] = 0u8;
+            self.live_slot_to_id[slot as usize] = Some(id);
+            slot
+        } else {
+            self.live_alloc_slot(id, indices, qjl, gamma)
+        }
+    }
+
+    fn live_delete_slot(&mut self, id: &str) {
+        if let Some(slot) = self.live_id_to_slot.remove(id) {
+            let base = self.live_slot_base(slot as usize);
+            let deleted_off = base + self.d + self.live_qjl_len() + LIVE_GAMMA_BYTES;
+            self.live_codes[deleted_off] = 1u8;
+            self.live_slot_to_id[slot as usize] = None;
+        }
+    }
+
+    fn live_iter_id_slots(&self) -> Vec<(String, u32)> {
+        self.live_id_to_slot
+            .iter()
+            .map(|(id, slot)| (id.clone(), *slot))
+            .collect()
+    }
+
+    fn live_compact_slab(&mut self) {
+        let stride = self.live_stride();
+        let mut new_codes = Vec::with_capacity(self.live_active_count() * stride);
+        let mut new_slots: Vec<Option<String>> = Vec::with_capacity(self.live_active_count());
+        let mut new_map: HashMap<String, u32> = HashMap::with_capacity(self.live_active_count());
+
+        for (old_slot, maybe_id) in self.live_slot_to_id.iter().enumerate() {
+            if let Some(id) = maybe_id {
+                let new_slot = new_slots.len() as u32;
+                new_map.insert(id.clone(), new_slot);
+                new_slots.push(Some(id.clone()));
+                let base = self.live_slot_base(old_slot);
+                new_codes.extend_from_slice(&self.live_codes[base..base + stride]);
+            }
+        }
+
+        self.live_codes = new_codes;
+        self.live_slot_to_id = new_slots;
+        self.live_id_to_slot = new_map;
+    }
+
+    fn rebuild_ann_slots_from_index_ids(&mut self) {
+        if self.index_ids.is_empty() {
+            self.ann_slots.clear();
+            return;
+        }
+        let mut slots = Vec::with_capacity(self.index_ids.len());
+        for id in &self.index_ids {
+            let Some(slot) = self.live_id_to_slot.get(id) else {
+                self.index_ids.clear();
+                self.ann_slots.clear();
+                self.manifest.index_state = None;
+                self.index_ids_dirty = true;
+                return;
+            };
+            slots.push(*slot);
+        }
+        self.ann_slots = slots;
     }
 
     fn write_many(
@@ -624,10 +764,10 @@ impl TurboQuantEngine {
                 .into());
             }
             match mode {
-                BatchWriteMode::Insert if self.live_records.contains_key(&item.id) => {
+                BatchWriteMode::Insert if self.live_id_to_slot.contains_key(&item.id) => {
                     return Err(format!("ID '{}' already exists; use upsert/update", item.id).into())
                 }
-                BatchWriteMode::Update if !self.live_records.contains_key(&item.id) => {
+                BatchWriteMode::Update if !self.live_id_to_slot.contains_key(&item.id) => {
                     return Err(format!("ID '{}' does not exist; use insert/upsert", item.id).into())
                 }
                 _ => {}
@@ -636,10 +776,10 @@ impl TurboQuantEngine {
 
         let mut wal_entries = Vec::with_capacity(items.len());
         let mut metadata_entries = Vec::with_capacity(items.len());
-        let mut live_updates = Vec::with_capacity(items.len());
+        let mut live_updates: Vec<(String, Vec<u8>, Vec<u8>, f32)> = Vec::with_capacity(items.len());
 
         let vectors: Vec<Array1<f64>> = items.iter().map(|item| item.vector.clone()).collect();
-        let quantized: Vec<(Vec<CodeIndex>, Vec<i8>, f64)> =
+        let quantized: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> =
             self.quantizer.quantize_batch(&vectors);
 
         for (item, (indices, qjl, gamma)) in items.into_iter().zip(quantized.into_iter()) {
@@ -657,28 +797,18 @@ impl TurboQuantEngine {
                 is_deleted: false,
             });
             metadata_entries.push((item.id.clone(), meta));
-            live_updates.push((
-                item.id,
-                SegmentRecord {
-                    id: wal_entries.last().unwrap().id.clone(),
-                    quantized_indices: indices,
-                    qjl_bits: qjl,
-                    gamma: gamma as f32,
-                    is_deleted: false,
-                },
-            ));
+            live_updates.push((item.id, indices, qjl, gamma as f32));
         }
 
         self.wal.append_batch(&wal_entries, false)?;
         self.wal_buffer.extend(wal_entries);
         self.metadata.put_many(&metadata_entries)?;
-        for (id, record) in live_updates {
-            self.live_records.insert(id, record);
+        for (id, indices, qjl, gamma) in live_updates {
+            self.live_alloc_or_update(id, &indices, &qjl, gamma);
         }
 
-
         self.invalidate_index_state()?;
-        self.manifest.vector_count = self.live_records.len() as u64;
+        self.manifest.vector_count = self.live_active_count() as u64;
         self.pending_manifest_updates += 1;
         self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold {
@@ -719,20 +849,11 @@ impl TurboQuantEngine {
 
         if !is_deleted {
             self.metadata.put(&id, &meta)?;
-            self.live_records.insert(
-                id,
-                SegmentRecord {
-                    id: entry.id,
-                    quantized_indices: entry.quantized_indices,
-                    qjl_bits: entry.qjl_bits,
-                    gamma: entry.gamma,
-                    is_deleted: false,
-                },
-            );
+            self.live_alloc_or_update(id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma);
         }
 
         self.invalidate_index_state()?;
-        self.manifest.vector_count = self.live_records.len() as u64;
+        self.manifest.vector_count = self.live_active_count() as u64;
         self.pending_manifest_updates += 1;
         self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold {
@@ -741,7 +862,7 @@ impl TurboQuantEngine {
         Ok(())
     }
 
-    fn rebuild_live_records_cache(
+    fn rebuild_live_codes_cache(
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut by_id: HashMap<String, SegmentRecord> = HashMap::new();
@@ -762,46 +883,27 @@ impl TurboQuantEngine {
         }
         by_id.retain(|_, r| !r.is_deleted);
 
-        self.live_records = by_id;
+        self.live_codes.clear();
+        self.live_slot_to_id.clear();
+        self.live_id_to_slot.clear();
         self.live_vectors.clear();
-        Ok(())
-    }
 
-    fn refresh_index_vectors_cache(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.index_vectors.clear();
-        if self.index_ids.is_empty() {
-            return Ok(());
+        let mut records: Vec<_> = by_id.into_values().collect();
+        records.sort_by(|a, b| a.id.cmp(&b.id));
+        for record in records {
+            self.live_alloc_or_update(record.id, &record.quantized_indices, &record.qjl_bits, record.gamma);
         }
-
-        let mut encoded = Vec::with_capacity(self.index_ids.len());
-        for id in &self.index_ids {
-            let Some(record) = self.live_records.get(id) else {
-                self.index_ids.clear();
-                self.manifest.index_state = None;
-                return Ok(());
-            };
-            encoded.push((
-                record.quantized_indices.clone(),
-                record.qjl_bits.clone(),
-                record.gamma as f64,
-            ));
-        }
-
-        self.index_vectors = self.quantizer.dequantize_batch(&encoded);
         Ok(())
     }
 
     fn invalidate_index_state(
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.index_ids.is_empty() && self.manifest.index_state.is_none() {
-            self.index_vectors.clear();
+        if self.index_ids.is_empty() && self.ann_slots.is_empty() && self.manifest.index_state.is_none() {
             return Ok(());
         }
         self.index_ids.clear();
-        self.index_vectors.clear();
+        self.ann_slots.clear();
         self.manifest.index_state = None;
         self.index_ids_dirty = true;
         Ok(())
@@ -833,7 +935,7 @@ impl TurboQuantEngine {
     fn can_use_ann_index(&self) -> bool {
         self.graph.has_index()
             && !self.index_ids.is_empty()
-            && self.index_ids.len() == self.index_vectors.len()
+            && self.index_ids.len() == self.ann_slots.len()
             && self
                 .manifest
                 .index_state
@@ -853,7 +955,20 @@ impl TurboQuantEngine {
             .map(|s| s.name.clone())
             .collect();
 
-        let mut live_records: Vec<SegmentRecord> = self.live_records.values().cloned().collect();
+        let mut live_records: Vec<SegmentRecord> = self
+            .live_iter_id_slots()
+            .into_iter()
+            .map(|(id, slot)| {
+                let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
+                SegmentRecord {
+                    id,
+                    quantized_indices: indices.to_vec(),
+                    qjl_bits: qjl.to_vec(),
+                    gamma,
+                    is_deleted: false,
+                }
+            })
+            .collect();
         live_records.sort_by(|a, b| a.id.cmp(&b.id));
 
         let new_segment_name = self.segments.next_segment_name();
@@ -984,6 +1099,7 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
+
 
 
 
