@@ -464,6 +464,7 @@ impl TurboQuantEngine {
         }
         new_codes.flush()?; drop(new_codes);
         let final_path = Path::new(&self.local_dir).join("live_codes.bin");
+        self.live_codes.release_mmap();
         std::fs::rename(temp_path, &final_path)?;
         self.live_codes = LiveCodesFile::open(final_path, stride)?;
         self.id_pool = new_pool;
