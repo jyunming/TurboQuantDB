@@ -5,7 +5,6 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Arc as SharedStrArc;
 
 use super::backend::StorageBackend;
 use super::compaction::Compactor;
@@ -141,11 +140,11 @@ pub struct TurboQuantEngine {
     compactor: Compactor,
     local_dir: String,
 
-    index_ids: Vec<SharedStrArc<str>>,
+    index_ids: Vec<u32>,
     ann_slots: Vec<u32>,
     live_codes: Vec<u8>,
     id_pool: IdPool,
-    live_vectors: HashMap<String, Array1<f64>>,
+    live_vectors: HashMap<u32, Array1<f64>>,
     index_ids_dirty: bool,
     pending_manifest_updates: usize,
 }
@@ -260,11 +259,7 @@ impl TurboQuantEngine {
             graph,
             compactor,
             local_dir: local_dir.to_string(),
-            index_ids: load_index_ids(local_dir)
-                .unwrap_or_default()
-                .into_iter()
-                .map(SharedStrArc::<str>::from)
-                .collect(),
+            index_ids: load_index_ids(local_dir).unwrap_or_default(),
             ann_slots: Vec::new(),
             live_codes: Vec::new(),
             id_pool: IdPool::new(),
@@ -376,9 +371,13 @@ impl TurboQuantEngine {
         };
         self.wal.append(&entry, false)?;
         self.wal_buffer.push(entry);
-        self.metadata.delete(&id)?;
+        if let Some(slot) = self.id_pool.get_slot(&id) {
+            self.metadata.delete(slot)?;
+        }
         self.live_delete_slot(&id);
-        self.live_vectors.remove(&id);
+        if let Some(slot) = self.id_pool.get_slot(&id) {
+            self.live_vectors.remove(&slot);
+        }
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
         self.pending_manifest_updates += 1;
@@ -393,10 +392,10 @@ impl TurboQuantEngine {
         &self,
         id: &str,
     ) -> Result<Option<GetResult>, Box<dyn std::error::Error + Send + Sync>> {
-        if self.id_pool.get_slot(id).is_none() {
+        let Some(slot) = self.id_pool.get_slot(id) else {
             return Ok(None);
-        }
-        let meta = self.metadata.get(id)?.unwrap_or_default();
+        };
+        let meta = self.metadata.get(slot)?.unwrap_or_default();
         Ok(Some(GetResult {
             id: id.to_string(),
             metadata: meta.properties,
@@ -419,16 +418,11 @@ impl TurboQuantEngine {
         }
         id_slot_pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let indexed_ids: Vec<SharedStrArc<str>> = id_slot_pairs
-            .iter()
-            .map(|(id, _)| SharedStrArc::<str>::from(id.clone()))
-            .collect();
         let indexed_slots: Vec<u32> = id_slot_pairs.iter().map(|(_, slot)| *slot).collect();
         let all_vectors: Vec<Array1<f64>> = indexed_slots
             .par_iter()
             .map(|slot| {
-                let id = self.id_pool.get_str(*slot).unwrap_or("");
-                self.live_vectors.get(id).cloned().unwrap_or_else(|| {
+                self.live_vectors.get(slot).cloned().unwrap_or_else(|| {
                     let (indices, qjl, gamma) = self.live_codes_at_slot(*slot as usize);
                     self.quantizer.dequantize(indices, qjl, gamma as f64)
                 })
@@ -441,9 +435,9 @@ impl TurboQuantEngine {
         };
 
         self.graph
-            .build(indexed_ids.len(), max_degree, alpha, build_scorer)?;
+            .build(indexed_slots.len(), max_degree, alpha, build_scorer)?;
 
-        self.index_ids = indexed_ids;
+        self.index_ids = indexed_slots.clone();
         self.ann_slots = indexed_slots;
         self.index_ids_dirty = true;
 
@@ -511,17 +505,18 @@ impl TurboQuantEngine {
                 })?
             };
 
-            let ann_ids: Vec<String> = ann
+            let ann_slots: Vec<u32> = ann
                 .iter()
-                .map(|(node, _)| self.index_ids[*node as usize].to_string())
+                .map(|(node, _)| self.index_ids[*node as usize])
                 .collect();
-            let meta_map = self.metadata.get_many(&ann_ids)?;
+            let meta_map = self.metadata.get_many(&ann_slots)?;
 
             let mut out = Vec::with_capacity(ann.len());
             for (idx, (node, score)) in ann.into_iter().enumerate() {
-                let id = self.index_ids[node as usize].to_string();
+                let slot = self.index_ids[node as usize];
+                let id = self.id_pool.get_str(slot).unwrap_or("").to_string();
                 let meta = meta_map
-                    .get(&ann_ids[idx])
+                    .get(&ann_slots[idx])
                     .cloned()
                     .unwrap_or_default();
                 out.push(SearchResult {
@@ -541,18 +536,18 @@ impl TurboQuantEngine {
             return Ok(out);
         }
 
-        let live_ids: Vec<String> = self.live_iter_id_slots().into_iter().map(|(id, _)| id).collect();
-        let meta_map = self.metadata.get_many(&live_ids)?;
+        let live_slots: Vec<u32> = self.live_iter_id_slots().into_iter().map(|(_, slot)| slot).collect();
+        let meta_map = self.metadata.get_many(&live_slots)?;
 
         let mut candidates = Vec::new();
         for (id, slot) in self.live_iter_id_slots() {
-            let meta = meta_map.get(&id).cloned().unwrap_or_default();
+            let meta = meta_map.get(&slot).cloned().unwrap_or_default();
             if let Some(f) = filter {
                 if !metadata_matches_filter(&meta.properties, f) {
                     continue;
                 }
             }
-            let v = self.live_vectors.get(&id).cloned().unwrap_or_else(|| {
+            let v = self.live_vectors.get(&slot).cloned().unwrap_or_else(|| {
                 let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
                 self.quantizer.dequantize(indices, qjl, gamma as f64)
             });
@@ -595,7 +590,9 @@ impl TurboQuantEngine {
         for record in &records {
             if record.is_deleted {
                 self.live_delete_slot(&record.id);
-                self.live_vectors.remove(&record.id);
+                if let Some(slot) = self.id_pool.get_slot(&record.id) {
+                    self.live_vectors.remove(&slot);
+                }
                 continue;
             }
             self.live_alloc_or_update(
@@ -604,7 +601,9 @@ impl TurboQuantEngine {
                 &record.qjl_bits,
                 record.gamma,
             );
-            self.live_vectors.remove(&record.id);
+            if let Some(slot) = self.id_pool.get_slot(&record.id) {
+                self.live_vectors.remove(&slot);
+            }
         }
         self.live_compact_slab();
 
@@ -753,18 +752,16 @@ impl TurboQuantEngine {
             self.ann_slots.clear();
             return;
         }
-        let mut slots = Vec::with_capacity(self.index_ids.len());
-        for id in &self.index_ids {
-            let Some(slot) = self.id_pool.get_slot(id.as_ref()) else {
+        for slot in &self.index_ids {
+            if self.id_pool.get_str(*slot).is_none() {
                 self.index_ids.clear();
                 self.ann_slots.clear();
                 self.manifest.index_state = None;
                 self.index_ids_dirty = true;
                 return;
-            };
-            slots.push(slot);
+            }
         }
-        self.ann_slots = slots;
+        self.ann_slots = self.index_ids.clone();
     }
 
     fn write_many(
@@ -798,8 +795,8 @@ impl TurboQuantEngine {
         }
 
         let mut wal_entries = Vec::with_capacity(items.len());
-        let mut metadata_entries = Vec::with_capacity(items.len());
-        let mut live_updates: Vec<(String, Vec<u8>, Vec<u8>, f32)> = Vec::with_capacity(items.len());
+        let mut metadata_entries: Vec<(u32, VectorMetadata)> = Vec::with_capacity(items.len());
+        let mut live_updates: Vec<(String, Vec<u8>, Vec<u8>, f32, VectorMetadata)> = Vec::with_capacity(items.len());
 
         let vectors: Vec<Array1<f64>> = items.iter().map(|item| item.vector.clone()).collect();
         let quantized: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> =
@@ -819,16 +816,16 @@ impl TurboQuantEngine {
                 metadata_json,
                 is_deleted: false,
             });
-            metadata_entries.push((item.id.clone(), meta));
-            live_updates.push((item.id, indices, qjl, gamma as f32));
+            live_updates.push((item.id, indices, qjl, gamma as f32, meta));
         }
 
         self.wal.append_batch(&wal_entries, false)?;
         self.wal_buffer.extend(wal_entries);
-        self.metadata.put_many(&metadata_entries)?;
-        for (id, indices, qjl, gamma) in live_updates {
-            self.live_alloc_or_update(&id, &indices, &qjl, gamma);
+        for (id, indices, qjl, gamma, meta) in live_updates {
+            let slot = self.live_alloc_or_update(&id, &indices, &qjl, gamma);
+            metadata_entries.push((slot, meta));
         }
+        self.metadata.put_many(&metadata_entries)?;
 
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
@@ -871,8 +868,8 @@ impl TurboQuantEngine {
         self.wal_buffer.push(entry.clone());
 
         if !is_deleted {
-            self.metadata.put(&id, &meta)?;
-            self.live_alloc_or_update(&id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma);
+            let slot = self.live_alloc_or_update(&id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma);
+            self.metadata.put(slot, &meta)?;
         }
 
         self.invalidate_index_state()?;
@@ -1067,7 +1064,7 @@ fn load_quantizer_state(
 }
 fn save_index_ids(
     local_dir: &str,
-    ids: &[SharedStrArc<str>],
+    ids: &[u32],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::write(
         format!("{}/{}", local_dir, INDEX_IDS_FILE),
@@ -1077,15 +1074,14 @@ fn save_index_ids(
 }
 
 fn serialize_index_ids(
-    ids: &[SharedStrArc<str>],
+    ids: &[u32],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let plain: Vec<&str> = ids.iter().map(|s| s.as_ref()).collect();
-    Ok(serde_json::to_vec_pretty(&plain)?)
+    Ok(serde_json::to_vec_pretty(ids)?)
 }
 
 fn load_index_ids(
     local_dir: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
     let local = format!("{}/{}", local_dir, INDEX_IDS_FILE);
     if Path::new(&local).exists() {
         let raw = std::fs::read(&local)?;
@@ -1129,4 +1125,18 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
