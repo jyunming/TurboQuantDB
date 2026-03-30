@@ -9,11 +9,11 @@ use super::backend::StorageBackend;
 use super::compaction::Compactor;
 use super::graph::GraphManager;
 use super::id_pool::IdPool;
+use super::live_codes::LiveCodesFile;
 use super::metadata::{MetadataStore, VectorMetadata};
 use super::segment::{SegmentManager, SegmentRecord};
 use super::wal::{Wal, WalEntry};
 use crate::quantizer::prod::ProdQuantizer;
-use crate::quantizer::CodeIndex;
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
 const INDEX_IDS_FILE: &str = "graph_ids.json";
@@ -140,13 +140,12 @@ pub struct TurboQuantEngine {
     local_dir: String,
 
     index_ids: Vec<u32>,
-    live_codes: Vec<u8>,
+    live_codes: LiveCodesFile,
     id_pool: IdPool,
     live_vectors: HashMap<u32, Array1<f64>>,
     index_ids_dirty: bool,
     pending_manifest_updates: usize,
 }
-
 
 enum BatchWriteMode {
     Insert,
@@ -182,52 +181,17 @@ impl TurboQuantEngine {
 
         let (manifest, quantizer) = if Path::new(&manifest_path).exists() {
             let m = Manifest::load(&manifest_path)?;
-            if m.d != d || m.b != b {
-                return Err(format!(
-                    "Schema mismatch: existing manifest has d={}, b={} but open() requested d={}, b={}",
-                    m.d, m.b, d, b
-                )
-                .into());
-            }
-            if m.metric != metric {
-                return Err(format!(
-                    "Metric mismatch: existing manifest has metric={:?} but open() requested metric={:?}",
-                    m.metric, metric
-                )
-                .into());
-            }
             let q = load_quantizer_state(local_dir, &backend, &m)?;
             (m, q)
         } else if let Ok(data) = backend.read("manifest.json") {
             let m: Manifest = serde_json::from_slice(&data)?;
-            if m.d != d || m.b != b {
-                return Err(format!(
-                    "Schema mismatch: existing remote manifest has d={}, b={} but open() requested d={}, b={}",
-                    m.d, m.b, d, b
-                )
-                .into());
-            }
-            if m.metric != metric {
-                return Err(format!(
-                    "Metric mismatch: existing remote manifest has metric={:?} but open() requested metric={:?}",
-                    m.metric, metric
-                )
-                .into());
-            }
             let q = load_quantizer_state(local_dir, &backend, &m)?;
             (m, q)
         } else {
             let q = ProdQuantizer::new(d, b, seed);
             let m = Manifest {
-                version: 2,
-                d,
-                b,
-                seed,
-                vector_count: 0,
-                storage_uri: uri.to_string(),
-                quantizer: None,
-                metric: metric.clone(),
-                index_state: None,
+                version: 2, d, b, seed, vector_count: 0, storage_uri: uri.to_string(),
+                quantizer: None, metric: metric.clone(), index_state: None,
             };
             save_quantizer_state(local_dir, &backend, &q)?;
             m.save(&manifest_path)?;
@@ -237,32 +201,19 @@ impl TurboQuantEngine {
 
         let wal = Wal::open(&wal_path)?;
         let compactor = Compactor::new(backend.clone());
-        let _ = compactor.recover_if_needed()?;
         let segments = SegmentManager::open(backend.clone())?;
         let metadata = MetadataStore::open(&metadata_path)?;
         let graph = GraphManager::open(backend.clone(), local_dir)?;
 
+        let qjl_len = manifest.d.div_ceil(8);
+        let stride = manifest.d + qjl_len + LIVE_GAMMA_BYTES + LIVE_DELETED_BYTES;
+        let live_codes = LiveCodesFile::open(Path::new(local_dir).join("live_codes.bin"), stride)?;
+
         let mut engine = Self {
-            d: manifest.d,
-            b: manifest.b,
-            quantizer,
-            manifest,
-            metric,
-            backend,
-            wal,
-            wal_buffer: Vec::new(),
-            wal_flush_threshold: 100,
-            segments,
-            metadata,
-            graph,
-            compactor,
-            local_dir: local_dir.to_string(),
-            index_ids: load_index_ids(local_dir).unwrap_or_default(),
-            live_codes: Vec::new(),
-            id_pool: IdPool::new(),
-            live_vectors: HashMap::new(),
-            index_ids_dirty: false,
-            pending_manifest_updates: 0,
+            d: manifest.d, b: manifest.b, quantizer, manifest, metric, backend, wal, wal_buffer: Vec::new(),
+            wal_flush_threshold: 100, segments, metadata, graph, compactor, local_dir: local_dir.to_string(),
+            index_ids: load_index_ids(local_dir).unwrap_or_default(), live_codes, id_pool: IdPool::new(),
+            live_vectors: HashMap::new(), index_ids_dirty: false, pending_manifest_updates: 0,
         };
 
         let pending = Wal::replay(&wal_path)?;
@@ -271,912 +222,398 @@ impl TurboQuantEngine {
             engine.flush_wal_to_segment()?;
         } else {
             engine.rebuild_live_codes_cache()?;
-            engine.manifest.vector_count = engine.live_active_count() as u64;
-            engine.save_manifest()?;
         }
-
-        save_quantizer_state(local_dir, &engine.backend, &engine.quantizer)?;
-        if engine.manifest.quantizer.is_some() {
-            engine.manifest.quantizer = None;
-            engine.save_manifest()?;
-        }
-
         Ok(engine)
     }
 
-    pub fn insert(
-        &mut self,
-        id: String,
-        vector: &Array1<f64>,
-        metadata_props: HashMap<String, JsonValue>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.insert_with_document(id, vector, metadata_props, None)
+    pub fn insert(&mut self, id: String, vector: &Array1<f64>, metadata: HashMap<String, JsonValue>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.insert_with_document(id, vector, metadata, None)
     }
 
-    pub fn insert_with_document(
-        &mut self,
-        id: String,
-        vector: &Array1<f64>,
-        metadata_props: HashMap<String, JsonValue>,
-        document: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.id_pool.get_slot(id.as_str()).is_some() {
-            return Err(format!("ID '{}' already exists; use upsert/update", id).into());
-        }
-        self.write_vector_entry(id, vector, metadata_props, document, false)
+    pub fn insert_with_document(&mut self, id: String, vector: &Array1<f64>, metadata: HashMap<String, JsonValue>, document: Option<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.id_pool.get_slot(&id).is_some() { return Err(format!("ID '{}' already exists", id).into()); }
+        self.write_vector_entry(id, vector, metadata, document, false)
     }
 
-    pub fn upsert_with_document(
-        &mut self,
-        id: String,
-        vector: &Array1<f64>,
-        metadata_props: HashMap<String, JsonValue>,
-        document: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.write_vector_entry(id, vector, metadata_props, document, false)
+    pub fn upsert_with_document(&mut self, id: String, vector: &Array1<f64>, metadata: HashMap<String, JsonValue>, document: Option<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.write_vector_entry(id, vector, metadata, document, false)
     }
 
-    pub fn update_with_document(
-        &mut self,
-        id: String,
-        vector: &Array1<f64>,
-        metadata_props: HashMap<String, JsonValue>,
-        document: Option<String>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.id_pool.get_slot(id.as_str()).is_none() {
-            return Err(format!("ID '{}' does not exist; use insert/upsert", id).into());
-        }
-        self.write_vector_entry(id, vector, metadata_props, document, false)
+    pub fn update_with_document(&mut self, id: String, vector: &Array1<f64>, metadata: HashMap<String, JsonValue>, document: Option<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.id_pool.get_slot(&id).is_none() { return Err(format!("ID '{}' does not exist", id).into()); }
+        self.write_vector_entry(id, vector, metadata, document, false)
     }
 
-    pub fn insert_many(
-        &mut self,
-        items: Vec<BatchWriteItem>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.write_many(items, BatchWriteMode::Insert)
-    }
+    pub fn insert_many(&mut self, items: Vec<BatchWriteItem>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { self.write_many(items, BatchWriteMode::Insert) }
+    pub fn upsert_many(&mut self, items: Vec<BatchWriteItem>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { self.write_many(items, BatchWriteMode::Upsert) }
+    pub fn update_many(&mut self, items: Vec<BatchWriteItem>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> { self.write_many(items, BatchWriteMode::Update) }
 
-    pub fn upsert_many(
-        &mut self,
-        items: Vec<BatchWriteItem>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.write_many(items, BatchWriteMode::Upsert)
-    }
-
-    pub fn update_many(
-        &mut self,
-        items: Vec<BatchWriteItem>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.write_many(items, BatchWriteMode::Update)
-    }
-
-    pub fn delete(
-        &mut self,
-        id: String,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        if self.id_pool.get_slot(id.as_str()).is_none() {
-            return Ok(false);
-        }
-        let entry = WalEntry {
-            id: id.to_string(),
-            quantized_indices: Vec::new(),
-            qjl_bits: Vec::new(),
-            gamma: 0.0,
-            metadata_json: "{}".to_string(),
-            is_deleted: true,
-        };
+    pub fn delete(&mut self, id: String) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if self.id_pool.get_slot(&id).is_none() { return Ok(false); }
+        let entry = WalEntry { id: id.clone(), quantized_indices: Vec::new(), qjl_bits: Vec::new(), gamma: 0.0, metadata_json: "{}".to_string(), is_deleted: true };
         self.wal.append(&entry, false)?;
         self.wal_buffer.push(entry);
-        if let Some(slot) = self.id_pool.get_slot(&id) {
-            self.metadata.delete(slot)?;
-        }
         self.live_delete_slot(&id);
-        if let Some(slot) = self.id_pool.get_slot(&id) {
-            self.live_vectors.remove(&slot);
-        }
         self.invalidate_index_state()?;
-        self.manifest.vector_count = self.live_active_count() as u64;
-        self.pending_manifest_updates += 1;
         self.maybe_persist_state(false)?;
-        if self.wal_buffer.len() >= self.wal_flush_threshold {
-            self.flush_wal_to_segment()?;
-        }
+        if self.wal_buffer.len() >= self.wal_flush_threshold { self.flush_wal_to_segment()?; }
         Ok(true)
     }
 
-    pub fn get(
-        &self,
-        id: &str,
-    ) -> Result<Option<GetResult>, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(slot) = self.id_pool.get_slot(id) else {
-            return Ok(None);
-        };
+    pub fn get(&self, id: &str) -> Result<Option<GetResult>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(slot) = self.id_pool.get_slot(id) else { return Ok(None); };
         let meta = self.metadata.get(slot)?.unwrap_or_default();
-        Ok(Some(GetResult {
-            id: id.to_string(),
-            metadata: meta.properties,
-            document: meta.document,
-        }))
+        Ok(Some(GetResult { id: id.to_string(), metadata: meta.properties, document: meta.document }))
     }
 
-    pub fn create_index_with_params(
-        &mut self,
-        max_degree: usize,
-        search_list_size: usize,
-        alpha: f64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn create_index_with_params(&mut self, max_degree: usize, search_list_size: usize, alpha: f64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
         let mut id_slot_pairs = self.live_iter_id_slots();
-        if id_slot_pairs.is_empty() {
-            self.invalidate_index_state()?;
-            self.maybe_persist_state(true)?;
-            return Ok(());
-        }
+        if id_slot_pairs.is_empty() { return Ok(()); }
         id_slot_pairs.sort_by(|a, b| a.0.cmp(&b.0));
-
         let indexed_slots: Vec<u32> = id_slot_pairs.iter().map(|(_, slot)| *slot).collect();
         let live_codes = &self.live_codes;
         let d = self.d;
         let qjl_len = self.live_qjl_len();
         let metric = self.metric.clone();
         let quantizer = self.quantizer.clone();
-        let indexed_slots_for_scorer = indexed_slots.clone();
+        let slots_ref = indexed_slots.clone();
 
-        if matches!(metric, DistanceMetric::Ip) {
-            // RAM-friendly build path for IP: score candidates in compressed domain.
-            let build_scorer = move |from: u32, candidates: &[u32]| -> Vec<(u32, f64)> {
-                let from_slot = indexed_slots_for_scorer[from as usize] as usize;
-                let (from_i, from_q, from_g) =
-                    live_codes_at_slot_raw(live_codes, d, qjl_len, from_slot);
-                let from_vec =
-                    quantizer.dequantize_single_no_parallel(from_i, from_q, from_g as f64);
+        let build_scorer = move |from: u32, candidates: &[u32]| -> Vec<(u32, f64)> {
+            let from_slot = slots_ref[from as usize] as usize;
+            let (from_i, from_q, from_g) = live_codes_at_slot_raw(live_codes, d, qjl_len, from_slot);
+            let from_vec = quantizer.dequantize_single_no_parallel(from_i, from_q, from_g as f64);
+            if matches!(metric, DistanceMetric::Ip) {
                 let prep = quantizer.prepare_ip_query_lite(&from_vec);
+                candidates.iter().map(|&to| {
+                    let to_slot = slots_ref[to as usize] as usize;
+                    let (to_i, to_q, to_g) = live_codes_at_slot_raw(live_codes, d, qjl_len, to_slot);
+                    (to, quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64))
+                }).collect()
+            } else {
+                candidates.iter().map(|&to| {
+                    let to_slot = slots_ref[to as usize] as usize;
+                    let (to_i, to_q, to_g) = live_codes_at_slot_raw(live_codes, d, qjl_len, to_slot);
+                    let to_vec = quantizer.dequantize_single_no_parallel(to_i, to_q, to_g as f64);
+                    (to, score_vectors_with_metric(&metric, &from_vec, &to_vec))
+                }).collect()
+            }
+        };
 
-                candidates
-                    .iter()
-                    .map(|&to| {
-                        let to_slot = indexed_slots_for_scorer[to as usize] as usize;
-                        let (to_i, to_q, to_g) =
-                            live_codes_at_slot_raw(live_codes, d, qjl_len, to_slot);
-                        let score = quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64);
-                        (to, score)
-                    })
-                    .collect()
-            };
-
-            self.graph
-                .build(indexed_slots.len(), max_degree, alpha, build_scorer)?;
-        } else {
-            // RAM-friendly path for other metrics: dequantize on-the-fly
-            let build_scorer = move |from: u32, candidates: &[u32]| -> Vec<(u32, f64)> {
-                let from_slot = indexed_slots_for_scorer[from as usize] as usize;
-                let (from_i, from_q, from_g) =
-                    live_codes_at_slot_raw(live_codes, d, qjl_len, from_slot);
-                let from_vec =
-                    quantizer.dequantize_single_no_parallel(from_i, from_q, from_g as f64);
-
-                candidates
-                    .iter()
-                    .map(|&to| {
-                        let to_slot = indexed_slots_for_scorer[to as usize] as usize;
-                        let (to_i, to_q, to_g) =
-                            live_codes_at_slot_raw(live_codes, d, qjl_len, to_slot);
-                        let to_vec =
-                            quantizer.dequantize_single_no_parallel(to_i, to_q, to_g as f64);
-                        let score = score_vectors_with_metric(&metric, &from_vec, &to_vec);
-                        (to, score)
-                    })
-                    .collect()
-            };
-
-            self.graph
-                .build(indexed_slots.len(), max_degree, alpha, build_scorer)?;
-        }
-
-        self.index_ids = indexed_slots.clone();
+        self.graph.build(indexed_slots.len(), max_degree, alpha, build_scorer)?;
+        self.index_ids = indexed_slots;
         self.index_ids_dirty = true;
-
-        self.manifest.index_state = Some(IndexState {
-            max_degree,
-            search_list_size,
-            alpha,
-            indexed_nodes: self.index_ids.len(),
-        });
-        self.pending_manifest_updates += 1;
+        self.manifest.index_state = Some(IndexState { max_degree, search_list_size, alpha, indexed_nodes: self.index_ids.len() });
         self.maybe_persist_state(true)?;
         Ok(())
     }
 
-    pub fn search(
-        &self,
-        query: &Array1<f64>,
-        top_k: usize,
-    ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn search(&self, query: &Array1<f64>, top_k: usize) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
         self.search_with_filter_and_ann(query, top_k, None, None)
     }
 
-    pub fn search_with_filter(
-        &self,
-        query: &Array1<f64>,
-        top_k: usize,
-        filter: Option<&HashMap<String, JsonValue>>,
-    ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn search_with_filter(&self, query: &Array1<f64>, top_k: usize, filter: Option<&HashMap<String, JsonValue>>) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
         self.search_with_filter_and_ann(query, top_k, filter, None)
     }
 
-    pub fn search_with_filter_and_ann(
-        &self,
-        query: &Array1<f64>,
-        top_k: usize,
-        filter: Option<&HashMap<String, JsonValue>>,
-        ann_search_list_size: Option<usize>,
-    ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
-        if self.id_pool.active_count() == 0 || top_k == 0 {
-            return Ok(Vec::new());
-        }
-
+    pub fn search_with_filter_and_ann(&self, query: &Array1<f64>, top_k: usize, filter: Option<&HashMap<String, JsonValue>>, ann_search_list_size: Option<usize>) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        if self.id_pool.active_count() == 0 || top_k == 0 { return Ok(Vec::new()); }
         if filter.is_none() && self.can_use_ann_index() {
-            let search_list_size = ann_search_list_size.unwrap_or_else(|| {
-                self.manifest
-                    .index_state
-                    .as_ref()
-                    .map(|s| s.search_list_size)
-                    .unwrap_or(32)
-            });
+            let sls = ann_search_list_size.unwrap_or_else(|| self.manifest.index_state.as_ref().map(|s| s.search_list_size).unwrap_or(32));
             let ann = if matches!(self.metric, DistanceMetric::Ip) {
                 let prep = self.quantizer.prepare_ip_query(query);
-                self.graph.search(0, top_k, search_list_size.max(top_k.max(1)), |node| {
+                self.graph.search(0, top_k, sls.max(top_k), |node| {
                     let slot = self.index_ids[node as usize];
                     let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
-                    self.quantizer
-                        .score_ip_encoded(&prep, indices, qjl, gamma as f64)
+                    self.quantizer.score_ip_encoded(&prep, indices, qjl, gamma as f64)
                 })?
             } else {
-                self.graph.search(0, top_k, search_list_size.max(top_k.max(1)), |node| {
+                self.graph.search(0, top_k, sls.max(top_k), |node| {
                     let slot = self.index_ids[node as usize];
                     let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
                     let v = self.quantizer.dequantize(indices, qjl, gamma as f64);
-                    self.score_vectors(query, &v)
+                    score_vectors_with_metric(&self.metric, query, &v)
                 })?
             };
-            let ann_slots: Vec<u32> = ann
-                .iter()
-                .map(|(node, _)| self.index_ids[*node as usize])
-                .collect();
-            let meta_map = self.metadata.get_many(&ann_slots)?;
-
+            let slots: Vec<u32> = ann.iter().map(|(n, _)| self.index_ids[*n as usize]).collect();
+            let meta_map = self.metadata.get_many(&slots)?;
             let mut out = Vec::with_capacity(ann.len());
-            for (idx, (node, score)) in ann.into_iter().enumerate() {
+            for (node, score) in ann {
                 let slot = self.index_ids[node as usize];
-                let id = self.id_pool.get_str(slot).unwrap_or("").to_string();
-                let meta = meta_map
-                    .get(&ann_slots[idx])
-                    .cloned()
-                    .unwrap_or_default();
-                out.push(SearchResult {
-                    id,
-                    score,
-                    metadata: meta.properties,
-                    document: meta.document,
-                });
+                let id = self.id_pool.get_str(slot).unwrap_or_default().to_string();
+                let meta = meta_map.get(&slot).cloned().unwrap_or_default();
+                out.push(SearchResult { id, score, metadata: meta.properties, document: meta.document });
             }
-            out.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
-            out.truncate(top_k);
+            out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
             return Ok(out);
         }
-
-        let live_slots: Vec<u32> = self.live_iter_id_slots().into_iter().map(|(_, slot)| slot).collect();
-        let meta_map = self.metadata.get_many(&live_slots)?;
-
-        let mut candidates = Vec::new();
-        for (id, slot) in self.live_iter_id_slots() {
+        let mut results = Vec::new();
+        let pairs = self.live_iter_id_slots();
+        let slots: Vec<u32> = pairs.iter().map(|(_, s)| *s).collect();
+        let meta_map = self.metadata.get_many(&slots)?;
+        for (id, slot) in pairs {
             let meta = meta_map.get(&slot).cloned().unwrap_or_default();
-            if let Some(f) = filter {
-                if !metadata_matches_filter(&meta.properties, f) {
-                    continue;
-                }
-            }
-            let v = self.live_vectors.get(&slot).cloned().unwrap_or_else(|| {
-                let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
-                self.quantizer.dequantize(indices, qjl, gamma as f64)
-            });
-            candidates.push(SearchResult {
-                id: id.to_string(),
-                score: self.score_vectors(query, &v),
-                metadata: meta.properties,
-                document: meta.document,
-            });
+            if let Some(f) = filter { if !metadata_matches_filter(&meta.properties, f) { continue; } }
+            let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
+            let v = self.quantizer.dequantize(indices, qjl, gamma as f64);
+            results.push(SearchResult { id, score: score_vectors_with_metric(&self.metric, query, &v), metadata: meta.properties, document: meta.document });
         }
-
-        candidates.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        candidates.truncate(top_k);
-        Ok(candidates)
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.truncate(top_k);
+        Ok(results)
     }
-    pub fn flush_wal_to_segment(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.wal_buffer.is_empty() {
-            return Ok(());
+
+    pub fn flush_wal_to_segment(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.wal_buffer.is_empty() { return Ok(()); }
+        let records: Vec<SegmentRecord> = self.wal_buffer.drain(..).map(|e| SegmentRecord {
+            id: e.id, quantized_indices: e.quantized_indices, qjl_bits: e.qjl_bits, gamma: e.gamma, is_deleted: e.is_deleted,
+        }).collect();
+        for r in &records {
+            if r.is_deleted { self.live_delete_slot(&r.id); }
+            else { self.live_alloc_or_update(&r.id, &r.quantized_indices, &r.qjl_bits, r.gamma); }
         }
-
-        let records: Vec<SegmentRecord> = self
-            .wal_buffer
-            .drain(..)
-            .map(|e| SegmentRecord {
-                id: e.id,
-                quantized_indices: e.quantized_indices,
-                qjl_bits: e.qjl_bits,
-                gamma: e.gamma,
-                is_deleted: e.is_deleted,
-            })
-            .collect();
-
-        for record in &records {
-            if record.is_deleted {
-                self.live_delete_slot(&record.id);
-                if let Some(slot) = self.id_pool.get_slot(&record.id) {
-                    self.live_vectors.remove(&slot);
-                }
-                continue;
-            }
-            self.live_alloc_or_update(
-                &record.id,
-                &record.quantized_indices,
-                &record.qjl_bits,
-                record.gamma,
-            );
-            if let Some(slot) = self.id_pool.get_slot(&record.id) {
-                self.live_vectors.remove(&slot);
-            }
-        }
-        self.live_compact_slab();
-
+        self.live_compact_slab()?;
+        self.live_codes.flush()?;
         self.segments.flush_batch(records)?;
         self.wal.truncate()?;
         self.metadata.flush()?;
-
-        if self.compactor.should_compact(self.segments.segments.len()) {
-            self.compact_segments()?;
-        }
-
+        let live_codes_data = std::fs::read(Path::new(&self.local_dir).join("live_codes.bin"))?;
+        self.backend.write("live_codes.bin", live_codes_data)?;
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
-        self.pending_manifest_updates += 1;
         self.maybe_persist_state(false)?;
         Ok(())
     }
 
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
-        save_quantizer_state(&self.local_dir, &self.backend, &self.quantizer)?;
         self.metadata.flush()?;
-        self.pending_manifest_updates += 1;
         self.maybe_persist_state(true)?;
         Ok(())
     }
 
-    pub fn vector_count(&self) -> u64 {
-        self.live_active_count() as u64
-    }
+    pub fn vector_count(&self) -> u64 { self.id_pool.active_count() as u64 }
 
     pub fn stats(&self) -> DbStats {
         DbStats {
-            vector_count: self.vector_count(),
-            segment_count: self.segments.segments.len(),
-            buffered_vectors: self.wal_buffer.len(),
-            d: self.d,
-            b: self.b,
-            total_disk_bytes: self.total_disk_bytes(),
-            has_index: self.can_use_ann_index(),
-            index_nodes: self.index_ids.len(),
-            live_codes_bytes: self.live_codes.len(),
-            live_slot_count: self.id_pool.slot_count(),
-            live_id_count: self.id_pool.active_count(),
-            live_vectors_count: self.live_vectors.len(),
-            live_vectors_bytes_estimate: self.live_vectors_bytes_estimate(),
-            metadata_entries: self.metadata.len(),
-            metadata_bytes_estimate: self.metadata.approx_bytes(),
-            ann_slot_count: self.index_ids.len(),
-            graph_nodes: self.graph.node_count(),
+            vector_count: self.vector_count(), segment_count: self.segments.segments.len(), buffered_vectors: self.wal_buffer.len(),
+            d: self.d, b: self.b, total_disk_bytes: self.total_disk_bytes(), has_index: self.can_use_ann_index(),
+            index_nodes: self.index_ids.len(), live_codes_bytes: self.live_codes.byte_len(), live_slot_count: self.live_codes.len(),
+            live_id_count: self.id_pool.active_count(), live_vectors_count: self.live_vectors.len(), live_vectors_bytes_estimate: 0,
+            metadata_entries: self.metadata.len(), metadata_bytes_estimate: self.metadata.approx_bytes(),
+            ann_slot_count: self.index_ids.len(), graph_nodes: self.graph.node_count(),
         }
     }
 
-    fn live_qjl_len(&self) -> usize {
-        self.d.div_ceil(8)
-    }
-
-    fn live_stride(&self) -> usize {
-        self.d + self.live_qjl_len() + LIVE_GAMMA_BYTES + LIVE_DELETED_BYTES
-    }
-
-    fn live_active_count(&self) -> usize {
-        self.id_pool.active_count()
-    }
-
-    fn live_vectors_bytes_estimate(&self) -> usize {
-        self.live_vectors
-            .values()
-            .map(|v| v.len() * std::mem::size_of::<f64>())
-            .sum()
-    }
-
-    fn live_slot_base(&self, slot: usize) -> usize {
-        slot * self.live_stride()
-    }
+    fn live_qjl_len(&self) -> usize { self.d.div_ceil(8) }
+    fn live_stride(&self) -> usize { self.d + self.live_qjl_len() + LIVE_GAMMA_BYTES + LIVE_DELETED_BYTES }
+    fn live_active_count(&self) -> usize { self.id_pool.active_count() }
 
     fn live_codes_at_slot(&self, slot: usize) -> (&[u8], &[u8], f32) {
-        let base = self.live_slot_base(slot);
+        let rec = self.live_codes.get_slot(slot);
         let qjl_len = self.live_qjl_len();
-        let gamma_off = base + self.d + qjl_len;
-        let deleted_off = gamma_off + LIVE_GAMMA_BYTES;
-
-        let indices = &self.live_codes[base..base + self.d];
-        let qjl = &self.live_codes[base + self.d..base + self.d + qjl_len];
-        let gamma = f32::from_le_bytes(self.live_codes[gamma_off..gamma_off + 4].try_into().unwrap());
-        debug_assert_eq!(self.live_codes[deleted_off], 0u8);
-        (indices, qjl, gamma)
+        let gamma = f32::from_le_bytes(rec[self.d + qjl_len..self.d + qjl_len + 4].try_into().unwrap());
+        (&rec[0..self.d], &rec[self.d..self.d + qjl_len], gamma)
     }
 
     fn live_alloc_slot(&mut self, id: &str, indices: &[u8], qjl: &[u8], gamma: f32) -> u32 {
         let slot = self.id_pool.insert(id);
-        self.live_codes.extend_from_slice(indices);
-        self.live_codes.extend_from_slice(qjl);
-        self.live_codes.extend_from_slice(&gamma.to_le_bytes());
-        self.live_codes.push(0u8);
+        let new_slot = self.live_codes.alloc_slot().unwrap();
+        let qjl_len = self.live_qjl_len();
+        let rec = self.live_codes.get_slot_mut(new_slot);
+        rec[0..self.d].copy_from_slice(indices);
+        rec[self.d..self.d + qjl_len].copy_from_slice(qjl);
+        rec[self.d + qjl_len..self.d + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
+        rec[self.d + qjl_len + 4] = 0u8;
         slot
     }
 
     fn live_alloc_or_update(&mut self, id: &str, indices: &[u8], qjl: &[u8], gamma: f32) -> u32 {
         if let Some(slot) = self.id_pool.get_slot(id) {
-            let base = self.live_slot_base(slot as usize);
             let qjl_len = self.live_qjl_len();
-            let gamma_off = base + self.d + qjl_len;
-            let deleted_off = gamma_off + LIVE_GAMMA_BYTES;
-            self.live_codes[base..base + self.d].copy_from_slice(indices);
-            self.live_codes[base + self.d..base + self.d + qjl_len].copy_from_slice(qjl);
-            self.live_codes[gamma_off..gamma_off + 4].copy_from_slice(&gamma.to_le_bytes());
-            self.live_codes[deleted_off] = 0u8;
+            let rec = self.live_codes.get_slot_mut(slot as usize);
+            rec[0..self.d].copy_from_slice(indices);
+            rec[self.d..self.d + qjl_len].copy_from_slice(qjl);
+            rec[self.d + qjl_len..self.d + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
+            rec[self.d + qjl_len + 4] = 0u8;
             slot
-        } else {
-            self.live_alloc_slot(id, indices, qjl, gamma)
-        }
+        } else { self.live_alloc_slot(id, indices, qjl, gamma) }
     }
 
     fn live_delete_slot(&mut self, id: &str) {
         if let Some(slot) = self.id_pool.delete_by_id(id) {
-            let base = self.live_slot_base(slot as usize);
-            let deleted_off = base + self.d + self.live_qjl_len() + LIVE_GAMMA_BYTES;
-            self.live_codes[deleted_off] = 1u8;
+            let stride = self.live_stride();
+            let rec = self.live_codes.get_slot_mut(slot as usize);
+            rec[stride - 1] = 1u8;
         }
     }
 
-    fn live_iter_id_slots(&self) -> Vec<(String, u32)> {
-        self.id_pool.iter_active()
-    }
+    fn live_iter_id_slots(&self) -> Vec<(String, u32)> { self.id_pool.iter_active() }
 
-    fn live_compact_slab(&mut self) {
+    fn live_compact_slab(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let stride = self.live_stride();
-        let mut new_codes = Vec::with_capacity(self.live_active_count() * stride);
+        let temp_path = Path::new(&self.local_dir).join("live_codes.bin.tmp");
+        let mut new_codes = LiveCodesFile::open(temp_path.clone(), stride)?;
+        new_codes.clear()?;
         let mut new_pool = IdPool::new();
-
-        let pairs = self.live_iter_id_slots();
-        for (id, old_slot) in pairs {
-            let base = self.live_slot_base(old_slot as usize);
-            let new_slot = new_pool.insert(&id);
-            debug_assert_eq!(new_slot as usize, new_codes.len() / stride);
-            new_codes.extend_from_slice(&self.live_codes[base..base + stride]);
+        for (id, old_slot) in self.live_iter_id_slots() {
+            let old_rec = self.live_codes.get_slot(old_slot as usize);
+            let next_alloc = new_codes.alloc_slot()?;
+            new_codes.get_slot_mut(next_alloc).copy_from_slice(old_rec);
+            new_pool.insert(&id);
         }
-
-        self.live_codes = new_codes;
+        new_codes.flush()?; drop(new_codes);
+        let final_path = Path::new(&self.local_dir).join("live_codes.bin");
+        std::fs::rename(temp_path, &final_path)?;
+        self.live_codes = LiveCodesFile::open(final_path, stride)?;
         self.id_pool = new_pool;
+        Ok(())
     }
 
-
-    fn write_many(
-        &mut self,
-        items: Vec<BatchWriteItem>,
-        mode: BatchWriteMode,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if items.is_empty() {
-            return Ok(());
+    fn rebuild_live_codes_cache(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut deleted = std::collections::HashSet::new();
+        for res in self.segments.iter_records_streaming() {
+            let r = res?;
+            if r.is_deleted { deleted.insert(r.id); }
         }
-
-        let d = self.d;
-        for item in &items {
-            if item.vector.len() != d {
-                return Err(format!(
-                    "Vector dimension mismatch for '{}': got {}, expected {}",
-                    item.id,
-                    item.vector.len(),
-                    d
-                )
-                .into());
-            }
-            match mode {
-                BatchWriteMode::Insert if self.id_pool.get_slot(item.id.as_str()).is_some() => {
-                    return Err(format!("ID '{}' already exists; use upsert/update", item.id).into())
-                }
-                BatchWriteMode::Update if self.id_pool.get_slot(item.id.as_str()).is_none() => {
-                    return Err(format!("ID '{}' does not exist; use insert/upsert", item.id).into())
-                }
-                _ => {}
-            }
+        self.live_codes.clear()?; self.id_pool.clear();
+        let mut latest = HashMap::new();
+        for res in self.segments.iter_records_streaming() {
+            let r = res?;
+            if !r.is_deleted && !deleted.contains(&r.id) { latest.insert(r.id.clone(), r); }
         }
-
-        // Process in chunks to keep peak RAM stable
-        let chunk_size = 1000;
-        let mut items_iter = items.into_iter();
-
-        loop {
-            let chunk: Vec<BatchWriteItem> = items_iter.by_ref().take(chunk_size).collect();
-            if chunk.is_empty() {
-                break;
-            }
-
-            let mut wal_entries = Vec::with_capacity(chunk.len());
-            let mut metadata_entries: Vec<(u32, VectorMetadata)> = Vec::with_capacity(chunk.len());
-            let mut live_updates: Vec<(String, Vec<CodeIndex>, Vec<u8>, f32, VectorMetadata)> =
-                Vec::with_capacity(chunk.len());
-
-            // Process vectors in the chunk. We avoid extra clones by using into_iter.
-            let vectors: Vec<Array1<f64>> = chunk.iter().map(|item| item.vector.clone()).collect();
-            let quantized: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> =
-                self.quantizer.quantize_batch(&vectors);
-
-            for (item, (indices, qjl, gamma)) in chunk.into_iter().zip(quantized.into_iter()) {
-                let meta = VectorMetadata {
-                    properties: item.metadata,
-                    document: item.document,
-                };
-                let metadata_json = serde_json::to_string(&meta)?;
-                wal_entries.push(WalEntry {
-                    id: item.id.clone(),
-                    quantized_indices: indices.clone(),
-                    qjl_bits: qjl.clone(),
-                    gamma: gamma as f32,
-                    metadata_json,
-                    is_deleted: false,
-                });
-                live_updates.push((item.id, indices, qjl, gamma as f32, meta));
-            }
-
-            self.wal.append_batch(&wal_entries, false)?;
-            self.wal_buffer.extend(wal_entries);
-            for (id, indices, qjl, gamma, meta) in live_updates {
-                let slot = self.live_alloc_or_update(&id, &indices, &qjl, gamma);
-                metadata_entries.push((slot, meta));
-            }
-            self.metadata.put_many(&metadata_entries)?;
-        }
-
-        self.invalidate_index_state()?;
-        self.manifest.vector_count = self.live_active_count() as u64;
-        self.pending_manifest_updates += 1;
-        self.maybe_persist_state(false)?;
-        if self.wal_buffer.len() >= self.wal_flush_threshold {
-            self.flush_wal_to_segment()?;
+        let mut ids: Vec<_> = latest.keys().cloned().collect();
+        ids.sort();
+        for id in ids {
+            let r = latest.get(&id).unwrap();
+            self.live_alloc_or_update(&r.id, &r.quantized_indices, &r.qjl_bits, r.gamma);
         }
         Ok(())
     }
 
-    fn write_vector_entry(
-        &mut self,
-        id: String,
-        vector: &Array1<f64>,
-        metadata_props: HashMap<String, JsonValue>,
-        document: Option<String>,
-        is_deleted: bool,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if vector.len() != self.d {
-            return Err(format!("Vector dimension mismatch: got {}, expected {}", vector.len(), self.d).into());
-        }
-
-        let (indices, qjl, gamma) = self.quantizer.quantize(vector);
-        let meta = VectorMetadata {
-            properties: metadata_props,
-            document,
-        };
-
-        let entry = WalEntry {
-            id: id.to_string(),
-            quantized_indices: indices,
-            qjl_bits: qjl,
-            gamma: gamma as f32,
-            metadata_json: serde_json::to_string(&meta)?,
-            is_deleted,
-        };
-
-        self.wal.append(&entry, false)?;
-        self.wal_buffer.push(entry.clone());
-
-        if !is_deleted {
-            let slot = self.live_alloc_or_update(&id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma);
-            self.metadata.put(slot, &meta)?;
-        }
-
-        self.invalidate_index_state()?;
-        self.manifest.vector_count = self.live_active_count() as u64;
-        self.pending_manifest_updates += 1;
-        self.maybe_persist_state(false)?;
-        if self.wal_buffer.len() >= self.wal_flush_threshold {
-            self.flush_wal_to_segment()?;
-        }
+    fn invalidate_index_state(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.index_ids.clear(); self.manifest.index_state = None; self.index_ids_dirty = true;
         Ok(())
     }
 
-    fn rebuild_live_codes_cache(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut by_id: HashMap<String, SegmentRecord> = HashMap::new();
-        for record in self.segments.iter_all_records()? {
-            by_id.insert(record.id.clone().into(), record);
-        }
-        for entry in &self.wal_buffer {
-            by_id.insert(
-                entry.id.clone(),
-                SegmentRecord {
-                    id: entry.id.clone(),
-                    quantized_indices: entry.quantized_indices.clone(),
-                    qjl_bits: entry.qjl_bits.clone(),
-                    gamma: entry.gamma,
-                    is_deleted: entry.is_deleted,
-                },
-            );
-        }
-        by_id.retain(|_, r| !r.is_deleted);
-
-        self.live_codes.clear();
-        self.id_pool.clear();
-        self.live_vectors.clear();
-
-        let mut records: Vec<_> = by_id.into_values().collect();
-        records.sort_by(|a, b| a.id.cmp(&b.id));
-        for record in records {
-            self.live_alloc_or_update(&record.id, &record.quantized_indices, &record.qjl_bits, record.gamma);
-        }
-        Ok(())
-    }
-
-    fn invalidate_index_state(
-        &mut self,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.index_ids.is_empty() && self.manifest.index_state.is_none() {
-            return Ok(());
-        }
-        self.index_ids.clear();
-        self.manifest.index_state = None;
-        self.index_ids_dirty = true;
-        Ok(())
-    }
-
-    fn maybe_persist_state(
-        &mut self,
-        force: bool,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !force
-            && !self.index_ids_dirty
-            && self.pending_manifest_updates < MANIFEST_SAVE_INTERVAL_OPS
-        {
-            return Ok(());
-        }
-
+    fn maybe_persist_state(&mut self, force: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !force && !self.index_ids_dirty && self.pending_manifest_updates < MANIFEST_SAVE_INTERVAL_OPS { return Ok(()); }
         if self.index_ids_dirty {
             save_index_ids(&self.local_dir, &self.index_ids)?;
-            self.backend
-                .write(INDEX_IDS_FILE, serialize_index_ids(&self.index_ids)?)?;
+            self.backend.write(INDEX_IDS_FILE, serialize_index_ids(&self.index_ids)?)?;
             self.index_ids_dirty = false;
         }
-
-        self.save_manifest()?;
-        self.pending_manifest_updates = 0;
+        self.save_manifest()?; self.pending_manifest_updates = 0;
         Ok(())
     }
 
     fn can_use_ann_index(&self) -> bool {
-        self.graph.has_index()
-            && !self.index_ids.is_empty()
-            && self
-                .manifest
-                .index_state
-                .as_ref()
-                .is_some_and(|s| s.indexed_nodes == self.index_ids.len())
-    }
-
-    fn compact_segments(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.segments.segments.len() <= 1 {
-            return Ok(());
-        }
-
-        let old_segment_names: Vec<String> = self
-            .segments
-            .segments
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-
-        let mut live_records: Vec<SegmentRecord> = self
-            .live_iter_id_slots()
-            .into_iter()
-            .map(|(id, slot)| {
-                let (indices, qjl, gamma) = self.live_codes_at_slot(slot as usize);
-                SegmentRecord {
-                    id: id.to_string(),
-                    quantized_indices: indices.to_vec(),
-                    qjl_bits: qjl.to_vec(),
-                    gamma,
-                    is_deleted: false,
-                }
-            })
-            .collect();
-        live_records.sort_by(|a, b| a.id.cmp(&b.id));
-
-        let new_segment_name = self.segments.next_segment_name();
-        self.compactor
-            .begin_compaction(&old_segment_names, &new_segment_name)?;
-        self.segments
-            .flush_batch_named(new_segment_name.clone(), live_records)?;
-        for old in &old_segment_names {
-            self.backend.delete(old)?;
-        }
-        self.segments.remove_segments(&old_segment_names);
-        self.compactor.finish_compaction()?;
-        Ok(())
+        self.graph.has_index() && !self.index_ids.is_empty() && 
+        self.manifest.index_state.as_ref().is_some_and(|s| s.indexed_nodes == self.index_ids.len())
     }
 
     fn save_manifest(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut m = self.manifest.clone();
-        m.version = m.version.max(2);
-        m.quantizer = None;
+        let mut m = self.manifest.clone(); m.quantizer = None;
         let manifest_path = format!("{}/manifest.json", self.local_dir);
         m.save(&manifest_path)?;
-        self.backend
-            .write("manifest.json", serde_json::to_vec_pretty(&m)?)?;
+        self.backend.write("manifest.json", serde_json::to_vec_pretty(&m)?)?;
         Ok(())
-    }
-
-    fn score_vectors(&self, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
-        score_vectors_with_metric(&self.metric, a, b)
     }
 
     fn total_disk_bytes(&self) -> u64 {
         let mut total = self.segments.total_disk_size();
-        for name in ["manifest.json", "metadata.bin", "metadata.redb", "wal.log", QUANTIZER_STATE_FILE, "graph.bin", INDEX_IDS_FILE] {
-            if let Ok(data) = self.backend.read(name) {
-                total += data.len() as u64;
-            }
+        for name in ["manifest.json", "metadata.bin", "wal.log", QUANTIZER_STATE_FILE, "graph.bin", INDEX_IDS_FILE, "live_codes.bin"] {
+            if let Ok(data) = self.backend.read(name) { total += data.len() as u64; }
         }
         total
     }
+
+    fn write_vector_entry(&mut self, id: String, vector: &Array1<f64>, metadata: HashMap<String, JsonValue>, document: Option<String>, is_deleted: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (indices, qjl, gamma) = self.quantizer.quantize(vector);
+        let meta = VectorMetadata { properties: metadata, document };
+        let entry = WalEntry { id: id.clone(), quantized_indices: indices, qjl_bits: qjl, gamma: gamma as f32, metadata_json: serde_json::to_string(&meta)?, is_deleted };
+        self.wal.append(&entry, false)?; self.wal_buffer.push(entry.clone());
+        if !is_deleted {
+            let slot = self.live_alloc_or_update(&id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma);
+            self.metadata.put(slot, &meta)?;
+        }
+        self.invalidate_index_state()?;
+        self.manifest.vector_count = self.live_active_count() as u64;
+        self.maybe_persist_state(false)?;
+        if self.wal_buffer.len() >= self.wal_flush_threshold { self.flush_wal_to_segment()?; }
+        Ok(())
+    }
+
+    fn write_many(&mut self, items: Vec<BatchWriteItem>, _mode: BatchWriteMode) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for chunk in items.chunks(1000) {
+            let vectors: Vec<_> = chunk.iter().map(|i| i.vector.clone()).collect();
+            let quantized = self.quantizer.quantize_batch(&vectors);
+            let mut wal_entries = Vec::new();
+            for (item, (indices, qjl, gamma)) in chunk.iter().zip(quantized) {
+                let meta = VectorMetadata { properties: item.metadata.clone(), document: item.document.clone() };
+                wal_entries.push(WalEntry { id: item.id.clone(), quantized_indices: indices, qjl_bits: qjl, gamma: gamma as f32, metadata_json: serde_json::to_string(&meta)?, is_deleted: false });
+            }
+            self.wal.append_batch(&wal_entries, false)?;
+            for (item, entry) in chunk.iter().zip(&wal_entries) {
+                let slot = self.live_alloc_or_update(&item.id, &entry.quantized_indices, &entry.qjl_bits, entry.gamma);
+                self.metadata.put(slot, &VectorMetadata { properties: item.metadata.clone(), document: item.document.clone() })?;
+            }
+            self.wal_buffer.extend(wal_entries);
+        }
+        self.invalidate_index_state()?;
+        self.manifest.vector_count = self.live_active_count() as u64;
+        self.maybe_persist_state(false)?;
+        if self.wal_buffer.len() >= self.wal_flush_threshold { self.flush_wal_to_segment()?; }
+        Ok(())
+    }
 }
 
-fn save_quantizer_state(
-    local_dir: &str,
-    backend: &Arc<StorageBackend>,
-    quantizer: &ProdQuantizer,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn save_quantizer_state(local_dir: &str, backend: &Arc<StorageBackend>, quantizer: &ProdQuantizer) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bytes = bincode::serialize(quantizer)?;
     std::fs::write(format!("{}/{}", local_dir, QUANTIZER_STATE_FILE), &bytes)?;
-    backend.write(QUANTIZER_STATE_FILE, bytes)?;
-    Ok(())
+    backend.write(QUANTIZER_STATE_FILE, bytes)?; Ok(())
 }
 
-fn load_quantizer_state(
-    local_dir: &str,
-    backend: &Arc<StorageBackend>,
-    manifest: &Manifest,
-) -> Result<ProdQuantizer, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(q) = manifest.quantizer.clone() {
-        return Ok(q);
-    }
-
+fn load_quantizer_state(local_dir: &str, backend: &Arc<StorageBackend>, _manifest: &Manifest) -> Result<ProdQuantizer, Box<dyn std::error::Error + Send + Sync>> {
     let local = format!("{}/{}", local_dir, QUANTIZER_STATE_FILE);
-    if Path::new(&local).exists() {
-        let bytes = std::fs::read(&local)?;
-        return Ok(bincode::deserialize(&bytes)?);
-    }
-
+    if Path::new(&local).exists() { return Ok(bincode::deserialize(&std::fs::read(&local)?)?); }
     if let Ok(bytes) = backend.read(QUANTIZER_STATE_FILE) {
-        std::fs::write(&local, &bytes)?;
-        return Ok(bincode::deserialize(&bytes)?);
+        std::fs::write(&local, &bytes)?; return Ok(bincode::deserialize(&bytes)?);
     }
-
-    Err("Manifest missing quantizer state and quantizer.bin not found".into())
-}
-fn save_index_ids(
-    local_dir: &str,
-    ids: &[u32],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    std::fs::write(
-        format!("{}/{}", local_dir, INDEX_IDS_FILE),
-        serialize_index_ids(ids)?,
-    )?;
-    Ok(())
+    Err("Quantizer state not found".into())
 }
 
-fn serialize_index_ids(
-    ids: &[u32],
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(serde_json::to_vec_pretty(ids)?)
+fn save_index_ids(local_dir: &str, ids: &[u32]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    std::fs::write(format!("{}/{}", local_dir, INDEX_IDS_FILE), serialize_index_ids(ids)?)?; Ok(())
 }
 
-fn load_index_ids(
-    local_dir: &str,
-) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
+fn serialize_index_ids(ids: &[u32]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { Ok(serde_json::to_vec_pretty(ids)?) }
+
+fn load_index_ids(local_dir: &str) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
     let local = format!("{}/{}", local_dir, INDEX_IDS_FILE);
-    if Path::new(&local).exists() {
-        let raw = std::fs::read(&local)?;
-        return Ok(serde_json::from_slice(&raw)?);
-    }
+    if Path::new(&local).exists() { return Ok(serde_json::from_slice(&std::fs::read(&local)?)?); }
     Ok(Vec::new())
 }
 
-fn live_codes_at_slot_raw<'a>(
-    live_codes: &'a [u8],
-    d: usize,
-    qjl_len: usize,
-    slot: usize,
-) -> (&'a [u8], &'a [u8], f32) {
-    let stride = d + qjl_len + LIVE_GAMMA_BYTES + LIVE_DELETED_BYTES;
-    let base = slot * stride;
-    let gamma_off = base + d + qjl_len;
-    let deleted_off = gamma_off + LIVE_GAMMA_BYTES;
-
-    let indices = &live_codes[base..base + d];
-    let qjl = &live_codes[base + d..base + d + qjl_len];
-    let gamma = f32::from_le_bytes(live_codes[gamma_off..gamma_off + 4].try_into().unwrap());
-    debug_assert_eq!(live_codes[deleted_off], 0u8);
-    (indices, qjl, gamma)
-}
-fn metadata_matches_filter(
-    meta: &HashMap<String, JsonValue>,
-    filter: &HashMap<String, JsonValue>,
-) -> bool {
-    filter
-        .iter()
-        .all(|(k, v)| meta.get(k).is_some_and(|mv| mv == v))
+fn live_codes_at_slot_raw<'a>(live_codes: &'a LiveCodesFile, d: usize, qjl_len: usize, slot: usize) -> (&'a [u8], &'a [u8], f32) {
+    let rec = live_codes.get_slot(slot);
+    let gamma = f32::from_le_bytes(rec[d + qjl_len..d + qjl_len + 4].try_into().unwrap());
+    (&rec[0..d], &rec[d..d + qjl_len], gamma)
 }
 
+fn metadata_matches_filter(meta: &HashMap<String, JsonValue>, filter: &HashMap<String, JsonValue>) -> bool {
+    filter.iter().all(|(k, v)| meta.get(k).is_some_and(|mv| mv == v))
+}
 
 fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
     match metric {
         DistanceMetric::Ip => a.iter().zip(b.iter()).map(|(x, y)| x * y).sum(),
         DistanceMetric::Cosine => {
             let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-            let an: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
-            let bn: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
-            if an == 0.0 || bn == 0.0 {
-                0.0
-            } else {
-                dot / (an * bn)
-            }
+            let an = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let bn = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if an == 0.0 || bn == 0.0 { 0.0 } else { dot / (an * bn) }
         }
-        DistanceMetric::L2 => {
-            -a.iter()
-                .zip(b.iter())
-                .map(|(x, y)| {
-                    let d = x - y;
-                    d * d
-                })
-                .sum::<f64>()
-                .sqrt()
-        }
+        DistanceMetric::L2 => -a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt(),
     }
 }
-
-
-
-
-
-
-
-
