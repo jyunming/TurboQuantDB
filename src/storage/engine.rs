@@ -377,8 +377,14 @@ impl TurboQuantEngine {
         self.segments.flush_batch(records)?;
         self.wal.truncate()?;
         self.metadata.flush()?;
-        let live_codes_data = std::fs::read(Path::new(&self.local_dir).join("live_codes.bin"))?;
+
+        // Windows: backend.write may overwrite the same live_codes file path.
+        // Drop active mmap before overwrite, then remap after write completes.
+        self.live_codes.release_mmap();
+        let live_codes_path = Path::new(&self.local_dir).join("live_codes.bin");
+        let live_codes_data = std::fs::read(&live_codes_path)?;
         self.backend.write("live_codes.bin", live_codes_data)?;
+        self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
         self.maybe_persist_state(false)?;
