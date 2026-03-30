@@ -5,3 +5,6 @@ pub mod graph;
 pub mod metadata;
 pub mod segment;
 pub mod wal;
+
+pub mod id_pool;
+

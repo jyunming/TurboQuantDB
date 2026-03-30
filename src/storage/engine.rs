@@ -10,6 +10,7 @@ use std::sync::Arc as SharedStrArc;
 use super::backend::StorageBackend;
 use super::compaction::Compactor;
 use super::graph::GraphManager;
+use super::id_pool::IdPool;
 use super::metadata::{MetadataStore, VectorMetadata};
 use super::segment::{SegmentManager, SegmentRecord};
 use super::wal::{Wal, WalEntry};
@@ -145,6 +146,7 @@ pub struct TurboQuantEngine {
     live_codes: Vec<u8>,
     live_slot_to_id: Vec<Option<SharedStrArc<str>>>,
     live_id_to_slot: HashMap<SharedStrArc<str>, u32>,
+    id_pool: IdPool,
     live_vectors: HashMap<String, Array1<f64>>,
     index_ids_dirty: bool,
     pending_manifest_updates: usize,
@@ -269,6 +271,7 @@ impl TurboQuantEngine {
             live_codes: Vec::new(),
             live_slot_to_id: Vec::new(),
             live_id_to_slot: HashMap::new(),
+            id_pool: IdPool::new(),
             live_vectors: HashMap::new(),
             index_ids_dirty: false,
             pending_manifest_updates: 0,
@@ -310,7 +313,7 @@ impl TurboQuantEngine {
         metadata_props: HashMap<String, JsonValue>,
         document: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.live_id_to_slot.contains_key(id.as_str()) {
+        if self.id_pool.get_slot(id.as_str()).is_some() {
             return Err(format!("ID '{}' already exists; use upsert/update", id).into());
         }
         self.write_vector_entry(id, vector, metadata_props, document, false)
@@ -333,7 +336,7 @@ impl TurboQuantEngine {
         metadata_props: HashMap<String, JsonValue>,
         document: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self.live_id_to_slot.contains_key(id.as_str()) {
+        if self.id_pool.get_slot(id.as_str()).is_none() {
             return Err(format!("ID '{}' does not exist; use insert/upsert", id).into());
         }
         self.write_vector_entry(id, vector, metadata_props, document, false)
@@ -364,7 +367,7 @@ impl TurboQuantEngine {
         &mut self,
         id: String,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        if !self.live_id_to_slot.contains_key(id.as_str()) {
+        if self.id_pool.get_slot(id.as_str()).is_none() {
             return Ok(false);
         }
         let entry = WalEntry {
@@ -394,7 +397,7 @@ impl TurboQuantEngine {
         &self,
         id: &str,
     ) -> Result<Option<GetResult>, Box<dyn std::error::Error + Send + Sync>> {
-        if !self.live_id_to_slot.contains_key(id as &str) {
+        if self.id_pool.get_slot(id).is_none() {
             return Ok(None);
         }
         let meta = self.metadata.get(id)?.unwrap_or_default();
@@ -480,7 +483,7 @@ impl TurboQuantEngine {
         filter: Option<&HashMap<String, JsonValue>>,
         ann_search_list_size: Option<usize>,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
-        if self.live_id_to_slot.is_empty() || top_k == 0 {
+        if self.id_pool.active_count() == 0 || top_k == 0 {
             return Ok(Vec::new());
         }
 
@@ -646,7 +649,7 @@ impl TurboQuantEngine {
             index_nodes: self.index_ids.len(),
             live_codes_bytes: self.live_codes.len(),
             live_slot_count: self.live_slot_to_id.len(),
-            live_id_count: self.live_id_to_slot.len(),
+            live_id_count: self.id_pool.active_count(),
             live_vectors_count: self.live_vectors.len(),
             live_vectors_bytes_estimate: self.live_vectors_bytes_estimate(),
             metadata_entries: self.metadata.len(),
@@ -665,7 +668,7 @@ impl TurboQuantEngine {
     }
 
     fn live_active_count(&self) -> usize {
-        self.live_id_to_slot.len()
+        self.id_pool.active_count()
     }
 
     fn live_vectors_bytes_estimate(&self) -> usize {
@@ -699,6 +702,8 @@ impl TurboQuantEngine {
         self.live_codes.extend_from_slice(&gamma.to_le_bytes());
         self.live_codes.push(0u8);
         self.live_id_to_slot.insert(id.clone(), slot);
+        let pool_slot = self.id_pool.insert(id.as_ref());
+        debug_assert_eq!(pool_slot, slot);
         self.live_slot_to_id.push(Some(id));
         slot
     }
@@ -726,6 +731,7 @@ impl TurboQuantEngine {
             let deleted_off = base + self.d + self.live_qjl_len() + LIVE_GAMMA_BYTES;
             self.live_codes[deleted_off] = 1u8;
             self.live_slot_to_id[slot as usize] = None;
+            self.id_pool.delete_by_slot(slot);
         }
     }
 
@@ -755,6 +761,12 @@ impl TurboQuantEngine {
         self.live_codes = new_codes;
         self.live_slot_to_id = new_slots;
         self.live_id_to_slot = new_map;
+        self.id_pool.clear();
+        for maybe_id in &self.live_slot_to_id {
+            if let Some(id) = maybe_id {
+                self.id_pool.insert(id.as_ref());
+            }
+        }
     }
 
     fn rebuild_ann_slots_from_index_ids(&mut self) {
@@ -918,6 +930,7 @@ impl TurboQuantEngine {
         self.live_codes.clear();
         self.live_slot_to_id.clear();
         self.live_id_to_slot.clear();
+        self.id_pool.clear();
         self.live_vectors.clear();
 
         let mut records: Vec<_> = by_id.into_values().collect();
@@ -1139,48 +1152,3 @@ fn score_vectors_with_metric(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
