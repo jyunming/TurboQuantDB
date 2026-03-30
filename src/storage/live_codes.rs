@@ -2,7 +2,7 @@ use memmap2::{MmapMut, MmapOptions};
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
-const GROW_SLOTS: usize = 4096;
+const GROW_SLOTS: usize = 16384;
 
 pub struct LiveCodesFile {
     _path: PathBuf,

@@ -468,6 +468,7 @@ impl TurboQuantEngine {
             new_codes.get_slot_mut(next_alloc).copy_from_slice(old_rec);
             new_pool.insert(&id);
         }
+        new_codes.truncate_to(new_pool.active_count())?;
         new_codes.flush()?; drop(new_codes);
         let final_path = Path::new(&self.local_dir).join("live_codes.bin");
         self.live_codes.release_mmap();
