@@ -13,7 +13,7 @@ pub struct VectorMetadata {
 
 pub struct MetadataStore {
     path: PathBuf,
-    data: HashMap<String, VectorMetadata>,
+    data: HashMap<u32, VectorMetadata>,
     dirty: bool,
 }
 
@@ -39,23 +39,23 @@ impl MetadataStore {
 
     pub fn put(
         &mut self,
-        id: &str,
+        slot: u32,
         meta: &VectorMetadata,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.data.insert(id.to_string(), meta.clone());
+        self.data.insert(slot, meta.clone());
         self.dirty = true;
         Ok(())
     }
 
     pub fn put_many(
         &mut self,
-        entries: &[(String, VectorMetadata)],
+        entries: &[(u32, VectorMetadata)],
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if entries.is_empty() {
             return Ok(());
         }
-        for (id, meta) in entries {
-            self.data.insert(id.clone(), meta.clone());
+        for (slot, meta) in entries {
+            self.data.insert(*slot, meta.clone());
         }
         self.dirty = true;
         Ok(())
@@ -63,26 +63,26 @@ impl MetadataStore {
 
     pub fn get(
         &self,
-        id: &str,
+        slot: u32,
     ) -> Result<Option<VectorMetadata>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.data.get(id).cloned())
+        Ok(self.data.get(&slot).cloned())
     }
 
     pub fn get_many(
         &self,
-        ids: &[String],
-    ) -> Result<HashMap<String, VectorMetadata>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut out = HashMap::with_capacity(ids.len());
-        for id in ids {
-            if let Some(meta) = self.data.get(id) {
-                out.insert(id.clone(), meta.clone());
+        slots: &[u32],
+    ) -> Result<HashMap<u32, VectorMetadata>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = HashMap::with_capacity(slots.len());
+        for slot in slots {
+            if let Some(meta) = self.data.get(slot) {
+                out.insert(*slot, meta.clone());
             }
         }
         Ok(out)
     }
 
-    pub fn delete(&mut self, id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.data.remove(id);
+    pub fn delete(&mut self, slot: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.data.remove(&slot);
         self.dirty = true;
         Ok(())
     }
@@ -94,9 +94,9 @@ impl MetadataStore {
     pub fn approx_bytes(&self) -> usize {
         self.data
             .iter()
-            .map(|(id, meta)| {
+            .map(|(_slot, meta)| {
                 let payload = serde_json::to_vec(meta).map(|v| v.len()).unwrap_or(0);
-                id.len() + payload
+                4 + payload
             })
             .sum()
     }
@@ -108,14 +108,12 @@ impl MetadataStore {
 
         let tmp = self.path.with_extension("tmp");
         let mut writer = BufWriter::new(File::create(&tmp)?);
+        writer.write_all(b"M2S1")?;
         writer.write_all(&(self.data.len() as u64).to_le_bytes())?;
 
-        for (id, meta) in &self.data {
-            let id_bytes = id.as_bytes();
+        for (slot, meta) in &self.data {
             let meta_bytes = serde_json::to_vec(meta)?;
-
-            writer.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
-            writer.write_all(id_bytes)?;
+            writer.write_all(&slot.to_le_bytes())?;
             writer.write_all(&(meta_bytes.len() as u32).to_le_bytes())?;
             writer.write_all(&meta_bytes)?;
         }
@@ -128,9 +126,15 @@ impl MetadataStore {
 
     fn load_from_file(
         path: &Path,
-    ) -> Result<HashMap<String, VectorMetadata>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<HashMap<u32, VectorMetadata>, Box<dyn std::error::Error + Send + Sync>> {
         let bytes = std::fs::read(path)?;
         let mut cur = Cursor::new(bytes);
+
+        let mut magic = [0u8; 4];
+        cur.read_exact(&mut magic)?;
+        if &magic != b"M2S1" {
+            return Ok(HashMap::new());
+        }
 
         let mut count_buf = [0u8; 8];
         cur.read_exact(&mut count_buf)?;
@@ -138,12 +142,9 @@ impl MetadataStore {
 
         let mut map = HashMap::with_capacity(count);
         for _ in 0..count {
-            let mut id_len_buf = [0u8; 4];
-            cur.read_exact(&mut id_len_buf)?;
-            let id_len = u32::from_le_bytes(id_len_buf) as usize;
-            let mut id_bytes = vec![0u8; id_len];
-            cur.read_exact(&mut id_bytes)?;
-            let id = String::from_utf8(id_bytes)?;
+            let mut slot_buf = [0u8; 4];
+            cur.read_exact(&mut slot_buf)?;
+            let slot = u32::from_le_bytes(slot_buf);
 
             let mut meta_len_buf = [0u8; 4];
             cur.read_exact(&mut meta_len_buf)?;
@@ -151,8 +152,7 @@ impl MetadataStore {
             let mut meta_bytes = vec![0u8; meta_len];
             cur.read_exact(&mut meta_bytes)?;
             let meta: VectorMetadata = serde_json::from_slice(&meta_bytes)?;
-
-            map.insert(id, meta);
+            map.insert(slot, meta);
         }
 
         Ok(map)
