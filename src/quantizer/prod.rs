@@ -85,7 +85,7 @@ impl ProdQuantizer {
             mse_lut,
             mse_lut_width: lut_w,
             sq,
-            qjl_scale: (PI / (2.0 * self.d as f64)).sqrt() as f32,
+            qjl_scale: (PI / 2.0).sqrt() as f32 / self.d as f32,
         }
     }
 
@@ -114,7 +114,7 @@ impl ProdQuantizer {
         PreparedIpQueryLite {
             y,
             sq,
-            qjl_scale: (PI / (2.0 * self.d as f64)).sqrt() as f32,
+            qjl_scale: (PI / 2.0).sqrt() as f32 / self.d as f32,
         }
     }
 
@@ -387,15 +387,15 @@ impl ProdQuantizer {
             x_mse[row] = acc;
         }
 
-        // x_qjl = sqrt(pi/(2d)) * gamma * S^T * sign(qjl)
+        // x_qjl = (1/d) * sqrt(pi/2) * gamma * S^T * sign(qjl)
         let mut x_qjl = vec![0.0f64; self.d];
-        let scale = (PI / (2.0 * self.d as f64)).sqrt() * gamma;
+        let scale = (PI / 2.0).sqrt() * gamma / self.d as f64;
         for row in 0..self.d {
             let mut acc = 0.0;
             for col in 0..self.d {
-                let byte_idx = col / 8;
-                let bit_idx = col % 8;
-                let bit_set = ((qjl[byte_idx] >> bit_idx) & 1u8) == 1u8;
+                let byte_idx = col >> 3;
+                let bit_idx = col & 7;
+                let bit_set = unsafe { ((*qjl.get_unchecked(byte_idx)) >> bit_idx) & 1u8 } == 1u8;
                 let sign = if bit_set { 1.0 } else { -1.0 };
                 acc += self.qjl_quantizer.projection[(col, row)] * sign;
             }

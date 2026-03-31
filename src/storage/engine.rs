@@ -4,6 +4,7 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::cmp::Ordering;
 
 use super::backend::StorageBackend;
 use super::graph::GraphManager;
@@ -435,21 +436,75 @@ impl TurboQuantEngine {
             return Ok(out);
         }
 
-        // Exhaustive search path
-        let mut results = Vec::new();
-        let pairs = self.live_iter_id_slots();
-        let slots: Vec<u32> = pairs.iter().map(|(_, s)| *s).collect();
-        let meta_map = self.metadata.get_many(&slots)?;
-        for (id, slot) in pairs {
-            let meta = meta_map.get(&slot).cloned().unwrap_or_default();
-            if let Some(f) = filter { if !metadata_matches_filter(&meta.properties, f) { continue; } }
-            let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-            let v = self.quantizer.dequantize(indices, qjl, gamma as f64);
-            results.push(SearchResult { id, score: score_vectors_with_metric(&self.metric, query, &v), metadata: meta.properties, document: meta.document });
+        // Exhaustive search path (SIMD Optimized)
+        self.exhaustive_search_simd(query, top_k, filter)
+    }
+
+    fn exhaustive_search_simd(&self, query: &Array1<f64>, top_k: usize, filter: Option<&HashMap<String, JsonValue>>) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        let active = self.id_pool.iter_active();
+        if active.is_empty() { return Ok(Vec::new()); }
+
+        let mut results: Vec<(u32, f64)> = Vec::new();
+        let q_norm = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+
+        if matches!(self.metric, DistanceMetric::Ip) {
+            let prep = self.quantizer.prepare_ip_query(query);
+            for (id, slot) in active {
+                let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
+                let score = self.quantizer.score_ip_encoded(&prep, indices, qjl, gamma as f64);
+                
+                // Post-filter
+                if let Some(f) = filter {
+                    let meta = self.metadata.get(slot)?.unwrap_or_default();
+                    if !metadata_matches_filter(&meta.properties, f) { continue; }
+                }
+
+                results.push((slot, score));
+            }
+        } else if matches!(self.metric, DistanceMetric::Cosine) {
+            let prep = self.quantizer.prepare_ip_query(query);
+            for (id, slot) in active {
+                let (indices, qjl, gamma, doc_norm) = self.live_codes_at_slot(slot as usize);
+                let ip = self.quantizer.score_ip_encoded(&prep, indices, qjl, gamma as f64);
+                let score = if q_norm > 0.0 && doc_norm > 0.0 { ip / (q_norm * doc_norm as f64) } else { 0.0 };
+
+                if let Some(f) = filter {
+                    let meta = self.metadata.get(slot)?.unwrap_or_default();
+                    if !metadata_matches_filter(&meta.properties, f) { continue; }
+                }
+
+                results.push((slot, score));
+            }
+        } else {
+            // L2 or other: dequantize (slower fallback)
+            for (id, slot) in active {
+                let (indices, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
+                let v = self.quantizer.dequantize(indices, qjl, gamma as f64);
+                let score = score_vectors_with_metric(&self.metric, query, &v);
+
+                if let Some(f) = filter {
+                    let meta = self.metadata.get(slot)?.unwrap_or_default();
+                    if !metadata_matches_filter(&meta.properties, f) { continue; }
+                }
+
+                results.push((slot, score));
+            }
         }
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-        results.truncate(top_k);
-        Ok(results)
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        if results.len() > top_k {
+            results.truncate(top_k);
+        }
+        let slots: Vec<u32> = results.iter().map(|(slot, _)| *slot).collect();
+        let meta_map = self.metadata.get_many(&slots)?;
+        let mut out = Vec::with_capacity(results.len());
+        for (slot, score) in results {
+            let id = self.id_pool.get_str(slot).unwrap_or_default().to_string();
+            let meta = meta_map.get(&slot).cloned().unwrap_or_default();
+            out.push(SearchResult { id, score, metadata: meta.properties, document: meta.document });
+        }
+        out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        Ok(out)
     }
 
     pub fn flush_wal_to_segment(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

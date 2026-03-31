@@ -240,6 +240,29 @@ impl GraphManager {
         Ok(out)
     }
 
+    fn select_neighbors_heuristic(
+        &self,
+        _node_id: u32,
+        mut candidates: Vec<(u32, f64)>,
+        max_degree: usize,
+    ) -> Vec<u32> {
+        if candidates.is_empty() { return Vec::new(); }
+        // candidates is already sorted descending by score (closest first)
+        
+        let mut result = Vec::new();
+        for (c_id, _c_score) in candidates {
+            if result.len() >= max_degree { break; }
+            
+            // Heuristic: only add if candidate is closer to 'node' than to any already selected neighbor.
+            // Since we don't have easy access to distances between arbitrary nodes here without 
+            // a lot of dequantization, we'll use a simplified version: 
+            // If the graph is dense, we just take the top ones. 
+            // But we can at least try to keep them diverse.
+            result.push(c_id);
+        }
+        result
+    }
+
     pub fn build(
         &mut self,
         n: usize,
@@ -272,40 +295,14 @@ impl GraphManager {
                     }
                 }
 
-                // Keep RNG state in full u64 space. Reducing state by `% n` collapses
-                // the period and can stall candidate discovery for many n values.
                 let mut x = (i as u64)
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
-                // LCG can have short periods for some n; stop when we cannot discover
-                // more unique neighbors via this generator.
                 while candidate_ids.len() < candidate_cap && (seen.len() + 1) < n {
-                    x = x
-                        .wrapping_mul(2862933555777941757)
-                        .wrapping_add(3037000493);
+                    x = x.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
                     let cand = (x % (n.max(1) as u64)) as usize;
-                    if cand == i {
-                        continue;
-                    }
-                    let cand_u32 = cand as u32;
-                    if seen.insert(cand_u32) {
-                        candidate_ids.push(cand_u32);
-                    }
-                }
-
-                // If LCG coverage is incomplete, deterministically fill the remainder.
-                if candidate_ids.len() < candidate_cap {
-                    for cand in 0..n {
-                        if cand == i {
-                            continue;
-                        }
-                        let cand_u32 = cand as u32;
-                        if seen.insert(cand_u32) {
-                            candidate_ids.push(cand_u32);
-                            if candidate_ids.len() >= candidate_cap {
-                                break;
-                            }
-                        }
+                    if cand != i && seen.insert(cand as u32) {
+                        candidate_ids.push(cand as u32);
                     }
                 }
                 candidate_ids
@@ -316,55 +313,28 @@ impl GraphManager {
         let mut adjacency: Vec<Vec<u32>> = (0..n)
             .into_par_iter()
             .map(|i| {
-                // For each node i, find best neighbors among a random sample
-                // AND neighbors of a sample.
                 let mut scored: Vec<(u32, f64)> = build_scorer(i as u32, &candidate_lists[i]);
-                scored.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1)
-                        .unwrap_or(Ordering::Equal)
-                        .then_with(|| a.0.cmp(&b.0))
-                });
-
-                scored
-                    .into_iter()
-                    .take(degree_cap.min(n.saturating_sub(1)))
-                    .map(|(id, _)| id)
-                    .collect::<Vec<u32>>()
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                scored.into_iter().take(degree_cap).map(|(id, _)| id).collect()
             })
             .collect();
 
         // Build Refinement (NN-style)
-        // Perform 1 iteration of refinement to align with "virtually zero" indexing time goal
-        for _iter in 0..1 {
+        for _iter in 0..2 {
             let next_adjacency: Vec<Vec<u32>> = (0..n)
                 .into_par_iter()
                 .map(|i| {
                     let mut candidates = HashSet::new();
-                    // Current neighbors
                     for &nb in &adjacency[i] {
                         candidates.insert(nb);
-                        // Neighbors of neighbors
                         for &nbnb in &adjacency[nb as usize] {
-                            if nbnb != i as u32 {
-                                candidates.insert(nbnb);
-                            }
+                            if nbnb != i as u32 { candidates.insert(nbnb); }
                         }
                     }
-
-                    // Score all found candidates
                     let cand_vec: Vec<u32> = candidates.into_iter().collect();
                     let mut scored = build_scorer(i as u32, &cand_vec);
-                    scored.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1)
-                            .unwrap_or(Ordering::Equal)
-                            .then_with(|| a.0.cmp(&b.0))
-                    });
-
-                    scored
-                        .into_iter()
-                        .take(degree_cap.min(n.saturating_sub(1)))
-                        .map(|(id, _)| id)
-                        .collect()
+                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                    scored.into_iter().take(degree_cap).map(|(id, _)| id).collect()
                 })
                 .collect();
             adjacency = next_adjacency;

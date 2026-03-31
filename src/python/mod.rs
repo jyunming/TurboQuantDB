@@ -84,7 +84,6 @@ impl Database {
             _ => return Err(pyo3::exceptions::PyValueError::new_err("Invalid mode")),
         };
 
-        // We handle f32/f64 matrix here
         if let Ok(v32) = vectors.extract::<PyReadonlyArray2<f32>>(py) {
             let matrix = v32.as_array();
             if ids.len() != matrix.nrows() {
@@ -139,7 +138,6 @@ impl Database {
                 })?;
             }
         }
-
         Ok(())
     }
 
