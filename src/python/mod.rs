@@ -280,7 +280,7 @@ impl Database {
             engine
                 .create_index_with_params(
                     max_degree.unwrap_or(32),
-                    search_list_size.unwrap_or(32),
+                    search_list_size.unwrap_or(64),
                     alpha.unwrap_or(1.2),
                 )
                 .map_err(to_py_runtime)
