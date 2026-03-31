@@ -309,18 +309,20 @@ impl GraphManager {
             })
             .collect();
 
-        // Initial adjacency using Greedy search
+        // Initial adjacency using Greedy search + Heuristic
         let mut adjacency: Vec<Vec<u32>> = (0..n)
             .into_par_iter()
             .map(|i| {
                 let mut scored: Vec<(u32, f64)> = build_scorer(i as u32, &candidate_lists[i]);
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                scored.into_iter().take(degree_cap).map(|(id, _)| id).collect()
+                
+                self.select_neighbors_heuristic(i as u32, scored, degree_cap)
             })
             .collect();
 
         // Build Refinement (NN-style)
-        for _iter in 0..2 {
+        // Perform 1 iteration of refinement to restore build speed
+        for _iter in 0..1 {
             let next_adjacency: Vec<Vec<u32>> = (0..n)
                 .into_par_iter()
                 .map(|i| {
@@ -334,7 +336,8 @@ impl GraphManager {
                     let cand_vec: Vec<u32> = candidates.into_iter().collect();
                     let mut scored = build_scorer(i as u32, &cand_vec);
                     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                    scored.into_iter().take(degree_cap).map(|(id, _)| id).collect()
+                    
+                    self.select_neighbors_heuristic(i as u32, scored, degree_cap)
                 })
                 .collect();
             adjacency = next_adjacency;

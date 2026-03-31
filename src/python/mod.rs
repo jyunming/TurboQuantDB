@@ -277,7 +277,7 @@ impl Database {
             let mut engine = self.engine.write().unwrap();
             engine
                 .create_index_with_params(
-                    max_degree.unwrap_or(32),
+                    max_degree.unwrap_or(16),
                     search_list_size.unwrap_or(64),
                     alpha.unwrap_or(1.2),
                 )
