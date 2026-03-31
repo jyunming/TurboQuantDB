@@ -367,7 +367,7 @@ impl TurboQuantEngine {
         let state_match = self.manifest.index_state.as_ref().is_some_and(|s| s.indexed_nodes == self.index_ids.len());
         
         if has_index && not_empty && state_match {
-            let sls = ann_search_list_size.unwrap_or_else(|| self.manifest.index_state.as_ref().map(|s| s.search_list_size).unwrap_or(32));
+            let sls = ann_search_list_size.unwrap_or_else(|| self.manifest.index_state.as_ref().map(|s| s.search_list_size).unwrap_or(64));
             
             // Pre-filter support
             let filter_slots = if let Some(f) = filter {
