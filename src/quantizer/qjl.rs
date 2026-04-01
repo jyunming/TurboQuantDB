@@ -1,29 +1,77 @@
 use nalgebra::DMatrix;
 use ndarray::Array1;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 
 use crate::linalg::hadamard::srht;
+use crate::linalg::rotation::generate_projection_matrix;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct QjlQuantizer {
     pub d: usize,
+    /// Projection state — two formats distinguished by length:
+    ///   - len == d   : legacy SRHT diagonal sign vector (old databases)
+    ///   - len == d*d : flattened d×d Gaussian matrix S, column-major (paper-conformant)
     pub projection_signs: Vec<f32>,
 }
 
 impl QjlQuantizer {
     pub fn new(d: usize, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
-        let mut projection_signs = vec![0.0f32; d];
-        for s in &mut projection_signs {
-            *s = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
+
+        // Paper Algorithm 2, step 3: S ∈ R^{d×d}, S_{ij} ~ N(0,1) i.i.d.
+        let projection = generate_projection_matrix(d, &mut rng);
+        // Store flattened column-major; len == d*d signals paper-conformant mode
+        let projection_signs: Vec<f32> = projection.as_slice().to_vec();
+
+        Self { d, projection_signs }
+    }
+
+    /// True when `projection_signs` holds a full d×d Gaussian matrix (paper-conformant).
+    /// False when it holds the legacy d-element SRHT sign vector.
+    #[inline]
+    pub fn is_matrix_mode(&self) -> bool {
+        self.projection_signs.len() == self.d * self.d
+    }
+
+    /// Forward projection: s = S · x  (used during quantization).
+    pub fn apply_projection(&self, x: &[f32], out: &mut [f32]) {
+        let d = self.d;
+        if self.is_matrix_mode() {
+            // Column-major: S[i,j] = projection_signs[i + j*d]
+            for i in 0..d {
+                let mut sum = 0.0f32;
+                for j in 0..d {
+                    sum += unsafe {
+                        *self.projection_signs.get_unchecked(i + j * d) * *x.get_unchecked(j)
+                    };
+                }
+                out[i] = sum;
+            }
+        } else {
+            srht(x, &self.projection_signs, out);
         }
-        Self {
-            d,
-            projection_signs,
+    }
+
+    /// Transpose projection: v = S^T · y  (used during dequantization).
+    pub fn apply_projection_transpose(&self, y: &[f32], out: &mut [f32]) {
+        let d = self.d;
+        if self.is_matrix_mode() {
+            // S^T[i,j] = S[j,i] = projection_signs[j + i*d]
+            for i in 0..d {
+                let mut sum = 0.0f32;
+                for j in 0..d {
+                    sum += unsafe {
+                        *self.projection_signs.get_unchecked(j + i * d) * *y.get_unchecked(j)
+                    };
+                }
+                out[i] = sum;
+            }
+        } else {
+            srht(y, &self.projection_signs, out);
         }
     }
 
@@ -31,15 +79,13 @@ impl QjlQuantizer {
         assert_eq!(r.len(), self.d);
         let r_f32: Vec<f32> = r.iter().map(|&v| v as f32).collect();
         let mut s_r = vec![0.0f32; self.d];
-        srht(&r_f32, &self.projection_signs, &mut s_r);
+        self.apply_projection(&r_f32, &mut s_r);
 
         let packed_len = self.d.div_ceil(8);
         let mut packed = vec![0u8; packed_len];
         for row in 0..self.d {
             if s_r[row] >= 0.0 {
-                let byte_idx = row / 8;
-                let bit_idx = row % 8;
-                packed[byte_idx] |= 1u8 << bit_idx;
+                packed[row / 8] |= 1u8 << (row % 8);
             }
         }
         packed
@@ -54,23 +100,16 @@ impl QjlQuantizer {
 
         let packed_len = self.d.div_ceil(8);
         let mut all_qjl = vec![vec![0u8; packed_len]; n];
-
-        all_qjl
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(col, packed)| {
-                let r_col_owned: Vec<f32> = rs.column(col).iter().copied().collect();
-                let mut s_r = vec![0.0f32; self.d];
-                srht(&r_col_owned, &self.projection_signs, &mut s_r);
-                for row in 0..self.d {
-                    if s_r[row] >= 0.0 {
-                        let byte_idx = row / 8;
-                        let bit_idx = row % 8;
-                        packed[byte_idx] |= 1u8 << bit_idx;
-                    }
+        all_qjl.par_iter_mut().enumerate().for_each(|(col, packed)| {
+            let r_col: Vec<f32> = rs.column(col).iter().copied().collect();
+            let mut s_r = vec![0.0f32; self.d];
+            self.apply_projection(&r_col, &mut s_r);
+            for row in 0..self.d {
+                if s_r[row] >= 0.0 {
+                    packed[row / 8] |= 1u8 << (row % 8);
                 }
-            });
-
+            }
+        });
         all_qjl
     }
 
@@ -85,29 +124,27 @@ impl QjlQuantizer {
             return Vec::new();
         }
 
-        let n = encoded.len();
-        let scale_base = (PI / (2.0 * self.d as f32)).sqrt();
+        let d = self.d;
+        // Unbiased reconstruction scale derived from QJL estimator:
+        //   E[<S·y, sign(S·r)>] = d · sqrt(2/π) · <y,r>/‖r‖
+        //   → scale = sqrt(π/2) / d  so that E[x̃_qjl] = r
+        let scale_base = (PI / 2.0_f32).sqrt() / d as f32;
 
-        let mut out = vec![Array1::zeros(self.d); n];
+        let mut out = vec![Array1::zeros(d); encoded.len()];
         out.par_iter_mut().enumerate().for_each(|(col, result)| {
             let (qjl, gamma) = &encoded[col];
-            let mut qjl_f32 = vec![0.0f32; self.d];
-            for row in 0..self.d {
-                let byte_idx = row / 8;
-                let bit_idx = row % 8;
-                let bit_set = ((qjl[byte_idx] >> bit_idx) & 1u8) == 1u8;
-                qjl_f32[row] = if bit_set { 1.0 } else { -1.0 };
+            let mut sign_vec = vec![0.0f32; d];
+            for row in 0..d {
+                let bit_set = ((qjl[row / 8] >> (row % 8)) & 1u8) == 1u8;
+                sign_vec[row] = if bit_set { 1.0 } else { -1.0 };
             }
-
-            let mut st_qjl = vec![0.0f32; self.d];
-            srht(&qjl_f32, &self.projection_signs, &mut st_qjl);
-
+            let mut st_qjl = vec![0.0f32; d];
+            self.apply_projection_transpose(&sign_vec, &mut st_qjl);
             let multiplier = (scale_base * *gamma as f32) as f64;
-            for row in 0..self.d {
+            for row in 0..d {
                 result[row] = multiplier * st_qjl[row] as f64;
             }
         });
-
         out
     }
 }

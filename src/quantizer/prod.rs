@@ -1,13 +1,10 @@
-use nalgebra::DMatrix;
 use ndarray::Array1;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 
 use super::CodeIndex;
 use super::mse::MseQuantizer;
 use super::qjl::QjlQuantizer;
-use crate::linalg::hadamard::srht;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ProdQuantizer {
@@ -51,7 +48,7 @@ impl ProdQuantizer {
 
         let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
         let mut y = vec![0.0f32; self.d];
-        srht(&query_f32, &self.mse_quantizer.rotation_signs, &mut y);
+        self.mse_quantizer.apply_rotation(&query_f32, &mut y);
 
         // Precompute MSE lookup scores for each dimension/code.
         let centroids = &self.mse_quantizer.centroids;
@@ -66,7 +63,7 @@ impl ProdQuantizer {
         }
 
         let mut sq = vec![0.0f32; self.d];
-        srht(&query_f32, &self.qjl_quantizer.projection_signs, &mut sq);
+        self.qjl_quantizer.apply_projection(&query_f32, &mut sq);
 
         PreparedIpQuery {
             mse_lut,
@@ -81,10 +78,10 @@ impl ProdQuantizer {
 
         let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
         let mut y = vec![0.0f32; self.d];
-        srht(&query_f32, &self.mse_quantizer.rotation_signs, &mut y);
+        self.mse_quantizer.apply_rotation(&query_f32, &mut y);
 
         let mut sq = vec![0.0f32; self.d];
-        srht(&query_f32, &self.qjl_quantizer.projection_signs, &mut sq);
+        self.qjl_quantizer.apply_projection(&query_f32, &mut sq);
 
         PreparedIpQueryLite {
             y,
