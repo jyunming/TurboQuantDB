@@ -1,18 +1,22 @@
 use nalgebra::DMatrix;
 use ndarray::Array1;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::CodeIndex;
 use super::codebook::lloyd_max;
 use crate::linalg::hadamard::{fwht, srht};
+use crate::linalg::rotation::generate_random_rotation;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MseQuantizer {
     pub d: usize,
     pub b: usize,
+    /// Rotation state — two formats distinguished by length:
+    ///   - len == d   : legacy SRHT diagonal sign vector (old databases)
+    ///   - len == d*d : flattened d×d QR rotation matrix Π, column-major (paper-conformant)
     pub rotation_signs: Vec<f32>,
     pub centroids: Vec<f32>,
 }
@@ -20,13 +24,13 @@ pub struct MseQuantizer {
 impl MseQuantizer {
     pub fn new(d: usize, b: usize, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
-        let mut rotation_signs = vec![0.0f32; d];
-        for s in &mut rotation_signs {
-            *s = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
-        }
 
-        let num_points = 20_000;
-        let centroids: Vec<f32> = lloyd_max(b, d, num_points)
+        // Paper Algorithm 1, step 2: Π = Q from QR(G), G_{ij} ~ N(0,1)
+        let rotation = generate_random_rotation(d, &mut rng);
+        // Store flattened column-major; len == d*d signals paper-conformant mode
+        let rotation_signs: Vec<f32> = rotation.as_slice().to_vec();
+
+        let centroids: Vec<f32> = lloyd_max(b, d, 20_000)
             .into_iter()
             .map(|c| c as f32)
             .collect();
@@ -35,11 +39,59 @@ impl MseQuantizer {
             "codebook too large for u16 indices; reduce bits"
         );
 
-        Self {
-            d,
-            b,
-            rotation_signs,
-            centroids,
+        Self { d, b, rotation_signs, centroids }
+    }
+
+    /// True when `rotation_signs` holds a full d×d QR matrix (paper-conformant).
+    /// False when it holds the legacy d-element SRHT sign vector.
+    #[inline]
+    pub fn is_qr_mode(&self) -> bool {
+        self.rotation_signs.len() == self.d * self.d
+    }
+
+    /// Forward rotation: y = Π · x  (used during quantization).
+    pub fn apply_rotation(&self, x: &[f32], out: &mut [f32]) {
+        let d = self.d;
+        if self.is_qr_mode() {
+            // Column-major: Π[i,j] = rotation_signs[i + j*d]
+            for i in 0..d {
+                let mut sum = 0.0f32;
+                for j in 0..d {
+                    sum += unsafe {
+                        *self.rotation_signs.get_unchecked(i + j * d) * *x.get_unchecked(j)
+                    };
+                }
+                out[i] = sum;
+            }
+        } else {
+            srht(x, &self.rotation_signs, out);
+        }
+    }
+
+    /// Inverse rotation: x̃ = Π^T · ỹ  (used during dequantization).
+    pub fn apply_rotation_transpose(&self, y: &[f32], out: &mut [f32]) {
+        let d = self.d;
+        if self.is_qr_mode() {
+            // Π^T[i,j] = Π[j,i] = rotation_signs[j + i*d]
+            for i in 0..d {
+                let mut sum = 0.0f32;
+                for j in 0..d {
+                    sum += unsafe {
+                        *self.rotation_signs.get_unchecked(j + i * d) * *y.get_unchecked(j)
+                    };
+                }
+                out[i] = sum;
+            }
+        } else {
+            // Legacy SRHT inverse: x = D · H · (1/√n) · y
+            let n = d.next_power_of_two();
+            let mut temp = vec![0.0f32; n];
+            temp[..d].copy_from_slice(y);
+            fwht(&mut temp);
+            let norm = 1.0 / (n as f32).sqrt();
+            for i in 0..d {
+                out[i] = temp[i] * self.rotation_signs[i] * norm;
+            }
         }
     }
 
@@ -47,7 +99,7 @@ impl MseQuantizer {
         assert_eq!(x.len(), self.d);
         let x_f32: Vec<f32> = x.iter().map(|&v| v as f32).collect();
         let mut y = vec![0.0f32; self.d];
-        srht(&x_f32, &self.rotation_signs, &mut y);
+        self.apply_rotation(&x_f32, &mut y);
 
         let mut indices = vec![0 as CodeIndex; self.d];
         for i in 0..self.d {
@@ -64,18 +116,14 @@ impl MseQuantizer {
         }
 
         let mut all_indices = vec![vec![0 as CodeIndex; self.d]; n];
-        all_indices
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(col, idxs)| {
-                let x_col_owned: Vec<f32> = xs.column(col).iter().copied().collect();
-                let mut y = vec![0.0f32; self.d];
-                srht(&x_col_owned, &self.rotation_signs, &mut y);
-                for row in 0..self.d {
-                    idxs[row] = self.nearest_centroid_index(y[row]);
-                }
-            });
-
+        all_indices.par_iter_mut().enumerate().for_each(|(col, idxs)| {
+            let x_col: Vec<f32> = xs.column(col).iter().copied().collect();
+            let mut y = vec![0.0f32; self.d];
+            self.apply_rotation(&x_col, &mut y);
+            for row in 0..self.d {
+                idxs[row] = self.nearest_centroid_index(y[row]);
+            }
+        });
         all_indices
     }
 
@@ -103,19 +151,15 @@ impl MseQuantizer {
     pub fn dequantize(&self, indices: &[CodeIndex]) -> Array1<f64> {
         assert_eq!(indices.len(), self.d);
         let d = self.d;
-        let n = d.next_power_of_two();
-
-        let mut temp = vec![0.0f32; n];
+        let mut y_tilde = vec![0.0f32; d];
         for i in 0..d {
-            temp[i] = self.centroids[indices[i] as usize];
+            y_tilde[i] = self.centroids[indices[i] as usize];
         }
-        // Inverse SRHT: forward is y = (1/√n)·H·D·x
-        // Inverse: x = (1/√n)·D·H·y — apply H first (no sign multiply), then D
-        fwht(&mut temp);
-        let norm = 1.0 / (n as f32).sqrt();
+        let mut out_data = vec![0.0f32; d];
+        self.apply_rotation_transpose(&y_tilde, &mut out_data);
         let mut out = Array1::zeros(d);
         for i in 0..d {
-            out[i] = (temp[i] * self.rotation_signs[i] * norm) as f64;
+            out[i] = out_data[i] as f64;
         }
         out
     }
@@ -125,23 +169,17 @@ impl MseQuantizer {
         if n == 0 {
             return DMatrix::zeros(self.d, 0);
         }
-
         let mut out = DMatrix::zeros(self.d, n);
         let d = self.d;
-        let signs = &self.rotation_signs;
-        let centroids = &self.centroids;
-
-        let pad = d.next_power_of_two();
-        let norm = 1.0 / (pad as f32).sqrt();
         for (col, indices) in indices_batch.iter().enumerate() {
-            let mut temp = vec![0.0f32; pad];
+            let mut y_tilde = vec![0.0f32; d];
             for row in 0..d {
-                temp[row] = centroids[indices[row] as usize];
+                y_tilde[row] = self.centroids[indices[row] as usize];
             }
-            // Inverse SRHT: apply H first (no sign multiply), then D·(1/√n)
-            fwht(&mut temp);
+            let mut x_rec = vec![0.0f32; d];
+            self.apply_rotation_transpose(&y_tilde, &mut x_rec);
             for row in 0..d {
-                out[(row, col)] = temp[row] * signs[row] * norm;
+                out[(row, col)] = x_rec[row];
             }
         }
         out

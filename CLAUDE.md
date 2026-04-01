@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-TurboQuantDB is an embedded vector database written in Rust with Python bindings (PyO3/Maturin). It implements the TurboQuant algorithm (arXiv:2504.19874): two-stage quantization (MSE + QJL via SRHT) achieving near-optimal vector compression with zero training time.
+TurboQuantDB is an embedded vector database written in Rust with Python bindings (PyO3/Maturin). It implements the TurboQuant algorithm (arXiv:2504.19874): two-stage quantization (MSE via QR rotation + residual QJL via dense Gaussian projection) achieving near-optimal vector compression with zero training time.
 
 Two deployment modes:
 - **Embedded** — `turboquantdb` Python package, runs in-process
@@ -62,15 +62,15 @@ python benchmarks/ci_quality_gate.py   # CI gates: min recall 0.60, max latency 
 | `src/storage/backend.rs` | `StorageProvider` trait (local; extensible to cloud) |
 | `src/storage/compaction.rs` | Segment merging |
 | `src/quantizer/prod.rs` | `ProdQuantizer` — two-stage MSE + QJL orchestrator |
-| `src/quantizer/mse.rs` | `MseQuantizer` — SRHT rotation + Lloyd-Max codebook |
-| `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit random projection, bit-packed |
-| `src/linalg/hadamard.rs` | In-place O(d log d) Walsh-Hadamard / SRHT |
+| `src/quantizer/mse.rs` | `MseQuantizer` — QR rotation + Lloyd-Max codebook |
+| `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit dense Gaussian projection, bit-packed |
+| `src/linalg/hadamard.rs` | In-place O(d log d) Walsh-Hadamard / SRHT (legacy path) |
 | `python/turboquantdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
 | `server/` | Separate Cargo workspace — optional HTTP service |
 
 ### Data Flow
 
-**Write:** `insert_batch()` → quantize via SRHT→MSE→QJL → WAL entry → `live_codes.bin` → periodic flush to immutable segment
+**Write:** `insert_batch()` → quantize via QR→MSE→Gaussian QJL → WAL entry → `live_codes.bin` → periodic flush to immutable segment
 
 **Search (brute-force):** query → precompute MSE lookup table + QJL scale → score all live vectors → top-k
 
@@ -104,7 +104,7 @@ db.stats()
 
 ### Key Design Points
 
-- Quantization is **data-oblivious** (seed-deterministic rotations, no training phase)
+- Quantization is **data-oblivious** (seed-deterministic QR rotation + dense Gaussian projection, no training phase)
 - `ProdQuantizer` encodes as: `[MSE centroid indices (d × log₂b bits)] + [QJL bit-pack (⌈d/8⌉ bytes)]`
 - Scoring uses precomputed lookup tables — no repeated centroid arithmetic at query time
 - Thread safety: `Arc<RwLock<TurboQuantEngine>>` — concurrent reads, serialized writes

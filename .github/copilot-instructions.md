@@ -59,16 +59,16 @@ cd server && cargo test -q
 | `src/storage/backend.rs` | `StorageProvider` trait (local; extensible) |
 | `src/storage/compaction.rs` | Segment merging |
 | `src/quantizer/prod.rs` | `ProdQuantizer` — MSE + QJL orchestrator |
-| `src/quantizer/mse.rs` | `MseQuantizer` — SRHT + Lloyd-Max codebook |
-| `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit projection, bit-packed |
-| `src/linalg/hadamard.rs` | In-place O(d log d) FWHT and SRHT |
+| `src/quantizer/mse.rs` | `MseQuantizer` — QR rotation + Lloyd-Max codebook |
+| `src/quantizer/qjl.rs` | `QjlQuantizer` — dense Gaussian projection, 1-bit sign bit-packed |
+| `src/linalg/hadamard.rs` | In-place O(d log d) FWHT and SRHT (legacy path) |
 | `src/linalg/matmul.rs` | GEMM/SGEMM via matrixmultiply crate |
 | `python/turboquantdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
 | `server/` | Axum HTTP service — separate Cargo workspace |
 
 ### Data Flow
 
-**Write:** `insert_batch()` → quantize (SRHT→MSE→QJL) → WAL entry → `live_codes.bin` → periodic flush to immutable segment
+**Write:** `insert_batch()` → quantize (QR→MSE→Gaussian QJL) → WAL entry → `live_codes.bin` → periodic flush to immutable segment
 
 **Search (brute-force):** query → precompute MSE lookup table + QJL scale → score all live vectors → filter → top-k
 
@@ -173,7 +173,7 @@ db.search(q, 5, filter={"$and": [
 - Hot paths: small focused functions, avoid unnecessary allocations
 
 ### Quantization & Scoring
-- Quantization is **data-oblivious** — seed-deterministic SRHT rotations, no training
+- Quantization is **data-oblivious** — seed-deterministic QR rotation (MSE) and dense Gaussian projection (QJL), no training
 - `ProdQuantizer` encodes as: `[MSE centroid indices (d × log₂b bits)] + [QJL bit-pack (⌈d/8⌉ bytes)]`
 - Scoring uses precomputed lookup tables — no repeated centroid arithmetic at query time
 - Thread safety: `Arc<RwLock<TurboQuantEngine>>` — concurrent reads, serialized writes
