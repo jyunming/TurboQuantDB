@@ -517,10 +517,11 @@ impl TurboQuantEngine {
         for r in &records {
             if r.is_deleted { self.live_delete_slot(&r.id); }
         }
-        self.rebuild_live_codes_cache()?;
+        // Persist segments first so any rebuilds (if needed) read a complete view.
+        self.segments.flush_batch(records)?;
+        // live_codes is already updated during ingest; compact without full rebuild.
         self.live_compact_slab()?;
         self.live_codes.flush()?;
-        self.segments.flush_batch(records)?;
         self.wal.truncate()?;
         self.metadata.flush()?;
 
