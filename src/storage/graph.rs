@@ -158,17 +158,32 @@ impl GraphManager {
         let end = self.data_start + self.offsets[i + 1] as usize;
         let rec = &mmap[start..end];
         
+        if rec.len() < 4 {
+            return Err(format!("corrupt graph record for node {}: too short ({} bytes)", node_id, rec.len()));
+        }
         let num_levels = u32::from_le_bytes(rec[0..4].try_into().unwrap());
         if level >= num_levels { return Ok(Vec::new()); }
         
         let mut curr = 4;
         for l in 0..num_levels {
+            if curr + 4 > rec.len() {
+                return Err(format!("corrupt graph record for node {}: truncated at level {}", node_id, l));
+            }
             let count = u32::from_le_bytes(rec[curr..curr+4].try_into().unwrap()) as usize;
+            // Validate count is plausible given remaining bytes (each varint is at least 1 byte)
+            let max_possible = (rec.len() - curr - 4).min(count);
+            if count > rec.len() {
+                return Err(format!("corrupt graph record for node {}: implausible neighbour count {}", node_id, count));
+            }
+            let _ = max_possible;
             curr += 4;
             if l == level {
                 let mut nbs = Vec::with_capacity(count);
                 let mut last_nb = 0u32;
                 for _ in 0..count {
+                    if curr >= rec.len() {
+                        return Err(format!("corrupt graph record for node {}: varint overrun", node_id));
+                    }
                     let (delta, bytes_read) = decode_varint(&rec[curr..]);
                     let nb = last_nb + delta;
                     nbs.push(nb);
@@ -179,6 +194,9 @@ impl GraphManager {
             }
             // Skip level data
             for _ in 0..count {
+                if curr >= rec.len() {
+                    return Err(format!("corrupt graph record for node {}: varint overrun while skipping", node_id));
+                }
                 let (_, bytes_read) = decode_varint(&rec[curr..]);
                 curr += bytes_read;
             }

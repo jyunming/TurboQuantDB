@@ -82,6 +82,11 @@ impl Compactor {
     ) -> Result<Segment, Box<dyn std::error::Error + Send + Sync>> {
         let new_seg = Segment::write_batch(&self.backend, new_segment_name, live_records)?;
         for name in old_segment_names {
+            // Guard: never delete the freshly written compacted segment in case a caller
+            // bug causes new_segment_name to appear in old_segment_names.
+            if name == new_segment_name {
+                continue;
+            }
             self.backend.delete(name)?;
         }
         Ok(new_seg)

@@ -430,8 +430,13 @@ fn json_to_py(py: Python<'_>, v: &JsonValue) -> PyResult<PyObject> {
         JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(i.to_object(py))
+            } else if let Some(u) = n.as_u64() {
+                Ok(u.to_object(py))
+            } else if let Some(f) = n.as_f64() {
+                Ok(f.to_object(py))
             } else {
-                Ok(n.as_f64().unwrap().to_object(py))
+                // Extreme values outside f64 range — fall back to string
+                Ok(n.to_string().to_object(py))
             }
         }
         JsonValue::String(s) => Ok(s.to_object(py)),
@@ -496,6 +501,13 @@ fn parse_metadata_rows(
 ) -> PyResult<Vec<HashMap<String, JsonValue>>> {
     if let Some(m) = metadatas {
         if let Ok(list) = m.downcast::<PyList>() {
+            if list.len() != n {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "metadatas length {} does not match ids/vectors length {}",
+                    list.len(),
+                    n
+                )));
+            }
             let mut out = Vec::with_capacity(n);
             for item in list {
                 let dict = item.downcast::<PyDict>()?;
@@ -516,6 +528,13 @@ fn parse_document_rows(
 ) -> PyResult<Vec<Option<String>>> {
     if let Some(d) = documents {
         if let Ok(list) = d.downcast::<PyList>() {
+            if list.len() != n {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "documents length {} does not match ids/vectors length {}",
+                    list.len(),
+                    n
+                )));
+            }
             let mut out = Vec::with_capacity(n);
             for item in list {
                 out.push(item.extract::<Option<String>>()?);

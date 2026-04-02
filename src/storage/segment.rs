@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 
-/// Fixed-size record stored in a segment file.
+/// Variable-length record stored in a segment file (length-prefixed bincode encoding).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SegmentRecord {
     pub id: String,
