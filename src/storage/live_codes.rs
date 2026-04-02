@@ -3,8 +3,17 @@ use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 
 const GROW_SLOTS: usize = 16384;
+
+/// Memory-mapped slab for quantized vectors or raw float vectors.
+///
+/// # Windows safety
+/// On Windows, a file cannot be renamed or overwritten while any handle (mmap
+/// *or* the underlying `File`) is open against it.  Call [`release_handles`]
+/// before any `fs::rename` / overwrite that targets this file; the next call
+/// to any mutating method will reopen the handle automatically.
 pub struct LiveCodesFile {
-    file: File,
+    path: PathBuf,
+    file: Option<File>,
     mmap: Option<MmapMut>,
     stride: usize,
     capacity: usize,
@@ -28,7 +37,8 @@ impl LiveCodesFile {
         let len = capacity;
 
         let mut live_codes = Self {
-            file,
+            path,
+            file: Some(file),
             mmap: None,
             stride,
             capacity,
@@ -42,10 +52,26 @@ impl LiveCodesFile {
         Ok(live_codes)
     }
 
+    /// Ensure the file handle is open, reopening from the stored path if needed.
+    fn ensure_open(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.file.is_none() {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&self.path)?;
+            self.file = Some(file);
+        }
+        Ok(())
+    }
+
     fn remap(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.mmap = None;
+        self.ensure_open()?;
         if self.capacity > 0 {
-            let mmap = unsafe { MmapOptions::new().map_mut(&self.file)? };
+            let mmap = unsafe {
+                MmapOptions::new().map_mut(self.file.as_ref().expect("file handle open"))?
+            };
             self.mmap = Some(mmap);
         }
         Ok(())
@@ -66,8 +92,9 @@ impl LiveCodesFile {
     pub fn alloc_slot(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         if self.len >= self.capacity {
             let new_capacity = self.capacity + GROW_SLOTS;
-            self.mmap = None; // DROP MUST BE FIRST ON WINDOWS
-            self.file.set_len((new_capacity * self.stride) as u64)?;
+            self.mmap = None; // mmap must be dropped before set_len on Windows
+            self.ensure_open()?;
+            self.file.as_ref().unwrap().set_len((new_capacity * self.stride) as u64)?;
             self.capacity = new_capacity;
             self.remap()?;
         }
@@ -80,8 +107,9 @@ impl LiveCodesFile {
         &mut self,
         new_len: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.mmap = None; // DROP MUST BE FIRST ON WINDOWS
-        self.file.set_len((new_len * self.stride) as u64)?;
+        self.mmap = None; // mmap must be dropped before set_len on Windows
+        self.ensure_open()?;
+        self.file.as_ref().unwrap().set_len((new_len * self.stride) as u64)?;
         self.capacity = new_len;
         self.len = new_len;
         self.remap()?;
@@ -95,8 +123,18 @@ impl LiveCodesFile {
         Ok(())
     }
 
+    /// Release both the mmap and the OS file handle.
+    ///
+    /// Required on Windows before any `fs::rename` or overwrite targeting
+    /// this file.  The handle is reopened automatically on the next access.
+    pub fn release_handles(&mut self) {
+        self.mmap = None;
+        self.file = None;
+    }
+
+    /// Release the mmap only (kept for callers that don't need full handle release).
     pub fn release_mmap(&mut self) {
-        self.mmap = None; // needed on Windows before replacing the underlying file
+        self.mmap = None;
     }
 
     /// Hint the OS that this mmap will be accessed randomly (not sequentially).
@@ -131,10 +169,11 @@ impl LiveCodesFile {
     }
 
     pub fn clear(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.mmap = None; // DROP MUST BE FIRST ON WINDOWS
+        self.mmap = None; // mmap must be dropped before set_len on Windows
+        self.ensure_open()?;
+        self.file.as_ref().unwrap().set_len(0)?;
         self.len = 0;
         self.capacity = 0;
-        self.file.set_len(0)?;
         Ok(())
     }
 }
