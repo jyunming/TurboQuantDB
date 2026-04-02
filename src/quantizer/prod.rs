@@ -127,6 +127,22 @@ impl ProdQuantizer {
         qjl: &[u8],
         gamma: f64,
     ) -> f64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return unsafe { self.score_ip_encoded_lite_simd(prep, idx, qjl, gamma) };
+            }
+        }
+        self.score_ip_encoded_lite_scalar(prep, idx, qjl, gamma)
+    }
+
+    fn score_ip_encoded_lite_scalar(
+        &self,
+        prep: &PreparedIpQueryLite,
+        idx: &[CodeIndex],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> f64 {
         let mut mse_score = 0.0f32;
         let centroids = &self.mse_quantizer.centroids;
         let prep_y = &prep.y;
@@ -156,6 +172,105 @@ impl ProdQuantizer {
         }
 
         (mse_score + (gamma as f32) * prep.qjl_scale * qjl_score) as f64
+    }
+
+    /// AVX2+FMA SIMD path for score_ip_encoded_lite (used in HNSW construction).
+    ///
+    /// MSE part: manual 8-wide gather from the codebook (16–256 entries, L1-resident)
+    /// followed by FMA against the sequential prep_y array.
+    ///
+    /// QJL part: bitwise sign expansion via integer SIMD + multiply-accumulate.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn score_ip_encoded_lite_simd(
+        &self,
+        prep: &PreparedIpQueryLite,
+        idx: &[CodeIndex],
+        qjl: &[u8],
+        gamma: f64,
+    ) -> f64 {
+        use std::arch::x86_64::*;
+
+        let centroids = self.mse_quantizer.centroids.as_ptr();
+        let prep_y = prep.y.as_ptr();
+        let idx_ptr = idx.as_ptr();
+
+        let mut mse_acc = _mm256_setzero_ps();
+        let mut i = 0usize;
+
+        // Main 8-wide FMA loop — centroids fits in L1 (16–256 entries), so the
+        // manual gather has no cache-miss penalty.
+        while i + 7 < self.n {
+            let mut cents = [0.0f32; 8];
+            for j in 0..8 {
+                cents[j] = *centroids.add(*idx_ptr.add(i + j) as usize);
+            }
+            let c_vec = _mm256_loadu_ps(cents.as_ptr());
+            let y_vec = _mm256_loadu_ps(prep_y.add(i));
+            mse_acc = _mm256_fmadd_ps(c_vec, y_vec, mse_acc);
+            i += 8;
+        }
+
+        // Horizontal reduction of mse_acc
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), mse_acc);
+        let mut mse_sum: f32 = tmp[0] + tmp[1] + tmp[2] + tmp[3]
+                             + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+
+        // Scalar tail for MSE
+        while i < self.n {
+            mse_sum += *centroids.add(*idx_ptr.add(i) as usize) * *prep_y.add(i);
+            i += 1;
+        }
+
+        // QJL part: for each byte, expand 8 bits → ±1.0 sign vector via integer SIMD,
+        // then multiply-accumulate against the sequential sq array.
+        let sq_ptr = prep.sq.as_ptr();
+        let qjl_ptr = qjl.as_ptr();
+        let qjl_len = qjl.len();
+
+        let bit_masks = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+        let zero_si = _mm256_setzero_si256();
+        let pos_one = _mm256_set1_ps(1.0f32);
+        let neg_one = _mm256_set1_ps(-1.0f32);
+
+        let mut qjl_acc = _mm256_setzero_ps();
+        let mut qjl_tail = 0.0f32;
+        let mut b = 0usize;
+
+        while b < qjl_len {
+            let byte = *qjl_ptr.add(b) as i32;
+            let base_i = b << 3;
+
+            if base_i + 7 < self.n {
+                // Expand byte bits to ±1.0 sign floats using integer SIMD.
+                let byte_broadcast = _mm256_set1_epi32(byte);
+                let masked = _mm256_and_si256(byte_broadcast, bit_masks);
+                let is_zero = _mm256_cmpeq_epi32(masked, zero_si);
+                // bit=1 → pos_one, bit=0 → neg_one
+                let signs = _mm256_blendv_ps(pos_one, neg_one, _mm256_castsi256_ps(is_zero));
+                let s_vec = _mm256_loadu_ps(sq_ptr.add(base_i));
+                qjl_acc = _mm256_fmadd_ps(signs, s_vec, qjl_acc);
+            } else {
+                for bit in 0..8 {
+                    let qi = base_i + bit;
+                    if qi >= self.n {
+                        break;
+                    }
+                    let s = *sq_ptr.add(qi);
+                    qjl_tail += if (byte & (1 << bit)) != 0 { s } else { -s };
+                }
+            }
+            b += 1;
+        }
+
+        _mm256_storeu_ps(tmp.as_mut_ptr(), qjl_acc);
+        let qjl_sum = tmp[0] + tmp[1] + tmp[2] + tmp[3]
+                    + tmp[4] + tmp[5] + tmp[6] + tmp[7]
+                    + qjl_tail;
+
+        (mse_sum + (gamma as f32) * prep.qjl_scale * qjl_sum) as f64
     }
 
     pub fn score_ip_encoded(
