@@ -385,10 +385,16 @@ impl TurboQuantEngine {
                 // live_ids.bin is missing (unclean shutdown). Rebuild live_codes and
                 // id_pool entirely from the WAL entries so we have a consistent base
                 // before flush_wal_to_segment compacts and persists everything.
+                //
+                // Raw vectors (live_vraw) are NOT stored in the WAL, so we cannot
+                // recover them.  Drop the stale live_vectors.bin and fall back to
+                // dequantization reranking for this session; the file is recreated
+                // automatically on the next clean insert+close cycle.
                 engine.live_codes.clear()?;
-                if let Some(vraw) = &mut engine.live_vraw {
-                    vraw.clear()?;
-                }
+                engine.live_vraw = None;
+                let _ = std::fs::remove_file(
+                    Path::new(&engine.local_dir).join("live_vectors.bin"),
+                );
                 engine.id_pool = IdPool::new();
                 let mse_len = engine.live_mse_len();
                 let qjl_len = engine.live_qjl_len();
@@ -1288,9 +1294,9 @@ impl TurboQuantEngine {
         self.metadata.flush()?;
         self.persist_id_pool()?;
 
-        self.live_codes.release_mmap();
+        self.live_codes.release_handles();
         if let Some(vraw) = &mut self.live_vraw {
-            vraw.release_mmap();
+            vraw.release_handles();
         }
         let live_codes_path = Path::new(&self.local_dir).join("live_codes.bin");
         let live_vraw_path = Path::new(&self.local_dir).join("live_vectors.bin");
@@ -1549,9 +1555,9 @@ impl TurboQuantEngine {
         let final_path = Path::new(&self.local_dir).join("live_codes.bin");
         let vfinal_path = Path::new(&self.local_dir).join("live_vectors.bin");
 
-        self.live_codes.release_mmap();
+        self.live_codes.release_handles();
         if let Some(vraw) = &mut self.live_vraw {
-            vraw.release_mmap();
+            vraw.release_handles();
         }
 
         std::fs::rename(temp_path, &final_path)?;

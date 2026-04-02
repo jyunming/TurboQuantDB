@@ -50,8 +50,38 @@ fn test_insert_and_search() {
 
 /// Test WAL crash recovery: inserts survive without explicit flush.
 #[test]
-#[ignore = "WAL crash recovery has mmap re-initialization bug on Windows (live_compact_slab panic)"]
-fn test_wal_recovery() {}
+fn test_wal_recovery() {
+    // Simulate a crash: insert vectors and flush WAL but do NOT call close()
+    // (so live_ids.bin is never written). On reopen the engine must recover
+    // the full dataset from the WAL alone.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+    let ids_path = dir.path().join("live_ids.bin");
+
+    {
+        let mut engine = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
+        for i in 0..5u32 {
+            let v = Array1::<f64>::from_elem(8, i as f64 / 10.0);
+            engine.insert(format!("v{}", i), &v, HashMap::new()).unwrap();
+        }
+        // Simulate crash: drop without close() so live_ids.bin is missing.
+        drop(engine);
+    }
+    std::fs::remove_file(&ids_path).ok(); // make sure it's gone
+
+    // Reopen must recover from WAL without panicking.
+    let mut recovered = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
+    assert_eq!(recovered.vector_count(), 5, "all 5 vectors must be recoverable from WAL");
+
+    // Flush and verify data survives the slab compaction (used to panic on Windows).
+    recovered.flush_wal_to_segment().unwrap();
+    assert_eq!(recovered.vector_count(), 5);
+
+    // Search must work after recovery.
+    let q = Array1::<f64>::from_elem(8, 0.3);
+    let results = recovered.search(&q, 3).unwrap();
+    assert_eq!(results.len(), 3);
+}
 
 /// Test persistence: save to disk, reload, verify vector count.
 #[test]
@@ -804,8 +834,24 @@ fn test_rerank_disabled_behavior() {
 }
 
 #[test]
-#[ignore = "WAL crash recovery has mmap re-initialization bug on Windows (live_compact_slab panic)"]
-fn test_wal_versioning_and_migration() {}
+fn test_wal_versioning_and_migration() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().to_str().unwrap();
+    let wal_path = dir.path().join("wal.log");
+
+    // Write first batch, verify WAL header is present.
+    {
+        let mut engine = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
+        engine.insert("v1".to_string(), &Array1::zeros(8), HashMap::new()).unwrap();
+    }
+    let wal_bytes = std::fs::read(&wal_path).unwrap();
+    assert_eq!(&wal_bytes[0..4], b"TQWV", "WAL must start with version header");
+
+    // Reopen and verify recovery + flush work without any panic.
+    let mut engine = TurboQuantEngine::open(db_path, db_path, 8, 2, 42).unwrap();
+    engine.flush_wal_to_segment().unwrap();
+    assert_eq!(engine.vector_count(), 1);
+}
 
 #[test]
 fn test_hnsw_beam_search_recall() {
