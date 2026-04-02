@@ -63,18 +63,32 @@ impl StorageProvider for LocalProvider {
         let mut results = Vec::new();
         let search_path = self.root.join(prefix);
 
-        let target_dir = if search_path.is_dir() {
-            search_path
+        // Determine the directory to enumerate and the file-name prefix to filter on.
+        // If `prefix` contains path separators (e.g. "subdir/seg-"), split at the last
+        // separator so we enumerate the correct subdirectory and filter by filename only.
+        let (target_dir, name_prefix): (PathBuf, &str) = if search_path.is_dir() {
+            (search_path, "")
         } else {
-            search_path.parent().unwrap_or(&self.root).to_path_buf()
+            let parent = search_path.parent().unwrap_or(&self.root).to_path_buf();
+            let name_part = Path::new(prefix)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(prefix);
+            (parent, name_part)
         };
 
         if target_dir.exists() {
-            for entry in fs::read_dir(target_dir)? {
+            let dir_prefix = target_dir.strip_prefix(&self.root).ok()
+                .and_then(|p| p.to_str())
+                .map(|s| if s.is_empty() { String::new() } else { format!("{}/", s) })
+                .unwrap_or_default();
+
+            for entry in fs::read_dir(&target_dir)? {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with(prefix) || prefix.is_empty() {
-                    results.push(name);
+                if name_prefix.is_empty() || name.starts_with(name_prefix) {
+                    // Return paths relative to root so callers can use them with other backend ops
+                    results.push(format!("{}{}", dir_prefix, name));
                 }
             }
         }

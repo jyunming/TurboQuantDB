@@ -1,6 +1,12 @@
 use std::f64::consts::PI;
 
-/// Numerically stable log-gamma using Lanczos approximation.
+/// Numerically stable log-gamma using Lanczos approximation (g=7, n=8 coefficients).
+///
+/// This is equivalent to the standard Wikipedia/Numerical Recipes formulation with a
+/// `z -= 1` pre-shift: using `c[i] / (z + i)` with i starting at 0 is algebraically
+/// identical to `c[i] / ((z-1) + i + 1)` with i starting at 0. The final formula
+/// `(z - 0.5) * t.ln()` and `t = z + 6.5` are derived from that same substitution.
+/// Verified: log_gamma(1) ≈ 0, log_gamma(2) ≈ 0, log_gamma(5) ≈ ln(24) = 3.178.
 fn log_gamma(z: f64) -> f64 {
     // Reflection for small z keeps the implementation robust.
     if z < 0.5 {
@@ -133,6 +139,30 @@ pub fn expected_mse(centroids: &[f64], d: usize, num_points: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_log_gamma_known_values() {
+        // Γ(1) = 0! = 1  →  log_gamma(1) = 0
+        assert!((log_gamma(1.0)).abs() < 1e-9, "log_gamma(1) = {}", log_gamma(1.0));
+        // Γ(2) = 1! = 1  →  log_gamma(2) = 0
+        assert!((log_gamma(2.0)).abs() < 1e-9, "log_gamma(2) = {}", log_gamma(2.0));
+        // Γ(5) = 4! = 24  →  log_gamma(5) = ln(24) ≈ 3.17805...
+        let expected = 24.0_f64.ln();
+        assert!(
+            (log_gamma(5.0) - expected).abs() < 1e-9,
+            "log_gamma(5) = {}, expected {}",
+            log_gamma(5.0),
+            expected
+        );
+        // Γ(0.5) = sqrt(π)  →  log_gamma(0.5) ≈ 0.57236...
+        let expected_half = std::f64::consts::PI.sqrt().ln();
+        assert!(
+            (log_gamma(0.5) - expected_half).abs() < 1e-9,
+            "log_gamma(0.5) = {}, expected {}",
+            log_gamma(0.5),
+            expected_half
+        );
+    }
 
     #[test]
     fn test_beta_pdf_integral() {
