@@ -83,19 +83,22 @@ python benchmarks/ci_quality_gate.py   # CI gates: min recall 0.60, max latency 
 The `Database` class (thread-safe via `Arc<RwLock<TurboQuantEngine>>`) exposes:
 
 ```python
-Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True)
+Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True,
+              fast_mode=False, rerank_precision=None, collection=None)
+# collection — optional subdirectory name; opens path/collection/ for multi-namespace support
 
 db.insert(id, vector, metadata=None, document=None)
 db.insert_batch(ids, vectors, metadatas=None, documents=None, mode="insert")
-db.upsert(id, vector, ...) / db.update(id, vector, ...)
-db.update_metadata(id, metadata=None, document=None)  # metadata-only; no re-quantise
+# mode: "insert" raises RuntimeError on duplicate; "update" raises RuntimeError if missing; "upsert" always succeeds
+db.upsert(id, vector, ...) / db.update(id, vector, ...)  # update raises RuntimeError if not found
+db.update_metadata(id, metadata=None, document=None)  # raises RuntimeError if not found
 db.delete(id) / db.delete_batch(ids)
 db.get(id) / db.get_many(ids) / db.list_all()
 db.list_ids(where_filter=None, limit=None, offset=0)  # paginated, filtered id list
 db.count(filter=None)
 db.search(query, top_k, filter=None, _use_ann=True, ann_search_list_size=None, include=None)
 db.query(query_embeddings, n_results=10, where_filter=None)  # batch multi-query (2-D array)
-db.create_index(max_degree=16, search_list_size=64, alpha=1.2)
+db.create_index(max_degree=32, ef_construction=200, search_list_size=128, alpha=1.2, n_refinements=5)
 db.stats()
 len(db)  /  "id" in db      # container protocol
 ```

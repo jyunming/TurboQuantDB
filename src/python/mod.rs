@@ -507,7 +507,7 @@ impl Database {
     /// the vector.  The quantised representation is untouched.
     ///
     /// Args:
-    ///     id: ID to update. Raises ``KeyError`` if not found.
+    ///     id: ID to update. Raises ``RuntimeError`` if not found.
     ///     metadata: New metadata dict, or ``None`` to preserve existing.
     ///     document: New document string, or ``None`` to preserve existing.
     ///

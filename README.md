@@ -97,11 +97,11 @@ for r in results:
 
 ## Python API
 
-### `Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True, fast_mode=False, rerank_precision=None)`
+### `Database.open(path, dimension, bits=4, seed=42, metric="ip", rerank=True, fast_mode=False, rerank_precision=None, collection=None)`
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `path` | `str` | Directory path for database files |
+| `path` | `str` | Base directory path for database files |
 | `dimension` | `int` | Vector dimension (must match on reopen) |
 | `bits` | `int` | Quantization bits: `4` (4.2× compression) or `8` (2.47× compression, higher recall) |
 | `seed` | `int` | RNG seed for quantizer — must match across sessions |
@@ -109,20 +109,24 @@ for r in results:
 | `rerank` | `bool` | Enable reranking of ANN candidates. Default `True`. Precision controlled by `rerank_precision`. |
 | `fast_mode` | `bool` | Skip QJL stage — ~30% faster ingest, ~5pp recall loss. Default `False`. |
 | `rerank_precision` | `str\|None` | `None` (default) — dequantization reranking, no extra storage; `"f16"` — float16 exact reranking (+n×d×2 bytes); `"f32"` — float32 exact reranking (+n×d×4 bytes) |
+| `collection` | `str\|None` | Optional subdirectory name. If given, opens `path/collection/` — allows multiple isolated namespaces under one base directory. |
 
 ### Insert / Update / Delete
 
 ```python
 db.insert(id, vector, metadata=None, document=None)
 db.insert_batch(ids, vectors, metadatas=None, documents=None, mode="insert")
-# mode: "insert" | "upsert" | "update"
+# mode: "insert"  → raises RuntimeError if any ID already exists
+#       "upsert"  → insert or replace (always succeeds)
+#       "update"  → raises RuntimeError if any ID does not exist
 
-db.upsert(id, vector, metadata=None, document=None)
-db.update(id, vector, metadata=None, document=None)
-db.delete(id)                                        # → bool
-db.delete_batch(ids)                                 # delete multiple ids at once
+db.upsert(id, vector, metadata=None, document=None)   # insert or replace
+db.update(id, vector, metadata=None, document=None)   # raises RuntimeError if id not found
+db.delete(id)                                         # → bool
+db.delete_batch(ids)                                  # delete multiple ids at once
 
 # Metadata-only update — no re-upload of vector needed
+# raises RuntimeError if id not found
 db.update_metadata(id, metadata=None, document=None)
 ```
 

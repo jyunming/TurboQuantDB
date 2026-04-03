@@ -20,7 +20,7 @@ Requires Python 3.10+. Pre-built wheels available for Linux, Windows, and macOS.
 from turboquantdb import Database
 
 db = Database.open(
-    path,                    # str — directory path, created if it doesn't exist
+    path,                    # str — base directory path, created if it doesn't exist
     dimension,               # int — vector dimension, must match on every reopen
     bits=4,                  # int — quantization bits: 4 (4.2× compression) or 8 (2.47×, higher recall)
     seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
@@ -30,10 +30,22 @@ db = Database.open(
     rerank_precision=None,   # str|None — None = dequant reranking (no extra storage)
                              #            "f16" = float16 exact reranking (+n×d×2 bytes)
                              #            "f32" = float32 exact reranking (+n×d×4 bytes)
+    collection=None,         # str|None — subdirectory name for the collection; if given,
+                             #            the DB is stored at path/collection/ instead of path/
 )
 ```
 
 `path` must use the same `dimension`, `bits`, `seed`, and `metric` every time it is opened — these are baked into the quantizer and cannot be changed after creation.
+
+### Multi-collection pattern
+
+Use the `collection` parameter to store multiple isolated namespaces under one base directory:
+
+```python
+articles = Database.open("./mydb", dimension=1536, collection="articles")
+images   = Database.open("./mydb", dimension=512,  collection="images")
+# Stored at ./mydb/articles/ and ./mydb/images/ respectively
+```
 
 ---
 
@@ -91,10 +103,14 @@ db.insert_batch(
     documents=None,  # list[str | None] | None
     mode="insert"    # "insert" | "upsert" | "update"
 )
+# mode semantics:
+#   "insert"  — raises RuntimeError if any ID already exists (atomic: fails at first duplicate)
+#   "upsert"  — insert new IDs or replace existing ones (always succeeds)
+#   "update"  — raises RuntimeError if any ID does not exist (atomic: fails at first missing ID)
 
-# Upsert / update
-db.upsert(id, vector, metadata=None, document=None)  # insert or replace
-db.update(id, vector, metadata=None, document=None)  # error if id not found
+# Single upsert / update
+db.upsert(id, vector, metadata=None, document=None)  # insert or replace (always succeeds)
+db.update(id, vector, metadata=None, document=None)  # raises RuntimeError if id not found
 ```
 
 ---
@@ -117,7 +133,7 @@ db.count(filter=None)            # int — number of matching vectors
 
 # Update metadata without re-uploading the vector
 db.update_metadata(
-    id,                          # str — must exist; raises KeyError otherwise
+    id,                          # str — must exist; raises RuntimeError otherwise
     metadata=None,               # dict | None — replaces metadata; None = keep existing
     document=None,               # str | None — replaces document; None = keep existing
 )
@@ -171,15 +187,15 @@ Build the index **after** loading your data. Rebuild after large batches of inse
 
 ```python
 db.create_index(
-    max_degree=32,        # int — max neighbors per node; higher = better recall, larger graph
-    ef_construction=200,  # int — beam size during build; higher = better quality, slower build
-    n_refinements=5,      # int — refinement passes; higher = better graph, slower build
-    search_list_size=128, # int — alias for ef_construction
-    alpha=1.2,            # float — pruning aggressiveness
+    max_degree=32,        # int — max neighbors per node; higher = better recall, larger graph (default 32)
+    ef_construction=200,  # int — beam size during build; higher = better quality, slower build (default 200)
+    n_refinements=5,      # int — refinement passes; higher = better graph, slower build (default 5)
+    search_list_size=128, # int — alias for ef_construction (default 128)
+    alpha=1.2,            # float — pruning aggressiveness (default 1.2)
 )
 ```
 
-Effect of each parameter on quality vs. build time:
+All parameters are optional. `None` uses the listed defaults.
 
 | Parameter | Recall impact | Build time impact |
 |-----------|--------------|------------------|
@@ -237,26 +253,46 @@ Filter semantics:
 
 ## RAG Integration
 
+`TurboQuantRetriever` is a lightweight LangChain-style wrapper around `Database`.
+
 ```python
 from turboquantdb.rag import TurboQuantRetriever
 
 retriever = TurboQuantRetriever(
-    db_path="./rag_db",
-    dimension=1536,
-    bits=4,
-    metric="cosine"
+    db_path,                # str — directory path for the database
+    dimension=1536,         # int — vector dimension
+    bits=4,                 # int — quantization bits (4 or 8)
+    seed=42,                # int — RNG seed
+    metric="ip",            # str — "ip", "cosine", or "l2"
+    rerank_precision=None,  # str|None — None (dequant), "f16", or "f32"
 )
+```
 
+### `add_texts(texts, embeddings, metadatas=None)`
+
+Batch-insert documents with their embeddings.
+
+```python
 retriever.add_texts(
     texts=["Document one.", "Document two."],
     embeddings=[vec1, vec2],       # np.ndarray or list[list[float]]
-    metadatas=[{"src": "a"}, {"src": "b"}]
+    metadatas=[{"src": "a"}, {"src": "b"}]  # optional
 )
+```
 
+IDs are auto-assigned as `doc_0`, `doc_1`, … continuing from the current count.
+
+### `similarity_search(query_embedding, k=4)`
+
+Search for the `k` most similar documents.
+
+```python
 results = retriever.similarity_search(query_embedding=query_vec, k=5)
 for r in results:
-    print(r["score"], r["text"])
+    print(r["score"], r["text"], r["metadata"])
 ```
+
+Returns a `list[dict]` with keys: `"text"`, `"metadata"`, `"score"`.
 
 ---
 
