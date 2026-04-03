@@ -270,6 +270,16 @@ TurboQuantDB is an embedded database — it runs in-process with no daemon.
 
 The combination gives unbiased inner product estimates with near-optimal distortion, requiring no training data.
 
+### What comes from the paper vs. what is added here
+
+The TurboQuant paper contributes the **quantization algorithm** — how to compress vectors and estimate inner products accurately. Its experiments use flat (exhaustive) search: all database vectors are scored against every query using the LUT-based asymmetric scorer. The paper's "indexing time virtually zero" claim refers to the quantizer requiring no training data, not to graph construction.
+
+**From the paper:** two-stage MSE + QJL quantization, QR rotation, Lloyd-Max codebook, asymmetric LUT scoring, unbiased inner product estimation.
+
+**Added by TurboQuantDB (not in the paper):** WAL persistence, memory-mapped storage, metadata/documents, HNSW graph index, reranking, Python bindings, and the HTTP server.
+
+The brute-force search path (`_use_ann=False`) is the paper-conformant mode — it scores all vectors using TurboQuant's LUT scorer, matching the paper's experimental setup exactly. The HNSW index is a practical engineering addition that reduces the candidate set before scoring, enabling sub-linear search at the cost of approximate recall.
+
 ### Module Map
 
 | Path | Responsibility |
@@ -306,6 +316,24 @@ See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/serv
 | `TQ_SERVER_ADDR` | `127.0.0.1:8080` | Bind address |
 | `TQ_LOCAL_ROOT` | `./data` | Storage root |
 | `TQ_JOB_WORKERS` | `2` | Async job thread count |
+
+---
+
+## Performance Roadmap
+
+The current implementation already uses AVX2 SIMD for FWHT, the MSE centroid scan,
+and the QJL bit-unpack inner product.
+
+**GPU acceleration** — batch ingest would benefit from cuBLAS GEMM (~3–5× for
+large batches on high-end cards). The ANN search path is memory-bound, not
+compute-bound, so GPU benefit there is minimal; the bottleneck is random cache
+misses during HNSW graph traversal rather than floating-point throughput.
+
+**AVX-512 codebook scan** — on modern Intel CPUs the MSE centroid lookup can be
+vectorised 2× wider with AVX-512, potentially halving scoring latency per batch.
+
+**Persistent HNSW** — incremental graph updates (no full rebuild after each ingest
+batch) would allow streaming use cases without periodic `create_index()` calls.
 
 ---
 
