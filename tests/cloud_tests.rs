@@ -41,7 +41,7 @@ fn test_local_file_uri_storage() -> Result<(), Box<dyn std::error::Error + Send 
 
     // Build index and verify upload
     let mut engine2 = engine2;
-    engine2.create_index(32, 64)?;
+    engine2.create_index_with_params(32, 200, 64, 1.2, 5)?;
 
     // ANN Search
     let results = engine2.search(&query, 5)?;

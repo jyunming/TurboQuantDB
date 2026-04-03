@@ -173,6 +173,24 @@ mod tests {
     }
 
     #[test]
+    fn log_gamma_reflection_formula_z_less_than_half() {
+        // Exercises the z < 0.5 reflection branch.
+        // By reflection: Γ(z)·Γ(1-z) = π/sin(πz)
+        // → log_gamma(z) + log_gamma(1-z) = ln(π) - ln(sin(πz))
+        use std::f64::consts::PI;
+        for &z in &[0.1_f64, 0.2, 0.3, 0.4, 0.49] {
+            let lg_z = log_gamma(z);        // triggers reflection branch
+            let lg_1mz = log_gamma(1.0 - z); // normal branch
+            let expected = (PI / (PI * z).sin()).ln();
+            let actual = lg_z + lg_1mz;
+            assert!(
+                (actual - expected).abs() < 1e-9,
+                "reflection identity failed for z={z}: got {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn test_beta_pdf_integral() {
         let d = 1536;
         let num_points = 100_000;
@@ -215,5 +233,14 @@ mod tests {
 
         // Assert within ~5% of paper's 0.36
         assert!((mse_b1 - 0.36).abs() < 0.05);
+    }
+
+    #[test]
+    fn beta_pdf_out_of_range_returns_zero() {
+        // Exercises the early-return branch: |x| >= 1.0
+        assert_eq!(beta_pdf(1.0, 16), 0.0);
+        assert_eq!(beta_pdf(-1.0, 16), 0.0);
+        assert_eq!(beta_pdf(1.5, 16), 0.0);
+        assert_eq!(beta_pdf(-2.0, 16), 0.0);
     }
 }

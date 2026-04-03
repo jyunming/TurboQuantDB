@@ -38,6 +38,8 @@ pub struct MseQuantizer {
 }
 
 impl MseQuantizer {
+    /// Create a new `MseQuantizer` for `d`-dimensional vectors with `b`-bit codebook and the
+    /// given `seed`. Generates the SRHT diagonal signs and Lloyd-Max centroids deterministically.
     pub fn new(d: usize, b: usize, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let n = d.next_power_of_two();
@@ -76,6 +78,8 @@ impl MseQuantizer {
         inverse_srht(y, &self.rotation_signs, out);
     }
 
+    /// Quantize a single `d`-dimensional vector: apply SRHT rotation, then map each
+    /// rotated dimension to the nearest codebook centroid. Returns `n` centroid indices.
     pub fn quantize(&self, x: &[f32]) -> Vec<CodeIndex> {
         assert_eq!(x.len(), self.d);
         let mut y = vec![0.0f32; self.n];
@@ -88,6 +92,8 @@ impl MseQuantizer {
         indices
     }
 
+    /// Batch version of [`quantize`](Self::quantize): each column of `xs` is an independent
+    /// `d`-dimensional input vector. Rows are quantized in parallel via Rayon.
     pub fn quantize_batch(&self, xs: &DMatrix<f32>) -> Vec<Vec<CodeIndex>> {
         assert_eq!(xs.nrows(), self.d);
         let num_vecs = xs.ncols();
@@ -131,6 +137,8 @@ impl MseQuantizer {
         }
     }
 
+    /// Reconstruct a `d`-dimensional vector from `n` centroid indices by looking up
+    /// centroids and applying the inverse SRHT rotation.
     pub fn dequantize(&self, indices: &[CodeIndex]) -> Array1<f64> {
         assert_eq!(indices.len(), self.n);
         let mut y_tilde = vec![0.0f32; self.n];
@@ -146,6 +154,8 @@ impl MseQuantizer {
         out
     }
 
+    /// Batch dequantization: each element of `indices_batch` is a slice of `n` centroid
+    /// indices. Returns a `d × num_vecs` matrix of reconstructed float32 vectors.
     pub fn dequantize_batch(&self, indices_batch: &[Vec<CodeIndex>]) -> DMatrix<f32> {
         let num_vecs = indices_batch.len();
         if num_vecs == 0 {

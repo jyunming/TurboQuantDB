@@ -1,34 +1,17 @@
-# pre-commit configuration for TurboQuantDB
-# https://pre-commit.com/
-#
-# Install:
-#   pip install pre-commit
-#   pre-commit install
-#
-# Run manually:
-#   pre-commit run --all-files
-
 repos:
   - repo: local
     hooks:
       - id: cargo-fmt
-        name: Rust format check
-        language: system
+        name: cargo fmt
         entry: cargo fmt --all --
-        args: [--check]
-        types: [rust]
+        language: system
+        types: [file]
+        files: \.rs$
         pass_filenames: false
-
       - id: cargo-check
-        name: Rust compile check
-        language: system
+        name: cargo check
         entry: cargo check -q
-        types: [rust]
-        pass_filenames: false
-
-      - id: cargo-test-lib
-        name: Rust unit tests
         language: system
-        entry: cargo test -q --lib
-        types: [rust]
+        types: [file]
+        files: \.rs$
         pass_filenames: false

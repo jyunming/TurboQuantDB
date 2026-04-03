@@ -34,3 +34,8 @@ Issues = "https://github.com/jyunming/TurboQuantDB/issues"
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
+
+[tool.pytest.ini_options]
+# Use a project-local temp dir to avoid Windows AppData permission issues
+tmp_path_retention_policy = "failed"
+addopts = ["--basetemp=t/pytest_tmp"]

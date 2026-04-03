@@ -1,4 +1,3 @@
-use ndarray::Array1;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -24,7 +23,7 @@ fn bench_batch_crud_large() -> Result<(), Box<dyn std::error::Error + Send + Syn
             meta.insert("idx".to_string(), JsonValue::Number((idx as i64).into()));
             items.push(BatchWriteItem {
                 id: format!("id-{idx}"),
-                vector: Array1::<f64>::from_iter((0..64).map(|d| (idx + d) as f64 / 1000.0)),
+                vector: (0..64).map(|d| (idx + d) as f32 / 1000.0).collect(),
                 metadata: meta,
                 document: None,
             });
@@ -41,7 +40,7 @@ fn bench_batch_crud_large() -> Result<(), Box<dyn std::error::Error + Send + Syn
 
     let start_delete = Instant::now();
     let delete_ids: Vec<String> = (0..250).map(|i| format!("id-{i}")).collect();
-    let deleted = engine.delete_many(&delete_ids)?;
+    let deleted = engine.delete_batch(delete_ids)?;
     engine.flush_wal_to_segment()?;
     let delete_elapsed = start_delete.elapsed();
 

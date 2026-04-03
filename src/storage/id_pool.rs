@@ -172,4 +172,64 @@ mod tests {
         assert_eq!(p.slot_count(), 1);
         assert_eq!(p.active_count(), 1);
     }
+
+    #[test]
+    fn bytes_len_reflects_stored_data() {
+        let mut p = IdPool::new();
+        assert_eq!(p.bytes_len(), 0);
+        p.insert("hello");
+        assert_eq!(p.bytes_len(), 5);
+        p.insert("world");
+        assert_eq!(p.bytes_len(), 10);
+    }
+
+    #[test]
+    fn clear_resets_all_state() {
+        let mut p = IdPool::new();
+        p.insert("a");
+        p.insert("b");
+        assert_eq!(p.slot_count(), 2);
+        assert_eq!(p.active_count(), 2);
+        assert!(p.bytes_len() > 0);
+        p.clear();
+        assert_eq!(p.slot_count(), 0);
+        assert_eq!(p.active_count(), 0);
+        assert_eq!(p.bytes_len(), 0);
+        assert_eq!(p.contains("a"), false);
+        assert_eq!(p.contains("b"), false);
+    }
+
+    #[test]
+    fn delete_by_slot_out_of_bounds_returns_false() {
+        let mut p = IdPool::new();
+        // Empty pool — any slot is out of bounds
+        assert_eq!(p.delete_by_slot(0), false);
+        assert_eq!(p.delete_by_slot(99), false);
+    }
+
+    #[test]
+    fn delete_by_slot_already_dead_returns_false() {
+        let mut p = IdPool::new();
+        let slot = p.insert("x");
+        assert_eq!(p.delete_by_slot(slot), true);
+        // Second delete on same slot — already dead
+        assert_eq!(p.delete_by_slot(slot), false);
+        assert_eq!(p.active_count(), 0);
+    }
+
+    #[test]
+    fn get_str_on_out_of_bounds_slot_returns_none() {
+        let p = IdPool::new();
+        assert_eq!(p.get_str(0), None);
+        assert_eq!(p.get_str(100), None);
+    }
+
+    #[test]
+    fn get_str_on_deleted_slot_returns_none() {
+        let mut p = IdPool::new();
+        let slot = p.insert("ghost");
+        assert_eq!(p.get_str(slot), Some("ghost"));
+        p.delete_by_slot(slot);
+        assert_eq!(p.get_str(slot), None);
+    }
 }

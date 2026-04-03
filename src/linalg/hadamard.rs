@@ -234,7 +234,6 @@ mod tests {
 
     #[test]
     fn srht_preserves_norm() {
-        let d = 4;
         let x = vec![1.0f32, 0.0, 0.0, 0.0];
         let signs = vec![1.0f32; 4];
         let mut out = vec![0.0f32; 4];
@@ -279,6 +278,42 @@ mod tests {
                 x[i],
                 x_hat[i]
             );
+        }
+    }
+
+    /// Exercises the AVX2 h<8 scalar path and scale_avx2 remainder (n not a multiple of 8).
+    /// On x86_64 with AVX2: fwht_avx2 is called; for h=1,2,4 the else branch (scalar) fires.
+    /// srht with d=3 (n=4): scale_avx2 gets n=4, full=0, all 4 elements go through remainder.
+    #[test]
+    fn fwht_n16_exercises_avx2_small_h_scalar_branch() {
+        // n=16: AVX2 path with h=1,2,4 (all < 8) → scalar fallback inside fwht_avx2.
+        let mut a = vec![1.0f32; 16];
+        fwht(&mut a);
+        assert_eq!(a[0], 16.0, "sum should be 16");
+        for &v in &a[1..] {
+            assert_eq!(v, 0.0, "all other elements should be 0");
+        }
+        // Apply again: FWHT([16, 0, …, 0]) = [16, 16, …, 16]
+        fwht(&mut a);
+        for &v in &a {
+            assert_eq!(v, 16.0, "second FWHT of impulse should be flat");
+        }
+    }
+
+    #[test]
+    fn srht_non_multiple_of_8_triggers_scale_remainder() {
+        // d=3, n=4: scale_avx2 gets n=4 → full=0, remainder loop covers all 4 elements.
+        let d = 3usize;
+        let x = vec![1.0f32, 2.0, 3.0];
+        let n = d.next_power_of_two(); // 4
+        let signs = vec![1.0f32; n];
+        let mut out = vec![0.0f32; n];
+        srht(&x, &signs, &mut out);
+        // inverse should recover x
+        let mut x_hat = vec![0.0f32; d];
+        inverse_srht(&out, &signs, &mut x_hat);
+        for i in 0..d {
+            assert!((x[i] - x_hat[i]).abs() < 1e-5, "mismatch at {i}");
         }
     }
 }

@@ -15,6 +15,11 @@
 # Wheel builds
 /dist/
 
+# Compiled Python extension (local maturin develop artifacts)
+python/turboquantdb/*.pyd
+python/turboquantdb/*.so
+python/turboquantdb/*.pdb
+
 # Secrets and local config
 .env
 /.claude/
