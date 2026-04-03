@@ -8,52 +8,57 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ## [Unreleased]
 
+---
+
+## [0.1.0] — 2026-04-03
+
 ### Added
-- `rerank_precision` parameter to `Database.open()` — opt-in raw-vector reranking (`"f16"` / `"f32"`, default `None` = dequantization)
-- f16 HNSW build scorer — HNSW construction scorer now reads f16 raw vectors when `rerank_precision="f16"`
+
+- `rerank_precision` parameter on `Database.open()` — opt-in raw-vector reranking (`"f16"` / `"f32"`, default `None` = dequantization)
+- `fast_mode` parameter on `Database.open()` — skip QJL stage for ~30% faster ingest at ~5pp recall cost
+- `collection` parameter on `Database.open()` — opens `path/collection/` sub-directory for multi-namespace support
+- `delete_batch(ids)` — delete multiple vectors in one call, returns count deleted
+- `count(filter=None)` — count active vectors, optionally filtered
+- `list_ids(where_filter, limit, offset)` — paginated, filtered ID listing
+- `update_metadata(id, metadata, document)` — metadata/document-only update without re-uploading vector
+- `query(query_embeddings, n_results, where_filter)` — batch multi-query accepting a 2-D numpy array
+- `include=` parameter on `search()` — control which fields are returned (`"id"`, `"score"`, `"metadata"`, `"document"`)
+- New metadata filter operators: `$in`, `$nin`, `$exists`, `$contains`
+- Python container protocol: `len(db)` and `"id" in db`
+- f16 HNSW build scorer — construction scorer reads f16 raw vectors when `rerank_precision="f16"`
 - `half` crate dependency for f16 encoding/decoding
 
 ### Fixed
+
 - HNSW build scorer hardcoded f32 reads — now branches on manifest `rerank_precision`
-
----
-
-## [0.1.0] — 2025
+- `bench_batch_crud` integration test: updated to `delete_batch` API
+- `cloud_tests` integration test: updated to `create_index_with_params` API
 
 ### Performance
 
-- **perf(hnsw)**: skip QJL scoring loop when `gamma=0` in fast_mode (`4a8b9ee`)
-- **perf(search)**: reuse index buffer in search closures + thread_local SRHT temp (`918a137`)
-- **perf(search)**: eliminate per-scoring-call allocations, fix EF_UPPER cap (`eddb1fb`)
-- **perf(hnsw)**: AVX2+FMA SIMD for `score_ip_encoded_lite` construction scorer (`3f7d993`)
-- **perf(hnsw)**: pre-cache encoded vecs, remove `cand_pool` floor, tunable n_refinements (`f95bcb6`)
-- **perf(ingest)**: f32 hot path, AVX2 FWHT, WAL V3 packing, zero-copy batch quantize (`60f6d41`)
-- **perf(quantizer, engine)**: parallel quantize/dequantize, fast_mode QJL skip, centroid-lookup HNSW build (`fb96ffb`)
-- **perf(search)**: parallel brute-force scan via rayon `par_chunks` (`2329ebc`)
-- **perf(quantizer)**: SGEMM acceleration + O(d log d) SRHT fast-path (`38a4804`)
-- **perf(quantizer)**: faster bit-unpack for packed MSE codes (`714f8a0`)
+- **perf(hnsw)**: skip QJL scoring loop when `gamma=0` in fast_mode
+- **perf(search)**: reuse index buffer in search closures + thread_local SRHT temp
+- **perf(search)**: eliminate per-scoring-call allocations, fix EF_UPPER cap
+- **perf(hnsw)**: AVX2+FMA SIMD for `score_ip_encoded_lite` construction scorer
+- **perf(hnsw)**: pre-cache encoded vecs, remove `cand_pool` floor, tunable `n_refinements`
+- **perf(ingest)**: f32 hot path, AVX2 FWHT, WAL V3 packing, zero-copy batch quantize
+- **perf(quantizer, engine)**: parallel quantize/dequantize, fast_mode QJL skip, centroid-lookup HNSW build
+- **perf(search)**: parallel brute-force scan via rayon `par_chunks`
+- **perf(quantizer)**: SGEMM acceleration + O(d log d) SRHT fast-path
+- **perf(quantizer)**: faster bit-unpack for packed MSE codes
 
-### Fixes
+### Features (algorithm)
 
-- **fix(storage)**: dequantization-based reranking — no `live_vectors.bin` overhead (`4325447`)
-- **fix(storage)**: change rerank default to `false`, eliminating `live_vectors.bin` overhead (`14e9e27`)
-- **fix(hnsw)**: correct HNSW construction, `ef_construction` param, fair LanceDB benchmark (`f051400`)
-
-### Features
-
-- **feat(quantizer)**: switch to paper-conformant QR rotation and Gaussian QJL projection (`62ca95b`)
-- **refactor(quantizer)**: unify rotation to SRHT-only, drop QR/Gaussian dense paths (`e7ecf46`)
-- **feat(storage)**: de-duplicate codes and persist id pool (`1833fe1`)
-- **feat(src)**: storage, quantizer, and linalg improvements (`1439da2`)
+- **feat(quantizer)**: switch to paper-conformant QR rotation and Gaussian QJL projection
+- **feat(storage)**: de-duplicate codes and persist id pool
+- **feat(storage)**: dequantization-based reranking — no `live_vectors.bin` overhead by default
 
 ### Infrastructure
 
-- **ci**: add CI and PyPI release workflows (`59e98ff`)
-- **ci**: set all Python versions for Linux wheel builds (`6cb18a3`)
-- **chore(version)**: reset to 0.1.0 and establish single source of truth in `pyproject.toml` (`258ff59`)
-- **chore**: consolidate repo — remove stale files, fix `.gitignore`, add MCP config (`36ee808`)
-- **docs**: rewrite all docs for newcomer clarity (`4aff5de`)
-- **docs**: add `CLAUDE.md` with build commands and architecture overview (`6b6dd05`)
+- Python test suite: 95 tests covering all API methods, filter operators, batch ops, RAG wrapper
+- CI: release workflow builds wheels for Python 3.10 / 3.11 / 3.12 / 3.13 on Linux, Windows, macOS
+- **docs**: complete Python API reference (`docs/PYTHON_API.md`) with all methods, parameters, error types
+- **chore(version)**: single source of truth in `pyproject.toml`; `Cargo.toml` kept in sync manually
 
 ---
 
