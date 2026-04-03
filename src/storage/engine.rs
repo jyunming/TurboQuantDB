@@ -415,6 +415,14 @@ impl TurboQuantEngine {
 
         let id_pool_loaded = if let Ok(ip) = load_id_pool(local_dir, &engine.backend) {
             engine.id_pool = ip;
+            // live_codes.open() sets len = capacity (file size / stride) because the file
+            // is pre-allocated in GROW_SLOTS increments.  Correct len to the actual number
+            // of populated slots so that the next alloc_slot() returns the right index.
+            let slot_count = engine.id_pool.slot_count();
+            engine.live_codes.set_len(slot_count);
+            if let Some(vraw) = engine.live_vraw.as_mut() {
+                vraw.set_len(slot_count);
+            }
             true
         } else {
             false
@@ -455,7 +463,7 @@ impl TurboQuantEngine {
                         s
                     } else {
                         // insert: alloc new slot
-                        let s = engine.id_pool.insert(&entry.id);
+                        let s = engine.id_pool.insert(&entry.id)?;
                         let new_slot = engine.live_codes.alloc_slot()?;
                         debug_assert_eq!(s as usize, new_slot);
                         let rec = engine.live_codes.get_slot_mut(new_slot);
@@ -1636,11 +1644,11 @@ impl TurboQuantEngine {
         qjl: &[u8],
         gamma: f32,
         norm: f32,
-    ) -> u32 {
-        let slot = self.id_pool.insert(id);
-        let new_slot = self.live_codes.alloc_slot().unwrap();
+    ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+        let slot = self.id_pool.insert(id)?;
+        let new_slot = self.live_codes.alloc_slot()?;
         if let Some(vraw) = &mut self.live_vraw {
-            let _ = vraw.alloc_slot().unwrap();
+            let _ = vraw.alloc_slot()?;
         } // Keep aligned
         let mse_len = self.live_mse_len();
         let qjl_len = self.live_qjl_len();
@@ -1651,7 +1659,7 @@ impl TurboQuantEngine {
         rec[mse_len + qjl_len..mse_len + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
         rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(&norm.to_le_bytes());
         rec[mse_len + qjl_len + 8] = 0u8;
-        slot
+        Ok(slot)
     }
 
     fn live_alloc_or_update(
@@ -1661,7 +1669,7 @@ impl TurboQuantEngine {
         qjl: &[u8],
         gamma: f32,
         norm: f32,
-    ) -> u32 {
+    ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(slot) = self.id_pool.get_slot(id) {
             let mse_len = self.live_mse_len();
             let qjl_len = self.live_qjl_len();
@@ -1672,7 +1680,7 @@ impl TurboQuantEngine {
             rec[mse_len + qjl_len..mse_len + qjl_len + 4].copy_from_slice(&gamma.to_le_bytes());
             rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(&norm.to_le_bytes());
             rec[mse_len + qjl_len + 8] = 0u8;
-            slot
+            Ok(slot)
         } else {
             self.live_alloc_slot(id, indices, qjl, gamma, norm)
         }
@@ -1723,7 +1731,7 @@ impl TurboQuantEngine {
                 nv.get_slot_mut(next_alloc).copy_from_slice(old_vrec);
             }
 
-            new_pool.insert(&id);
+            new_pool.insert(&id)?;
         }
 
         new_codes.truncate_to(new_pool.active_count())?;
@@ -1866,7 +1874,7 @@ impl TurboQuantEngine {
                 &entry.qjl_bits,
                 entry.gamma,
                 norm,
-            );
+            )?;
             self.live_save_raw_vector(slot, &vec_f32);
             self.metadata.put(slot, &meta)?;
         }
@@ -1919,7 +1927,7 @@ impl TurboQuantEngine {
                     &entry.qjl_bits,
                     entry.gamma,
                     norm,
-                );
+                )?;
                 self.live_save_raw_vector(slot, &item.vector);
                 metadata_entries.push((slot, meta));
                 wal_entries.push(entry);
@@ -4220,7 +4228,7 @@ mod tests {
         let p = dir.path().to_str().unwrap();
         let d = 8;
         let mut e = open_default(p, d);
-        let mut m = |tag: &str| {
+        let m = |tag: &str| {
             let mut h = no_meta();
             h.insert("tag".into(), json!(tag));
             h
@@ -4262,7 +4270,7 @@ mod tests {
         let p = dir.path().to_str().unwrap();
         let d = 8;
         let mut e = open_default(p, d);
-        let mut m = |tag: &str| {
+        let m = |tag: &str| {
             let mut h = no_meta();
             h.insert("tag".into(), json!(tag));
             h
@@ -4333,7 +4341,7 @@ mod tests {
         let p = dir.path().to_str().unwrap();
         let d = 8;
         let mut e = open_default(p, d);
-        let mut m = |s: &str| {
+        let m = |s: &str| {
             let mut h = no_meta();
             h.insert("title".into(), json!(s));
             h

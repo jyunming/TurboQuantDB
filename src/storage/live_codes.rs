@@ -164,6 +164,20 @@ impl LiveCodesFile {
         self.len
     }
 
+    /// Override `len` without modifying the file.
+    ///
+    /// Used by the engine after loading the IdPool on reopen: the file may be
+    /// pre-allocated to `capacity > actual_len` slots, so `len` must be
+    /// corrected to match the number of populated slots tracked by the IdPool.
+    pub fn set_len(&mut self, len: usize) {
+        debug_assert!(
+            len <= self.capacity,
+            "set_len({len}) exceeds capacity({})",
+            self.capacity
+        );
+        self.len = len;
+    }
+
     pub fn stride(&self) -> usize {
         self.stride
     }

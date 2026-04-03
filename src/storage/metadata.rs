@@ -136,7 +136,15 @@ impl MetadataStore {
         let mut magic = [0u8; 4];
         cur.read_exact(&mut magic)?;
         if &magic != b"M2S1" {
-            return Ok(HashMap::new());
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid metadata magic in {}: expected {:?}, found {:?}",
+                    path.display(),
+                    b"M2S1",
+                    magic
+                ),
+            )));
         }
 
         let mut count_buf = [0u8; 8];

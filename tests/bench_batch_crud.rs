@@ -45,7 +45,7 @@ fn bench_batch_crud_large() -> Result<(), Box<dyn std::error::Error + Send + Syn
     let delete_elapsed = start_delete.elapsed();
 
     println!(
-        "batch benchmark: inserted={} in {:?}, get_many(10k)={} in {:?}, delete_many(5k)={} in {:?}",
+        "batch benchmark: inserted={} in {:?}, get_many(500)={} in {:?}, delete_many(250)={} in {:?}",
         total,
         insert_elapsed,
         got.len(),

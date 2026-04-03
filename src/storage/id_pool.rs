@@ -33,16 +33,17 @@ impl IdPool {
         self.get_slot(id).is_some()
     }
 
-    pub fn insert(&mut self, id: &str) -> u32 {
+    pub fn insert(&mut self, id: &str) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(slot) = self.get_slot(id) {
-            return slot;
+            return Ok(slot);
         }
 
-        assert!(id.len() <= u16::MAX as usize, "id too long for u16 length");
-        assert!(
-            self.bytes.len() <= u32::MAX as usize,
-            "id pool byte buffer exceeds 4 GiB — offsets would overflow u32"
-        );
+        if id.len() > u16::MAX as usize {
+            return Err(format!("id is too long ({} bytes, max {})", id.len(), u16::MAX).into());
+        }
+        if self.bytes.len() > u32::MAX as usize {
+            return Err("id pool byte buffer exceeds 4 GiB — too many unique IDs inserted".into());
+        }
 
         let slot = self.offsets.len() as u32;
         let hash = fnv1a64(id.as_bytes());
@@ -55,7 +56,7 @@ impl IdPool {
 
         self.lookup.entry(hash).or_default().push(slot);
         self.active_count += 1;
-        slot
+        Ok(slot)
     }
 
     pub fn get_slot(&self, id: &str) -> Option<u32> {
@@ -164,8 +165,8 @@ mod tests {
     #[test]
     fn insert_get_delete_roundtrip() {
         let mut p = IdPool::new();
-        let a = p.insert("a");
-        let b = p.insert("b");
+        let a = p.insert("a").unwrap();
+        let b = p.insert("b").unwrap();
         assert_eq!(a, 0);
         assert_eq!(b, 1);
         assert_eq!(p.get_slot("a"), Some(0));
@@ -182,8 +183,8 @@ mod tests {
     #[test]
     fn duplicate_insert_returns_existing_slot() {
         let mut p = IdPool::new();
-        let a0 = p.insert("same");
-        let a1 = p.insert("same");
+        let a0 = p.insert("same").unwrap();
+        let a1 = p.insert("same").unwrap();
         assert_eq!(a0, a1);
         assert_eq!(p.slot_count(), 1);
         assert_eq!(p.active_count(), 1);
@@ -193,17 +194,17 @@ mod tests {
     fn bytes_len_reflects_stored_data() {
         let mut p = IdPool::new();
         assert_eq!(p.bytes_len(), 0);
-        p.insert("hello");
+        p.insert("hello").unwrap();
         assert_eq!(p.bytes_len(), 5);
-        p.insert("world");
+        p.insert("world").unwrap();
         assert_eq!(p.bytes_len(), 10);
     }
 
     #[test]
     fn clear_resets_all_state() {
         let mut p = IdPool::new();
-        p.insert("a");
-        p.insert("b");
+        p.insert("a").unwrap();
+        p.insert("b").unwrap();
         assert_eq!(p.slot_count(), 2);
         assert_eq!(p.active_count(), 2);
         assert!(p.bytes_len() > 0);
@@ -226,7 +227,7 @@ mod tests {
     #[test]
     fn delete_by_slot_already_dead_returns_false() {
         let mut p = IdPool::new();
-        let slot = p.insert("x");
+        let slot = p.insert("x").unwrap();
         assert_eq!(p.delete_by_slot(slot), true);
         // Second delete on same slot — already dead
         assert_eq!(p.delete_by_slot(slot), false);
@@ -243,9 +244,16 @@ mod tests {
     #[test]
     fn get_str_on_deleted_slot_returns_none() {
         let mut p = IdPool::new();
-        let slot = p.insert("ghost");
+        let slot = p.insert("ghost").unwrap();
         assert_eq!(p.get_str(slot), Some("ghost"));
         p.delete_by_slot(slot);
         assert_eq!(p.get_str(slot), None);
+    }
+
+    #[test]
+    fn insert_id_too_long_returns_err() {
+        let mut p = IdPool::new();
+        let long_id = "x".repeat(u16::MAX as usize + 1);
+        assert!(p.insert(&long_id).is_err());
     }
 }

@@ -37,7 +37,31 @@ impl Compactor {
         Ok(())
     }
 
-    /// Finalize compaction transaction marker after old segments were deleted.
+    /// Advance the compaction marker to `Committed` after old segments are deleted.
+    ///
+    /// This completes the 2-phase protocol:
+    ///   1. `begin_compaction` → writes `Prepared` (new segment not yet written)
+    ///   2. Write new segment, delete old segments
+    ///   3. `commit_compaction` → advances marker to `Committed` (old segments gone)
+    ///   4. `finish_compaction` → deletes the marker file
+    ///
+    /// Recovery on `Committed` is a safe no-op (old segments already gone).
+    pub fn commit_compaction(
+        &self,
+        old_segment_names: &[String],
+        new_segment_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let state = CompactionState {
+            phase: CompactionPhase::Committed,
+            old_segment_names: old_segment_names.to_vec(),
+            new_segment_name: new_segment_name.to_string(),
+        };
+        self.backend
+            .write(COMPACTION_STATE_FILE, &serde_json::to_vec_pretty(&state)?)?;
+        Ok(())
+    }
+
+    /// Remove the compaction marker file once the transaction is fully complete.
     pub fn finish_compaction(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.backend.delete(COMPACTION_STATE_FILE)?;
         Ok(())
@@ -92,6 +116,8 @@ impl Compactor {
 
     /// Write a new compacted segment from already-resolved live records,
     /// then delete the provided old segment files.
+    /// Advances the compaction marker to `Committed` after deletion so that
+    /// a crash between deletion and marker removal is safely recoverable.
     pub fn compact_live_records(
         &self,
         old_segment_names: &[String],
@@ -107,6 +133,9 @@ impl Compactor {
             }
             self.backend.delete(name)?;
         }
+        // Advance marker to Committed now that old segments are gone.
+        // Recovery on Committed is a no-op, so a crash here is safe.
+        self.commit_compaction(old_segment_names, new_segment_name)?;
         Ok(new_seg)
     }
 

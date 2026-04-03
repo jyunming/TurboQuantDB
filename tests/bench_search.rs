@@ -56,12 +56,12 @@ fn test_benchmark_compaction_and_search() -> Result<(), Box<dyn std::error::Erro
     println!("Brute-force (10 segments) took: {:?}", elapsed_brute);
     assert_eq!(results_brute.len(), 10);
 
-    // 2. Compaction
-    println!("Compacting segments...");
-    let start_compact = Instant::now();
+    // 2. Flush WAL to segment
+    println!("Flushing WAL to segment...");
+    let start_flush = Instant::now();
     engine.flush_wal_to_segment()?;
-    println!("Compaction took: {:?}", start_compact.elapsed());
-    let compaction_ms = start_compact.elapsed().as_secs_f64() * 1000.0;
+    println!("Flush took: {:?}", start_flush.elapsed());
+    let compaction_ms = start_flush.elapsed().as_secs_f64() * 1000.0;
 
     // 3. Brute-force Search (1 segment)
     let start_brute_post = Instant::now();

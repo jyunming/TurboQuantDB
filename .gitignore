@@ -69,3 +69,5 @@ bench_plots.png
 /dist_tmp/
 coverage.lcov
 .coverage
+
+/test_bench_tmp/
