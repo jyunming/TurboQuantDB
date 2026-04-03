@@ -457,8 +457,14 @@ impl TurboQuantEngine {
                         rec[mse_len..mse_len + qjl_len].copy_from_slice(&entry.qjl_bits);
                         rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                             .copy_from_slice(&entry.gamma.to_le_bytes());
-                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                            .copy_from_slice(&0.0_f32.to_le_bytes()); // norm not in WAL
+                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(
+                            &(if entry.norm > 1e-10 {
+                                entry.norm
+                            } else {
+                                1.0_f32
+                            })
+                            .to_le_bytes(),
+                        );
                         rec[mse_len + qjl_len + 8] = 0u8;
                         s
                     } else {
@@ -471,8 +477,14 @@ impl TurboQuantEngine {
                         rec[mse_len..mse_len + qjl_len].copy_from_slice(&entry.qjl_bits);
                         rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                             .copy_from_slice(&entry.gamma.to_le_bytes());
-                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                            .copy_from_slice(&0.0_f32.to_le_bytes()); // norm not in WAL
+                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(
+                            &(if entry.norm > 1e-10 {
+                                entry.norm
+                            } else {
+                                1.0_f32
+                            })
+                            .to_le_bytes(),
+                        );
                         rec[mse_len + qjl_len + 8] = 0u8;
                         s
                     };
@@ -564,6 +576,7 @@ impl TurboQuantEngine {
             quantized_indices: Vec::new(),
             qjl_bits: Vec::new(),
             gamma: 0.0,
+            norm: 0.0,
             metadata_json: "{}".to_string(),
             is_deleted: true,
         };
@@ -754,6 +767,7 @@ impl TurboQuantEngine {
                 quantized_indices: Vec::new(),
                 qjl_bits: Vec::new(),
                 gamma: 0.0,
+                norm: 0.0,
                 metadata_json: "{}".to_string(),
                 is_deleted: true,
             };
@@ -1199,7 +1213,15 @@ impl TurboQuantEngine {
                         let v = {
                             let mut buf = idx_buf.borrow_mut();
                             quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
-                            quantizer_r.dequantize(&buf, qjl, gamma as f64)
+                            let doc_norm = f32::from_le_bytes(
+                                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            let mut v = quantizer_r.dequantize(&buf, qjl, gamma as f64);
+                            // Dequantize returns unit vector; scale back to original norm.
+                            v.mapv_inplace(|x| x * doc_norm as f64);
+                            v
                         };
                         score_vectors_with_metric(metric_r, query, &v)
                     },
@@ -1901,6 +1923,7 @@ impl TurboQuantEngine {
             quantized_indices: indices,
             qjl_bits: qjl,
             gamma: gamma as f32,
+            norm,
             metadata_json: serde_json::to_string(&meta)?,
             is_deleted,
         };
@@ -1970,6 +1993,7 @@ impl TurboQuantEngine {
                     quantized_indices: indices,
                     qjl_bits: qjl,
                     gamma: gamma as f32,
+                    norm,
                     metadata_json: serde_json::to_string(&meta)?,
                     is_deleted: false,
                 };
