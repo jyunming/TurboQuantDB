@@ -8,28 +8,7 @@ use std::sync::Arc;
 
 use super::backend::StorageBackend;
 
-/// HNSW (Hierarchical Navigable Small World) graph index for approximate nearest-neighbour search.
-///
-/// ## Format
-///
-/// The graph is stored in `graph.bin` with a V3 binary format (magic `TQG3`):
-/// - 4-byte magic + header (entry point, max level, node count, max degree)
-/// - Per-node adjacency lists: `[count: u8, neighbors: [u32; count]]`
-///
-/// Offsets into the file are precomputed at open time for O(1) node lookup.
-///
-/// ## Construction
-///
-/// Built via `GraphManager::build_index()` using a greedy beam-search algorithm:
-/// for each new node, find the `search_list_size` nearest existing nodes, then
-/// connect it to the `max_degree` best ones and optionally run `n_refinements`
-/// passes to improve graph connectivity.
-///
-/// ## Search
-///
-/// `beam_search()` performs greedy traversal from the entry point, maintaining a
-/// priority queue of candidates and a visited set. Returns a sorted list of
-/// `SearchCandidate` structs (slot id + score).
+/// Maximum adjacency list size per HNSW node across all layers.
 pub const MAX_DEGREE: usize = 127;
 const GRAPH_V3_MAGIC: &[u8; 4] = b"TQG3";
 
@@ -70,6 +49,12 @@ impl PartialOrd for OrderingWrapper {
     }
 }
 
+/// Manages the HNSW graph index: construction, persistence, and approximate search.
+///
+/// The graph is stored in `graph.bin` (V3 binary: magic `TQG3` + header + offset
+/// table + varint-delta-encoded adjacency lists) and memory-mapped at open time
+/// for O(1) node lookup. Call [`GraphManager::build`] after loading vectors, then
+/// [`GraphManager::search`] for sub-linear approximate nearest-neighbour queries.
 pub struct GraphManager {
     backend: Arc<StorageBackend>,
     local_cache_path: String,
@@ -82,6 +67,8 @@ pub struct GraphManager {
 }
 
 impl GraphManager {
+    /// Open (or create) the graph manager. Reads `graph.bin` from `backend` into
+    /// `cache_dir` and memory-maps it; if the file is absent the manager starts empty.
     pub fn open(
         backend: Arc<StorageBackend>,
         cache_dir: &str,
@@ -107,10 +94,12 @@ impl GraphManager {
         Ok(manager)
     }
 
+    /// Number of nodes currently indexed. Returns 0 when no index has been built.
     pub fn node_count(&self) -> usize {
         self.node_count
     }
 
+    /// Returns `true` when a valid graph is loaded and ready for [`search`](Self::search).
     pub fn has_index(&self) -> bool {
         self.node_count > 0 && self.mmap.is_some()
     }
@@ -149,6 +138,8 @@ impl GraphManager {
         self.node_count = 0;
     }
 
+    /// Read the neighbour list of `node_id` at the given `level`. Returns an empty
+    /// `Vec` when `level` exceeds the node's assigned HNSW level.
     pub fn get_neighbors_at_level(&self, node_id: u32, level: u32) -> Result<Vec<u32>, String> {
         let mmap = self.mmap.as_ref().ok_or("Graph not loaded")?;
         let i = node_id as usize;
@@ -224,6 +215,8 @@ impl GraphManager {
         Ok(Vec::new())
     }
 
+    /// Beam search from the entry point down to level 0. Returns at most `k` results
+    /// ordered by descending `scorer` value, optionally filtered by `filter`.
     pub fn search(
         &self,
         _entry_node_unused: u32,
@@ -349,6 +342,8 @@ impl GraphManager {
         Ok(out)
     }
 
+    /// Build the HNSW graph for `n` nodes, persist it to `graph.bin`, and memory-map
+    /// the result. `build_scorer(i, candidates)` must return scored `(id, score)` pairs.
     pub fn build(
         &mut self,
         n: usize,
@@ -519,4 +514,291 @@ fn decode_varint(data: &[u8]) -> (u32, usize) {
         shift += 7;
     }
     (val, data.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn make_backend(dir: &tempfile::TempDir) -> Arc<StorageBackend> {
+        Arc::new(
+            StorageBackend::from_uri(dir.path().to_str().unwrap()).unwrap(),
+        )
+    }
+
+    /// A simple identity scorer used in build() calls below.
+    fn dot_scorer(from: u32, candidates: &[u32]) -> Vec<(u32, f64)> {
+        candidates
+            .iter()
+            .map(|&to| {
+                let score = 1.0 / (1.0 + (from as f64 - to as f64).abs());
+                (to, score)
+            })
+            .collect()
+    }
+
+    // ── parse_layout with mmap=None (lines 122-124) ──────────────────────────
+    // Fresh GraphManager (no graph.bin) → mmap is None → parse_layout returns early
+
+    #[test]
+    fn parse_layout_mmap_none_sets_node_count_zero() {
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let mut mgr = GraphManager::open(backend, dir.path().to_str().unwrap()).unwrap();
+        // No graph.bin exists → mmap is None → node_count must be 0
+        assert_eq!(mgr.node_count(), 0);
+        // Call parse_layout directly (accessible because we're in the same module)
+        mgr.parse_layout();
+        assert_eq!(mgr.node_count(), 0, "parse_layout with no mmap must set node_count=0");
+    }
+
+    // ── parse_layout V3 magic but header too short (line 149) ─────────────────
+    // Write a file with TQG3 magic + n=100 but without enough bytes for the
+    // offset table → data_start check fails → node_count set to 0
+
+    #[test]
+    fn parse_layout_v3_truncated_sets_node_count_zero() {
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+
+        // Header: magic(4) + n=100 u32(4) + ep=0 u32(4) + max_level=0 u32(4) = 16 bytes
+        // No offset table → data_start = 16 + (100+1)*8 = 824 > file_len(16) → truncated path
+        let mut fake: Vec<u8> = Vec::new();
+        fake.extend_from_slice(b"TQG3");
+        fake.extend_from_slice(&100u32.to_le_bytes()); // n=100
+        fake.extend_from_slice(&0u32.to_le_bytes());   // entry_point
+        fake.extend_from_slice(&0u32.to_le_bytes());   // max_level
+
+        // Write directly to local cache path and also to backend
+        let local_path = format!("{}/graph.bin", cache);
+        std::fs::write(&local_path, &fake).unwrap();
+        backend.write("graph.bin", &fake).unwrap();
+
+        // Open — should succeed but report node_count=0 because data_start > file size
+        let mgr = GraphManager::open(backend, cache).unwrap();
+        assert_eq!(
+            mgr.node_count(),
+            0,
+            "truncated V3 header should result in node_count=0"
+        );
+    }
+
+    // ── search on empty graph (line 236) ─────────────────────────────────────
+
+    #[test]
+    fn search_empty_graph_returns_empty() {
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let mgr = GraphManager::open(backend, dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(mgr.node_count(), 0);
+        let results = mgr
+            .search(0, 5, 32, |_| 1.0, None::<fn(u32) -> bool>)
+            .unwrap();
+        assert!(results.is_empty(), "empty graph search must return empty vec");
+    }
+
+    // ── get_neighbors_at_level: node_id >= node_count (line 156) ─────────────
+
+    #[test]
+    fn get_neighbors_node_out_of_range_returns_error() {
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+
+        let mut mgr = GraphManager::open(backend, cache).unwrap();
+        // Build a tiny 3-node graph
+        mgr.build(3, 4, 8, 0, 1.2, dot_scorer).unwrap();
+
+        // node_id=99 is >= node_count=3 → OOR error
+        let result = mgr.get_neighbors_at_level(99, 0);
+        assert!(result.is_err(), "out-of-range node_id must return Err");
+    }
+
+    // ── get_neighbors_at_level: level >= num_levels (line 172) ───────────────
+
+    #[test]
+    fn get_neighbors_level_exceeds_num_levels_returns_empty() {
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+
+        let mut mgr = GraphManager::open(backend, cache).unwrap();
+        mgr.build(5, 4, 8, 0, 1.2, dot_scorer).unwrap();
+
+        // Level 99 far exceeds any stored num_levels → returns Ok(empty)
+        let nbs = mgr.get_neighbors_at_level(0, 99).unwrap();
+        assert!(
+            nbs.is_empty(),
+            "requesting a level beyond num_levels should return empty vec"
+        );
+    }
+
+    // ── decode_varint: no terminator byte (line 521) ──────────────────────────
+    // All bytes have the continuation bit set → loop exhausts slice → fallback return
+
+    #[test]
+    fn decode_varint_no_terminator_returns_full_length() {
+        // All bytes have high bit set → no b < 0x80 found → returns data.len()
+        let data = [0x80u8, 0x81, 0x82, 0x83];
+        let (_, bytes_consumed) = decode_varint(&data);
+        assert_eq!(
+            bytes_consumed,
+            data.len(),
+            "varint with no terminator must consume all bytes"
+        );
+    }
+
+    // ── Multi-level HNSW search (lines 251-291) ───────────────────────────────
+    // With 200 nodes and max_degree=4 (level_mult≈0.721), ~50 nodes at level≥1,
+    // which exceeds EF_UPPER=32 and reliably triggers beam saturation code paths.
+
+    #[test]
+    fn multilevel_graph_search_exercises_upper_layer_beam() {
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+
+        let mut mgr = GraphManager::open(backend, cache).unwrap();
+        let n = 200usize;
+        // max_degree=4 → level_mult≈0.721 → ~50 nodes at level≥1 > EF_UPPER=32
+        // This guarantees beam saturation: lines 257, 259, 272, 277, 279 covered.
+        mgr.build(n, 4, 64, 1, 1.2, |from, candidates| {
+            candidates.iter().map(|&to| {
+                let diff = (from as f64) - (to as f64);
+                (to, -(diff * diff))
+            }).collect()
+        })
+        .unwrap();
+
+        assert!(
+            mgr.max_level > 0,
+            "200-node HNSW with max_degree=4 should virtually always produce max_level > 0"
+        );
+
+        let results = mgr
+            .search(mgr.entry_point, 10, 64, |n| -(n as f64), None::<fn(u32) -> bool>)
+            .unwrap();
+        assert!(!results.is_empty(), "multilevel search should return results");
+    }
+
+    // ── Corrupt graph records: get_neighbors_at_level error paths ─────────────
+    // Helper: write a valid graph.bin header with n=1 node but a custom (corrupt) record.
+
+    fn write_corrupt_graph(dir: &tempfile::TempDir, max_level: u32, record: &[u8]) {
+        let n: u32 = 1;
+        let ep: u32 = 0;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"TQG3");
+        buf.extend_from_slice(&n.to_le_bytes());
+        buf.extend_from_slice(&ep.to_le_bytes());
+        buf.extend_from_slice(&max_level.to_le_bytes());
+        // Offset table: offsets[0]=0, offsets[1]=record.len()
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&(record.len() as u64).to_le_bytes());
+        buf.extend_from_slice(record);
+        let path = dir.path().join("graph.bin");
+        std::fs::write(&path, &buf).unwrap();
+    }
+
+    #[test]
+    fn get_neighbors_corrupt_too_short_record_returns_error() {
+        // rec.len()=3 < 4 → error "too short" (lines 155-159)
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+        write_corrupt_graph(&dir, 0, &[0x01, 0x02, 0x03]);
+        let mgr = GraphManager::open(backend, cache).unwrap();
+        assert_eq!(mgr.node_count(), 1);
+        let result = mgr.get_neighbors_at_level(0, 0);
+        assert!(result.is_err(), "too-short record should return Err");
+        assert!(result.unwrap_err().contains("too short"));
+    }
+
+    #[test]
+    fn get_neighbors_corrupt_truncated_at_level_returns_error() {
+        // num_levels=1 but no count bytes → curr+4 > rec.len() (lines 169-172)
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+        let record = [1u8, 0, 0, 0]; // num_levels=1, no count data
+        write_corrupt_graph(&dir, 0, &record);
+        let mgr = GraphManager::open(backend, cache).unwrap();
+        let result = mgr.get_neighbors_at_level(0, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("truncated at level"));
+    }
+
+    #[test]
+    fn get_neighbors_corrupt_implausible_count_returns_error() {
+        // count=200 > rec.len()=8 → implausible (lines 178-181)
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+        let mut record = Vec::new();
+        record.extend_from_slice(&1u32.to_le_bytes()); // num_levels=1
+        record.extend_from_slice(&200u32.to_le_bytes()); // count=200 > rec.len()=8
+        write_corrupt_graph(&dir, 0, &record);
+        let mgr = GraphManager::open(backend, cache).unwrap();
+        let result = mgr.get_neighbors_at_level(0, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("implausible"));
+    }
+
+    #[test]
+    fn get_neighbors_corrupt_varint_overrun_reading_returns_error() {
+        // count=3 but only 1 varint present → overrun reading (lines 190-193)
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+        let mut record = Vec::new();
+        record.extend_from_slice(&1u32.to_le_bytes()); // num_levels=1
+        record.extend_from_slice(&3u32.to_le_bytes()); // count=3
+        record.push(0x05u8); // one varint (delta=5), then overrun
+        write_corrupt_graph(&dir, 0, &record);
+        let mgr = GraphManager::open(backend, cache).unwrap();
+        let result = mgr.get_neighbors_at_level(0, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("varint overrun"));
+    }
+
+    #[test]
+    fn get_neighbors_corrupt_varint_overrun_skipping_returns_error() {
+        // num_levels=2, level0_count=2, only 1 varint → overrun while skipping (lines 206-209)
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+        let mut record = Vec::new();
+        record.extend_from_slice(&2u32.to_le_bytes()); // num_levels=2
+        record.extend_from_slice(&2u32.to_le_bytes()); // level0 count=2
+        record.push(0x05u8); // one varint, then overrun while skipping level 0
+        write_corrupt_graph(&dir, 1, &record);
+        let mgr = GraphManager::open(backend, cache).unwrap();
+        // Request level=1 → must skip level 0 → overrun
+        let result = mgr.get_neighbors_at_level(0, 1);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("varint overrun"));
+    }
+
+    #[test]
+    fn search_with_corrupt_record_covers_err_arms_in_upper_and_base_level() {
+        // max_level=1, record=[2,0,0,0] (num_levels=2, no count bytes)
+        // get_neighbors_at_level(0, 1) → skip level 0 data → truncated → Err (line 281)
+        // get_neighbors_at_level(0, 0) → read level 0 count → truncated → Err (line 333)
+        let dir = tempdir().unwrap();
+        let backend = make_backend(&dir);
+        let cache = dir.path().to_str().unwrap();
+        let record = [2u8, 0, 0, 0]; // num_levels=2, truncated after that
+        write_corrupt_graph(&dir, 1, &record);
+        let mgr = GraphManager::open(backend, cache).unwrap();
+        assert_eq!(mgr.node_count(), 1);
+        // search() internally calls get_neighbors_at_level and silently handles Err
+        let results = mgr
+            .search(0, 5, 16, |n| n as f64, None::<fn(u32) -> bool>)
+            .unwrap();
+        // Results may be non-empty (just the entry point), but must not panic
+        let _ = results;
+    }
 }

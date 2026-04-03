@@ -861,4 +861,142 @@ mod tests {
         let score = pq.score_ip_encoded_lite_scalar(&prep_lite, &idx, &qjl, 0.0);
         assert!(score.is_finite());
     }
+
+    // ── SIMD scalar tail coverage (lines 239-242, 278-284) ───────────────────
+    // With d=4, n=4: the SIMD main loop `while i+7 < 4` never runs,
+    // so the MSE scalar tail and QJL scalar tail are both exercised.
+
+    #[test]
+    fn small_dim_simd_scalar_tail_covered_with_d4() {
+        // d=4 → n=4; SIMD main loop `while i+7 < n` never executes →
+        // scalar tail runs for all 4 dims (lines 239-242)
+        // QJL: qjl_len=1, base_i=0, 0+7=7 >= 4 → scalar QJL tail (lines 278-284)
+        let d = 4;
+        let pq = ProdQuantizer::new(d, 4, 42);
+        let x: Vec<f32> = vec![0.7f32, 0.1, 0.5, 0.3];
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let query = Array1::from_iter(x.iter().map(|&v| v as f64));
+        let prep_lite = pq.prepare_ip_query_lite(&query);
+        let score = pq.score_ip_encoded_lite(&prep_lite, &idx, &qjl, gamma);
+        assert!(score.is_finite(), "d=4 scalar-tail score must be finite: {score}");
+        // Also test with non-zero gamma to exercise the full QJL scalar tail
+        let score_g = pq.score_ip_encoded_lite(&prep_lite, &idx, &qjl, 1.0);
+        assert!(score_g.is_finite(), "d=4 scalar-tail with gamma=1 must be finite: {score_g}");
+    }
+
+    // ── score_ip_encoded with d=4: MSE+QJL scalar tails (lines 390-394, 414-423) ──
+    // score_ip_encoded_lite was already tested above; this exercises score_ip_encoded
+    // (the full SIMD path) with d=4 so n=4 and the scalar-tail branches are taken.
+
+    #[test]
+    fn score_ip_encoded_d4_exercises_simd_scalar_tails() {
+        let d = 4;
+        let pq = ProdQuantizer::new(d, 4, 42);
+        let x: Vec<f32> = vec![0.7f32, 0.1, 0.5, 0.3];
+        let (idx, qjl, gamma) = pq.quantize(&x);
+        let query = Array1::from_iter(x.iter().map(|&v| v as f64));
+        // prepare_ip_query (full version, not _lite) is required for score_ip_encoded
+        let prep = pq.prepare_ip_query(&query);
+        // With d=4 (n=4): SIMD main loop `while i+7 < 4` never runs → MSE scalar tail
+        // (lines 390-394); QJL base_i=0, 0+7=7>=4 → QJL scalar tail (lines 414-423)
+        let score = pq.score_ip_encoded(&prep, &idx, &qjl, gamma);
+        assert!(score.is_finite(), "d=4 score_ip_encoded must be finite: {score}");
+        let score_g = pq.score_ip_encoded(&prep, &idx, &qjl, 1.0);
+        assert!(score_g.is_finite(), "d=4 score_ip_encoded with gamma=1 must be finite: {score_g}");
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_preserves_order() {
+        // v1 is parallel to query → high IP; v2 is orthogonal → IP ≈ 0.
+        // Quantized scores must preserve this ordering.
+        let d = 64;
+        let pq = ProdQuantizer::new(d, 4, 42);
+
+        let scale = 1.0_f32 / (d as f32).sqrt();
+        let query: Vec<f32> = vec![scale; d];
+        // v1 in the same direction, twice the magnitude → IP(q, v1) = 2.0
+        let v1: Vec<f32> = vec![scale * 2.0; d];
+        // v2 orthogonal to query: first half positive, second half negative → IP(q, v2) = 0.0
+        let v2: Vec<f32> = (0..d)
+            .map(|i| if i < d / 2 { scale } else { -scale })
+            .collect();
+
+        let query_arr = Array1::from_iter(query.iter().map(|&v| v as f64));
+        let (idx1, qjl1, g1) = pq.quantize(&v1);
+        let (idx2, qjl2, g2) = pq.quantize(&v2);
+
+        let prep = pq.prepare_ip_query(&query_arr);
+        let score1 = pq.score_ip_encoded(&prep, &idx1, &qjl1, g1);
+        let score2 = pq.score_ip_encoded(&prep, &idx2, &qjl2, g2);
+
+        assert!(
+            score1 > score2,
+            "parallel vector (score {:.4}) should outscore orthogonal vector (score {:.4})",
+            score1,
+            score2
+        );
+    }
+
+    #[test]
+    fn fast_mode_scores_correlate_with_full_mode() {
+        // Both modes share the same MSE codebook; QJL correction is the only difference.
+        // Rank order should agree on at least 60% of pairs (Kendall's tau ≥ 0.6).
+        let d = 64;
+        let pq_full = ProdQuantizer::new(d, 4, 42);
+        let pq_fast = ProdQuantizer::new_srht(d, 4, 42);
+
+        let scale = 1.0_f32 / (d as f32).sqrt();
+        let query = Array1::from_iter((0..d).map(|i| (i as f64 * 0.1 + 1.0) * scale as f64));
+
+        let n = 12usize;
+        let vecs: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                (0..d)
+                    .map(|j| ((i * d + j) as f32 * 0.07 + 0.3).sin() * scale)
+                    .collect()
+            })
+            .collect();
+
+        let prep_full = pq_full.prepare_ip_query(&query);
+        let prep_fast = pq_fast.prepare_ip_query(&query);
+
+        let scores_full: Vec<f64> = vecs
+            .iter()
+            .map(|v| {
+                let (idx, qjl, gamma) = pq_full.quantize(v);
+                pq_full.score_ip_encoded(&prep_full, &idx, &qjl, gamma)
+            })
+            .collect();
+
+        let scores_fast: Vec<f64> = vecs
+            .iter()
+            .map(|v| {
+                let (idx, qjl, gamma) = pq_fast.quantize(v);
+                pq_fast.score_ip_encoded(&prep_fast, &idx, &qjl, gamma)
+            })
+            .collect();
+
+        let mut concordant = 0usize;
+        let mut total = 0usize;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                total += 1;
+                let full_order = scores_full[i] > scores_full[j];
+                let fast_order = scores_fast[i] > scores_fast[j];
+                if full_order == fast_order {
+                    concordant += 1;
+                }
+            }
+        }
+
+        let tau = concordant as f64 / total as f64;
+        assert!(
+            tau >= 0.6,
+            "rank correlation (Kendall's tau) too low: {:.2} ({}/{} concordant pairs)",
+            tau,
+            concordant,
+            total
+        );
+    }
 }
+

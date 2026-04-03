@@ -39,6 +39,7 @@ pub struct QjlQuantizer {
 }
 
 impl QjlQuantizer {
+    /// Create a new `QjlQuantizer` for `d`-dimensional vectors with seeded SRHT signs.
     pub fn new(d: usize, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let n = d.next_power_of_two();
@@ -63,6 +64,8 @@ impl QjlQuantizer {
         srht(x, &self.projection_signs, out);
     }
 
+    /// Encode a `d`-dimensional residual vector `r` (as `f64`) into a bit-packed byte
+    /// vector of length `ceil(n/8)`. Each bit stores the sign of the SRHT projection.
     pub fn quantize(&self, r: &Array1<f64>) -> Vec<u8> {
         assert_eq!(r.len(), self.d);
         let r_f32: Vec<f32> = r.iter().map(|&v| v as f32).collect();
@@ -81,6 +84,8 @@ impl QjlQuantizer {
         packed
     }
 
+    /// Batch QJL encode: each column of `rs` (a `d × num_vecs` matrix) is encoded
+    /// independently into a bit-packed byte vector. Columns are processed in parallel.
     pub fn quantize_batch(&self, rs: &DMatrix<f32>) -> Vec<Vec<u8>> {
         assert_eq!(rs.nrows(), self.d);
         let num_vecs = rs.ncols();
@@ -111,12 +116,16 @@ impl QjlQuantizer {
         all_qjl
     }
 
+    /// Reconstruct a `d`-dimensional vector from bit-packed QJL codes and scale `gamma`.
+    /// Returns `gamma * inverse_srht(±1 sign vector)`, an approximation of the residual.
     pub fn dequantize(&self, qjl: &[u8], gamma: f64) -> Array1<f64> {
         assert_eq!(qjl.len(), self.n.div_ceil(8));
         let mut out = self.dequantize_batch(&[(qjl.to_vec(), gamma)]);
         out.pop().unwrap_or_else(|| Array1::zeros(self.d))
     }
 
+    /// Batch dequantization: each element is `(bit_packed_qjl, gamma)`. Returns one
+    /// reconstructed `d`-dimensional vector per entry. Processed in parallel via Rayon.
     pub fn dequantize_batch(&self, encoded: &[(Vec<u8>, f64)]) -> Vec<Array1<f64>> {
         if encoded.is_empty() {
             return Vec::new();
@@ -308,27 +317,92 @@ mod tests {
 
     #[test]
     fn bit_packing_round_trip() {
-        let d = 8;
-        let q = make_qjl(d);
-        // Create a vector that we know will project positively in some dims
-        let x = Array1::<f64>::from_iter((0..d).map(|_| 1.0f64));
-        let packed = q.quantize(&x);
-        assert_eq!(packed.len(), q.n.div_ceil(8));
+        // Run for both d=8 (n=8, padding_bits=0 → if-block skipped) and
+        // d=4 (n=4, padding_bits=4 → if-block entered, covering lines 333-337).
+        for &d in &[8usize, 4usize] {
+            let q = make_qjl(d);
+            let x = Array1::<f64>::from_iter((0..d).map(|_| 1.0f64));
+            let packed = q.quantize(&x);
+            assert_eq!(packed.len(), q.n.div_ceil(8));
 
-        // All bits should be either 0 or 1 — verify no undefined bits
-        let total_valid_bits = q.n;
-        let total_packed_bits = packed.len() * 8;
-        let padding_bits = total_packed_bits - total_valid_bits;
-        if padding_bits > 0 {
-            // Padding bits in the last byte should be 0
-            let last_byte = packed[packed.len() - 1];
-            let valid_bits_in_last = 8 - padding_bits;
-            let padding_mask = !((1u8 << valid_bits_in_last) - 1);
-            assert_eq!(
-                last_byte & padding_mask,
-                0,
-                "padding bits should be 0 in last byte"
-            );
+            let total_valid_bits = q.n;
+            let total_packed_bits = packed.len() * 8;
+            let padding_bits = total_packed_bits - total_valid_bits;
+            if padding_bits > 0 {
+                // Padding bits in the last byte should be 0
+                let last_byte = packed[packed.len() - 1];
+                let valid_bits_in_last = 8 - padding_bits;
+                let padding_mask = !((1u8 << valid_bits_in_last) - 1);
+                assert_eq!(
+                    last_byte & padding_mask,
+                    0,
+                    "padding bits should be 0 in last byte"
+                );
+            }
         }
     }
+
+    #[test]
+    fn bit_pack_unpack_roundtrip() {
+        // Encode a vector r with its own norm as gamma; the inner product of r with
+        // dequantize(quantize(r), ||r||) must be positive (correct sign).
+        let d = 64;
+        let q = make_qjl(d);
+        let r = Array1::<f64>::from_iter((0..d).map(|i| (i as f64 + 1.0) * 0.1));
+        let norm_r: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+
+        let packed = q.quantize(&r);
+        let recon = q.dequantize(&packed, norm_r);
+
+        let ip: f64 = r.iter().zip(recon.iter()).map(|(a, b)| a * b).sum();
+        assert!(
+            ip > 0.0,
+            "inner product of r with its QJL reconstruction should be positive, got {ip}"
+        );
+    }
+
+    #[test]
+    fn projection_preserves_inner_product_order() {
+        // A vector parallel to the query should have a higher QJL sign-agreement score
+        // than a vector orthogonal to the query.
+        let d = 64;
+        let q = make_qjl(d);
+
+        let scale = 1.0_f32 / (d as f32).sqrt();
+        let query: Vec<f32> = vec![scale; d];
+        // v1 is identical to query (perfect alignment)
+        let v1: Vec<f32> = query.clone();
+        // v2 is orthogonal: first half positive, second half negative → IP(q, v2) = 0
+        let v2: Vec<f32> = (0..d)
+            .map(|i| if i < d / 2 { scale } else { -scale })
+            .collect();
+
+        let mut proj_q = vec![0.0f32; q.n];
+        let mut proj_v1 = vec![0.0f32; q.n];
+        let mut proj_v2 = vec![0.0f32; q.n];
+        q.apply_projection(&query, &mut proj_q);
+        q.apply_projection(&v1, &mut proj_v1);
+        q.apply_projection(&v2, &mut proj_v2);
+
+        // Normalised sign inner product: +1 when signs agree, -1 when they differ
+        let sign_ip = |a: &[f32], b: &[f32]| -> f64 {
+            a.iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| if x.signum() == y.signum() { 1.0_f64 } else { -1.0_f64 })
+                .sum::<f64>()
+                / a.len() as f64
+        };
+
+        let score_v1 = sign_ip(&proj_q, &proj_v1);
+        let score_v2 = sign_ip(&proj_q, &proj_v2);
+
+        assert!(
+            score_v1 > score_v2,
+            "parallel vector (sign-IP {:.3}) should outscore orthogonal (sign-IP {:.3})",
+            score_v1,
+            score_v2
+        );
+    }
 }
+
+

@@ -392,4 +392,20 @@ mod tests {
         }
         assert_eq!(lc.byte_len(), lc.len() * STRIDE);
     }
+
+    // ── ensure_open() after release_handles() (lines 58-63) ─────────────────
+    // release_handles() sets file=None; next call to truncate_to() calls
+    // ensure_open() which reopens the file, covering lines 58-63.
+
+    #[test]
+    fn truncate_to_after_release_handles_reopens_file() {
+        let (_dir, mut lc) = make_lc();
+        lc.alloc_slot().unwrap();
+        assert_eq!(lc.len(), 1);
+        // release_handles() sets both file=None and mmap=None
+        lc.release_handles();
+        // truncate_to calls ensure_open() → file.is_none() → opens file → lines 58-63
+        lc.truncate_to(0).unwrap();
+        assert_eq!(lc.len(), 0);
+    }
 }

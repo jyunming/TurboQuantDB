@@ -542,4 +542,34 @@ mod tests {
         assert_eq!(replayed[0].quantized_indices, vec![5, 10]);
         assert_eq!(replayed[0].gamma, 1.0);
     }
+
+    // ── append_batch empty + force_sync=false covers line 96 ─────────────────
+    // When entries is empty AND force_sync=false, the `if force_sync` block is
+    // not entered. LLVM marks this "not-taken" path at line 96.
+
+    #[test]
+    fn append_batch_empty_no_sync_covers_branch_at_line_96() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.bin");
+        let mut wal = Wal::open(&path).unwrap();
+        // entries=[] + force_sync=false → the `if force_sync { sync() }` block skipped
+        wal.append_batch(&[], false).unwrap();
+        // Nothing was written beyond the header
+        let replayed = Wal::replay(&path, None).unwrap();
+        assert!(replayed.is_empty());
+    }
+
+    // ── append_batch without quantizer uses plain serialize (line 117) ────────
+    // When quantizer=None, the else branch at line 117 serializes WalEntry directly.
+
+    #[test]
+    fn append_batch_without_quantizer_uses_plain_serialize() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.bin");
+        let mut wal = Wal::open(&path).unwrap();
+        // No set_quantizer() call → self.quantizer=None → else branch at line 117
+        wal.append_batch(&[tombstone_entry("x")], false).unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(file_size > 8, "WAL should have data after append: size={file_size}");
+    }
 }
