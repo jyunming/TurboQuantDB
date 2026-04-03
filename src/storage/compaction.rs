@@ -58,12 +58,20 @@ impl Compactor {
             }
         };
 
-        // If the compacted segment exists, complete old-segment deletion.
+        // If the compacted segment exists and is valid, complete old-segment deletion.
+        // Validate by attempting to read the segment header; a crash mid-write can leave
+        // a truncated file that passes the exists() check but would corrupt the database.
         if self.backend.exists(&state.new_segment_name) {
-            for name in &state.old_segment_names {
-                if name != &state.new_segment_name {
-                    let _ = self.backend.delete(name);
+            let valid = Segment::read_all(&self.backend, &state.new_segment_name).is_ok();
+            if valid {
+                for name in &state.old_segment_names {
+                    if name != &state.new_segment_name {
+                        let _ = self.backend.delete(name);
+                    }
                 }
+            } else {
+                // Corrupt partial write — discard it and keep old segments intact.
+                let _ = self.backend.delete(&state.new_segment_name);
             }
         }
 

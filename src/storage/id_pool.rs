@@ -39,6 +39,10 @@ impl IdPool {
         }
 
         assert!(id.len() <= u16::MAX as usize, "id too long for u16 length");
+        assert!(
+            self.bytes.len() <= u32::MAX as usize,
+            "id pool byte buffer exceeds 4 GiB — offsets would overflow u32"
+        );
 
         let slot = self.offsets.len() as u32;
         let hash = fnv1a64(id.as_bytes());
@@ -76,6 +80,10 @@ impl IdPool {
         }
         let off = self.offsets[i] as usize;
         let len = self.lens[i] as usize;
+        // Bounds check before slicing — guards against on-disk corruption or truncated files.
+        if off > self.bytes.len() || off + len > self.bytes.len() {
+            return None;
+        }
         std::str::from_utf8(&self.bytes[off..off + len]).ok()
     }
 

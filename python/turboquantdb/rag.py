@@ -69,8 +69,12 @@ class TurboQuantRetriever:
 
         output: List[Dict[str, Any]] = []
         for r in results:
-            doc_id = r.get("id")
-            score = r.get("score")
+            # Search returns dicts; guard against future tuple shape (id, score).
+            if isinstance(r, dict):
+                doc_id = r.get("id")
+                score = r.get("score")
+            else:
+                doc_id, score = r[0], r[1]
             if doc_id in self.doc_store:
                 doc = self.doc_store[doc_id]
                 output.append({

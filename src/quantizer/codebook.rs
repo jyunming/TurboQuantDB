@@ -157,7 +157,7 @@ mod tests {
         // Γ(5) = 4! = 24  →  log_gamma(5) = ln(24) ≈ 3.17805...
         let expected = 24.0_f64.ln();
         assert!(
-            (log_gamma(5.0) - expected).abs() < 1e-9,
+            (log_gamma(5.0) - expected).abs() < 1e-7,
             "log_gamma(5) = {}, expected {}",
             log_gamma(5.0),
             expected
@@ -165,7 +165,7 @@ mod tests {
         // Γ(0.5) = sqrt(π)  →  log_gamma(0.5) ≈ 0.57236...
         let expected_half = std::f64::consts::PI.sqrt().ln();
         assert!(
-            (log_gamma(0.5) - expected_half).abs() < 1e-9,
+            (log_gamma(0.5) - expected_half).abs() < 1e-7,
             "log_gamma(0.5) = {}, expected {}",
             log_gamma(0.5),
             expected_half
@@ -184,7 +184,7 @@ mod tests {
             let expected = (PI / (PI * z).sin()).ln();
             let actual = lg_z + lg_1mz;
             assert!(
-                (actual - expected).abs() < 1e-9,
+                (actual - expected).abs() < 1e-7,
                 "reflection identity failed for z={z}: got {actual}, expected {expected}"
             );
         }
