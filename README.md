@@ -30,7 +30,7 @@ Two deployment modes:
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) stable toolchain
-- Python 3.8+
+- Python 3.10+
 - C++ compiler: Visual Studio Build Tools (Windows) · `xcode-select --install` (macOS) · `build-essential` (Linux)
 
 ### Build from source
@@ -47,6 +47,33 @@ maturin develop --release
 ```bash
 pip install turboquantdb
 ```
+
+---
+
+## Recommended Setup
+
+Three presets covering the main use cases — pick one and you're ready:
+
+```python
+from turboquantdb import Database
+
+# High Quality — best recall (~97% at 50k×1536)
+db = Database.open(path, dimension=DIM, bits=8, rerank=True)
+db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
+results = db.search(query, top_k=10, ann_search_list_size=200)
+
+# Balanced — recommended default (~89% recall, 5.7× smaller than float32)
+db = Database.open(path, dimension=DIM, bits=4, rerank=True)
+db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
+results = db.search(query, top_k=10, ann_search_list_size=128)
+
+# Fast Build — fastest ingest (~83% recall, same disk as Balanced)
+db = Database.open(path, dimension=DIM, bits=4, fast_mode=True, rerank=False)
+db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
+results = db.search(query, top_k=10, ann_search_list_size=128)
+```
+
+Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)
 
 ---
 
