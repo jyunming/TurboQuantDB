@@ -49,4 +49,17 @@ ASSESSMENT_PAPER_CONFORMANCE.md
 PERF_PLAN.md
 RAM_PLAN.md
 RAM_DIAGNOSTIC_AND_FIX_PLAN.md
+BENCHMARK_GUIDEBOOK.md
 docs/PYTHON_MIGRATION.md
+docs/ROADMAP_BACKLOG.md
+
+# Local benchmark scripts (require external deps / local data paths)
+benchmarks/real_world_bench_v2.py
+benchmarks/scale_matrix_bench.py
+
+# Benchmark output artifacts
+bench_results_*.json
+bench_plots.png
+/dist_tmp/
+coverage.lcov
+.coverage
