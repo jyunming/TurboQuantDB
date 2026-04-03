@@ -32,12 +32,11 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--recall-threshold", type=float, default=0.80, help="Recall threshold gate")
     p.add_argument(
-        "--no-enforce-recall-threshold",
-        dest="enforce_recall_threshold",
-        action="store_false",
-        help="Disable recall threshold enforcement (enforcement is on by default)",
+        "--enforce-recall-threshold",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enforce recall threshold gate (default: on; disable with --no-enforce-recall-threshold)",
     )
-    p.set_defaults(enforce_recall_threshold=True)
     p.add_argument(
         "--artifact-dir",
         type=str,
