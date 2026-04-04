@@ -190,7 +190,7 @@ db.create_index(
     max_degree=32,        # int — max neighbors per node; higher = better recall, larger graph (default 32)
     ef_construction=200,  # int — beam size during graph build; higher = better quality, slower build (default 200)
     n_refinements=5,      # int — refinement passes after build; higher = better graph, slower (default 5)
-    search_list_size=128, # int — beam width during index-time search (routing); separate from ef_construction (default 128)
+    search_list_size=128, # int — default query-time HNSW search breadth (ef_search); higher = better recall, higher latency (default 128)
     alpha=1.2,            # float — edge pruning aggressiveness (default 1.2)
 )
 ```

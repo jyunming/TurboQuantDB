@@ -7,7 +7,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const WAL_MAGIC: &[u8; 4] = b"TQWV";
-const WAL_VERSION: u32 = 3;
+const WAL_VERSION: u32 = 4;
 
 /// On-disk V3 entry — MSE indices stored as bit-packed bytes.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -131,18 +131,25 @@ impl Wal {
         }
         let mut file = File::open(path)?;
         let mut magic = [0u8; 4];
-        let mut version = 0u32;
+        let version;
 
-        let has_header = if file.read_exact(&mut magic).is_ok() && &magic == WAL_MAGIC {
+        if file.read_exact(&mut magic).is_ok() && &magic == WAL_MAGIC {
             let mut v_buf = [0u8; 4];
             file.read_exact(&mut v_buf)?;
             version = u32::from_le_bytes(v_buf);
-            true
         } else {
-            // No magic, reset to start for legacy read
-            file = File::open(path)?;
-            false
+            // No magic — not a valid WAL file; return empty rather than corrupt read.
+            return Ok(Vec::new());
         };
+
+        if version != WAL_VERSION {
+            return Err(format!(
+                "Unsupported WAL version {} (expected {}). \
+                 The WAL format changed; delete wal.log to start fresh.",
+                version, WAL_VERSION
+            )
+            .into());
+        }
 
         let mut entries = Vec::new();
         loop {
@@ -156,12 +163,13 @@ impl Wal {
             let mut payload = vec![0u8; len];
             match file.read_exact(&mut payload) {
                 Ok(_) => {}
+                // Partial write at end of file — treat as truncated, stop here.
                 Err(_) => break,
             }
 
-            if has_header && version == 3 {
-                // V3: packed MSE indices
-                if let Ok(packed) = bincode::deserialize::<WalEntryPacked>(&payload) {
+            // V4: packed MSE indices with norm field.
+            match bincode::deserialize::<WalEntryPacked>(&payload) {
+                Ok(packed) => {
                     let quantized_indices = if packed.is_deleted || packed.packed_mse.is_empty() {
                         Vec::new()
                     } else if let Some(q) = quantizer {
@@ -181,6 +189,9 @@ impl Wal {
                         is_deleted: packed.is_deleted,
                     });
                 }
+                // Decode failure on a complete payload means a schema mismatch or corruption —
+                // treat as a truncated final entry and stop replaying.
+                Err(_) => break,
             }
         }
         Ok(entries)
@@ -252,7 +263,7 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         assert!(data.len() >= 8, "file should have header");
         assert_eq!(&data[0..4], b"TQWV");
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 3u32);
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 4u32);
     }
 
     #[test]

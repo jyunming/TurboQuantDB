@@ -457,14 +457,8 @@ impl TurboQuantEngine {
                         rec[mse_len..mse_len + qjl_len].copy_from_slice(&entry.qjl_bits);
                         rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                             .copy_from_slice(&entry.gamma.to_le_bytes());
-                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(
-                            &(if entry.norm > 1e-10 {
-                                entry.norm
-                            } else {
-                                1.0_f32
-                            })
-                            .to_le_bytes(),
-                        );
+                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                            .copy_from_slice(&entry.norm.to_le_bytes());
                         rec[mse_len + qjl_len + 8] = 0u8;
                         s
                     } else {
@@ -477,14 +471,8 @@ impl TurboQuantEngine {
                         rec[mse_len..mse_len + qjl_len].copy_from_slice(&entry.qjl_bits);
                         rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                             .copy_from_slice(&entry.gamma.to_le_bytes());
-                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8].copy_from_slice(
-                            &(if entry.norm > 1e-10 {
-                                entry.norm
-                            } else {
-                                1.0_f32
-                            })
-                            .to_le_bytes(),
-                        );
+                        rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                            .copy_from_slice(&entry.norm.to_le_bytes());
                         rec[mse_len + qjl_len + 8] = 0u8;
                         s
                     };
@@ -1959,21 +1947,29 @@ impl TurboQuantEngine {
             let mut metadata_entries: Vec<(u32, VectorMetadata)> = Vec::with_capacity(chunk.len());
             // Normalize each vector to unit sphere before quantization so the
             // Lloyd-Max codebook (fitted to Beta-distribution unit-sphere coords) is valid.
-            let unit_vecs: Vec<Vec<f32>> = chunk
+            // Compute (unit_vec, norm) once to avoid a second O(d) pass per vector.
+            let unit_vecs_and_norms: Vec<(Vec<f32>, f32)> = chunk
                 .iter()
                 .map(|item| {
                     let n = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
                     if n > 1e-10 {
-                        item.vector.iter().map(|&x| x / n).collect()
+                        (item.vector.iter().map(|&x| x / n).collect(), n)
                     } else {
-                        item.vector.clone()
+                        (item.vector.clone(), n)
                     }
                 })
                 .collect();
-            let vec_refs: Vec<&[f32]> = unit_vecs.iter().map(|v| v.as_slice()).collect();
+            let vec_refs: Vec<&[f32]> = unit_vecs_and_norms
+                .iter()
+                .map(|(v, _)| v.as_slice())
+                .collect();
             let quantized = self.quantizer.quantize_batch(&vec_refs);
 
-            for (_i, (item, (indices, qjl, gamma))) in chunk.iter().zip(quantized).enumerate() {
+            for (_i, (item, ((_unit_vec, norm), (indices, qjl, gamma)))) in chunk
+                .iter()
+                .zip(unit_vecs_and_norms.iter().zip(quantized))
+                .enumerate()
+            {
                 match mode {
                     BatchWriteMode::Insert if self.id_pool.contains(&item.id) => {
                         return Err(format!("ID '{}' already exists", item.id).into());
@@ -1983,7 +1979,6 @@ impl TurboQuantEngine {
                     }
                     _ => {}
                 }
-                let norm = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
                 let meta = VectorMetadata {
                     properties: item.metadata.clone(),
                     document: item.document.clone(),
@@ -1993,7 +1988,7 @@ impl TurboQuantEngine {
                     quantized_indices: indices,
                     qjl_bits: qjl,
                     gamma: gamma as f32,
-                    norm,
+                    norm: *norm,
                     metadata_json: serde_json::to_string(&meta)?,
                     is_deleted: false,
                 };
@@ -2002,7 +1997,7 @@ impl TurboQuantEngine {
                     &entry.quantized_indices,
                     &entry.qjl_bits,
                     entry.gamma,
-                    norm,
+                    *norm,
                 )?;
                 self.live_save_raw_vector(slot, &item.vector);
                 metadata_entries.push((slot, meta));

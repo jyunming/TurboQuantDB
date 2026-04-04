@@ -199,7 +199,7 @@ Measured on **DBpedia OpenAI3 embeddings** ([Qdrant/dbpedia-entities-openai3-tex
 
 *dequant-rerank = rerank from codebook (zero extra disk). f16-rerank = store float16 raw vectors (+293 MB).*
 
-**Reproduction:** `python _tmp/disk_size.py` — requires `pip install datasets tqdb`
+**Reproduction:** build the extension with `maturin develop --release`, then run `python benchmarks/run_recall_bench.py` — requires `pip install datasets tqdb`
 
 ---
 
