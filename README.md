@@ -127,7 +127,7 @@ db.stats()                           # → dict
 len(db) / "id" in db                 # container protocol
 
 # Search
-results = db.search(query, top_k=10, filter=None, _use_ann=True,
+results = db.search(query, top_k=10, filter=None, _use_ann=False,
                     ann_search_list_size=None, include=None)
 # include: list of "id"|"score"|"metadata"|"document" (default all)
 

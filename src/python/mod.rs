@@ -356,7 +356,7 @@ impl Database {
         Ok(engine.list_all())
     }
 
-    #[pyo3(signature = (query, top_k, filter=None, _use_ann=true, ann_search_list_size=None, include=None))]
+    #[pyo3(signature = (query, top_k, filter=None, _use_ann=false, ann_search_list_size=None, include=None))]
     fn search(
         &self,
         py: Python<'_>,
@@ -538,7 +538,7 @@ impl Database {
     ///     query_embeddings: 2-D array of shape ``(N, D)``.
     ///     n_results: Number of results per query. Default 10.
     ///     where_filter: Optional metadata filter (same syntax as :meth:`search`).
-    ///     _use_ann: Use HNSW index if available. Default ``True``.
+    ///     _use_ann: Use HNSW index if available. Default ``False``.
     ///     ann_search_list_size: HNSW ef_search override.
     ///
     /// Returns:
@@ -550,7 +550,7 @@ impl Database {
     ///         query_embeddings=np.stack([q1, q2, q3]),
     ///         n_results=5,
     ///     )
-    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=true, ann_search_list_size=None))]
+    #[pyo3(signature = (query_embeddings, n_results=10, where_filter=None, _use_ann=false, ann_search_list_size=None))]
     fn query(
         &self,
         py: Python<'_>,

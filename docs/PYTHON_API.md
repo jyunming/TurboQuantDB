@@ -155,7 +155,7 @@ results = db.search(
     query,                       # np.ndarray (float32) or list[float]
     top_k=10,                    # int
     filter=None,                 # dict | None  (see Metadata Filtering below)
-    _use_ann=True,               # bool — use HNSW index if available
+    _use_ann=False,              # bool — use HNSW index if available (opt-in)
     ann_search_list_size=None,   # int | None — HNSW ef_search (default: max_degree × 2)
     include=None,                # list[str] | None — fields to return; default all
                                  #   valid values: "id", "score", "metadata", "document"
@@ -174,7 +174,7 @@ all_results = db.query(
     query_embeddings,            # np.ndarray shape (N, D), float32 or float64
     n_results=10,                # int — results per query
     where_filter=None,           # dict | None
-    _use_ann=True,
+    _use_ann=False,
     ann_search_list_size=None,
 )
 # Returns list[list[dict]] — one inner list per query vector
