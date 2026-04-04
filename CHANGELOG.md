@@ -8,11 +8,6 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ## [Unreleased]
 
-### Performance
-
-- **feat(perf)**: comprehensive regression gate tracking all metrics across recall, latency, disk, and RAM
-- **feat(perf)**: paper-methodology precommit regression gate + competitor comparison bench
-
 ---
 
 ## [0.2.0] — 2026-04-04
@@ -27,6 +22,11 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 - **fix(quantizer)**: normalize vectors to unit sphere before quantization — fixes 2× recall gap for non-normalized input vectors; Lloyd-Max codebook assumes unit-sphere variance
 - **fix(wal)**: store and restore vector norm in WAL entries — norms written as `0.0` during crash recovery caused all recovered vectors to score `0.0` under IP metric
+
+### Infrastructure
+
+- Comprehensive regression gate tracking recall, latency, disk, and RAM metrics across all configurations
+- Paper-methodology precommit regression gate + competitor comparison bench
 
 ---
 
