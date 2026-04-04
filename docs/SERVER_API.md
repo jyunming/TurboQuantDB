@@ -4,8 +4,6 @@
 
 Define the HTTP/JSON contract for multi-tenant TurboQuantDB service mode.
 
-Base path: `/v1`
-
 ## Conventions
 
 - All endpoints require authentication (except `/healthz`).

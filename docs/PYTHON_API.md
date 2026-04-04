@@ -22,8 +22,8 @@ from tqdb import Database
 db = Database.open(
     path,                    # str — base directory path, created if it doesn't exist
     dimension,               # int — vector dimension, must match on every reopen
-    bits=4,                  # int — quantization bits: 2 (higher compression, lower recall)
-                             #                           or 4 (better recall, default)
+    bits=4,                  # int — quantization bits (any int >= 2; 2 = highest compression,
+                             #        4 = better recall (default), 8 = near-lossless)
     seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
     metric="ip",             # str — "ip" (inner product), "cosine", or "l2"
     rerank=True,             # bool — enable reranking of ANN candidates; precision via rerank_precision
@@ -262,7 +262,7 @@ from tqdb.rag import TurboQuantRetriever
 retriever = TurboQuantRetriever(
     db_path,                # str — directory path for the database
     dimension=1536,         # int — vector dimension
-    bits=4,                 # int — quantization bits (2 or 4)
+    bits=4,                 # int — quantization bits (any int >= 2; common: 2, 4, 8)
     seed=42,                # int — RNG seed
     metric="ip",            # str — "ip", "cosine", or "l2"
     rerank_precision=None,  # str|None — None (dequant), "f16", or "f32"
