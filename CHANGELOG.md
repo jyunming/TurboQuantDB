@@ -22,7 +22,7 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 ### Infrastructure
 
 - Comprehensive regression gate tracking recall, latency, disk, and RAM metrics across all configurations
-- Paper-methodology precommit regression gate + competitor comparison bench
+- Paper-methodology precommit regression gate
 
 ---
 
