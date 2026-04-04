@@ -7,7 +7,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const WAL_MAGIC: &[u8; 4] = b"TQWV";
-const WAL_VERSION: u32 = 3;
+const WAL_VERSION: u32 = 4;
 
 /// On-disk V3 entry — MSE indices stored as bit-packed bytes.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -16,8 +16,8 @@ struct WalEntryPacked {
     pub packed_mse: Vec<u8>,
     pub qjl_bits: Vec<u8>,
     pub gamma: f32,
+    pub norm: f32,
     pub metadata_json: String,
-    #[serde(default)]
     pub is_deleted: bool,
 }
 
@@ -27,23 +27,9 @@ pub struct WalEntry {
     pub quantized_indices: Vec<CodeIndex>,
     pub qjl_bits: Vec<u8>,
     pub gamma: f32,
+    pub norm: f32,
     pub metadata_json: String,
-    #[serde(default)]
     pub is_deleted: bool,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[doc(hidden)]
-struct WalEntryLegacy {
-    pub id: String,
-    pub quantized_indices: Vec<CodeIndex>,
-    pub qjl_bits: Vec<u8>,
-    pub gamma: f32,
-    pub metadata_json: String,
-    #[serde(default)]
-    pub is_deleted: bool,
-    #[serde(default)]
-    pub original_vector: Option<Vec<f32>>,
 }
 
 pub struct Wal {
@@ -109,6 +95,7 @@ impl Wal {
                     packed_mse,
                     qjl_bits: entry.qjl_bits.clone(),
                     gamma: entry.gamma,
+                    norm: entry.norm,
                     metadata_json: entry.metadata_json.clone(),
                     is_deleted: entry.is_deleted,
                 };
@@ -144,18 +131,25 @@ impl Wal {
         }
         let mut file = File::open(path)?;
         let mut magic = [0u8; 4];
-        let mut version = 0u32;
+        let version;
 
-        let has_header = if file.read_exact(&mut magic).is_ok() && &magic == WAL_MAGIC {
+        if file.read_exact(&mut magic).is_ok() && &magic == WAL_MAGIC {
             let mut v_buf = [0u8; 4];
             file.read_exact(&mut v_buf)?;
             version = u32::from_le_bytes(v_buf);
-            true
         } else {
-            // No magic, reset to start for legacy read
-            file = File::open(path)?;
-            false
+            // No magic — not a valid WAL file; return empty rather than corrupt read.
+            return Ok(Vec::new());
         };
+
+        if version != WAL_VERSION {
+            return Err(format!(
+                "Unsupported WAL version {} (expected {}). \
+                 The WAL format changed; delete wal.log to start fresh.",
+                version, WAL_VERSION
+            )
+            .into());
+        }
 
         let mut entries = Vec::new();
         loop {
@@ -169,12 +163,13 @@ impl Wal {
             let mut payload = vec![0u8; len];
             match file.read_exact(&mut payload) {
                 Ok(_) => {}
+                // Partial write at end of file — treat as truncated, stop here.
                 Err(_) => break,
             }
 
-            if has_header && version == 3 {
-                // V3: packed MSE indices
-                if let Ok(packed) = bincode::deserialize::<WalEntryPacked>(&payload) {
+            // V4: packed MSE indices with norm field.
+            match bincode::deserialize::<WalEntryPacked>(&payload) {
+                Ok(packed) => {
                     let quantized_indices = if packed.is_deleted || packed.packed_mse.is_empty() {
                         Vec::new()
                     } else if let Some(q) = quantizer {
@@ -189,26 +184,14 @@ impl Wal {
                         quantized_indices,
                         qjl_bits: packed.qjl_bits,
                         gamma: packed.gamma,
+                        norm: packed.norm,
                         metadata_json: packed.metadata_json,
                         is_deleted: packed.is_deleted,
                     });
                 }
-            } else if has_header && version == 2 {
-                if let Ok(entry) = bincode::deserialize::<WalEntry>(&payload) {
-                    entries.push(entry);
-                }
-            } else {
-                // Legacy v1 path
-                if let Ok(legacy) = bincode::deserialize::<WalEntryLegacy>(&payload) {
-                    entries.push(WalEntry {
-                        id: legacy.id,
-                        quantized_indices: legacy.quantized_indices,
-                        qjl_bits: legacy.qjl_bits,
-                        gamma: legacy.gamma,
-                        metadata_json: legacy.metadata_json,
-                        is_deleted: legacy.is_deleted,
-                    });
-                }
+                // Decode failure on a complete payload means a schema mismatch or corruption —
+                // treat as a truncated final entry and stop replaying.
+                Err(_) => break,
             }
         }
         Ok(entries)
@@ -241,6 +224,7 @@ mod tests {
             quantized_indices: vec![],
             qjl_bits: vec![],
             gamma: 0.0,
+            norm: 0.0,
             metadata_json: "{}".to_string(),
             is_deleted: true,
         }
@@ -255,6 +239,7 @@ mod tests {
             quantized_indices: idx,
             qjl_bits: qjl,
             gamma: gamma as f32,
+            norm: 1.0,
             metadata_json: r#"{"key":"val"}"#.to_string(),
             is_deleted: false,
         }
@@ -278,7 +263,7 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         assert!(data.len() >= 8, "file should have header");
         assert_eq!(&data[0..4], b"TQWV");
-        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 3u32);
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 4u32);
     }
 
     #[test]
@@ -327,11 +312,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wal.bin");
 
-        let entries_in = vec![
-            real_entry("a", &pq),
-            real_entry("b", &pq),
-            tombstone_entry("c"),
-        ];
+        let mut e_with_norm = real_entry("a", &pq);
+        e_with_norm.norm = 3.14;
+        let entries_in = vec![e_with_norm, real_entry("b", &pq), tombstone_entry("c")];
         {
             let mut wal = Wal::open(&path).unwrap();
             wal.set_quantizer(Arc::clone(&pq));
@@ -340,6 +323,11 @@ mod tests {
 
         let replayed = Wal::replay(&path, Some(&pq)).unwrap();
         assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[0].id, "a");
+        assert!(
+            (replayed[0].norm - 3.14).abs() < 1e-5,
+            "norm should survive roundtrip"
+        );
         assert_eq!(replayed[2].id, "c");
         assert!(replayed[2].is_deleted);
         assert!(replayed[2].quantized_indices.is_empty());
@@ -475,73 +463,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Legacy V1 format (no header) — entries without magic bytes
+    // Legacy V1 and V2 formats no longer supported; tests removed.
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn replay_legacy_v1_format_no_header() {
-        // Build a V1 WAL manually: no TQWV header, just length-prefixed WalEntryLegacy structs.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("wal_v1.bin");
-
-        use std::fs::File;
-        use std::io::Write;
-        // Use WalEntryLegacy directly (accessible via use super::*) to guarantee format match.
-        let entry = WalEntryLegacy {
-            id: "legacy1".to_string(),
-            quantized_indices: vec![0u16, 1u16],
-            qjl_bits: vec![0b10101010u8],
-            gamma: 0.5,
-            metadata_json: "{}".to_string(),
-            is_deleted: false,
-            original_vector: None,
-        };
-        let encoded = bincode::serialize(&entry).unwrap();
-        let mut f = File::create(&path).unwrap();
-        f.write_all(&(encoded.len() as u64).to_le_bytes()).unwrap();
-        f.write_all(&encoded).unwrap();
-        drop(f);
-
-        // Replay: no magic → falls back to V1 path
-        let replayed = Wal::replay(&path, None).unwrap();
-        assert_eq!(replayed.len(), 1, "V1 format should produce one entry");
-        assert_eq!(replayed[0].id, "legacy1");
-        assert_eq!(replayed[0].gamma, 0.5);
-    }
-
-    // -----------------------------------------------------------------------
-    // V2 format (header version=2, plain WalEntry without bit-packing)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn replay_v2_format() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("wal_v2.bin");
-
-        use std::fs::File;
-        use std::io::Write;
-        let entry = WalEntry {
-            id: "v2entry".to_string(),
-            quantized_indices: vec![5u16, 10u16],
-            qjl_bits: vec![0xFFu8],
-            gamma: 1.0,
-            metadata_json: r#"{"x":1}"#.to_string(),
-            is_deleted: false,
-        };
-        let encoded = bincode::serialize(&entry).unwrap();
-
-        let mut f = File::create(&path).unwrap();
-        f.write_all(b"TQWV").unwrap();
-        f.write_all(&2u32.to_le_bytes()).unwrap(); // version = 2
-        f.write_all(&(encoded.len() as u64).to_le_bytes()).unwrap();
-        f.write_all(&encoded).unwrap();
-
-        let replayed = Wal::replay(&path, None).unwrap();
-        assert_eq!(replayed.len(), 1);
-        assert_eq!(replayed[0].id, "v2entry");
-        assert_eq!(replayed[0].quantized_indices, vec![5, 10]);
-        assert_eq!(replayed[0].gamma, 1.0);
-    }
 
     // ── append_batch empty + force_sync=false covers line 96 ─────────────────
     // When entries is empty AND force_sync=false, the `if force_sync` block is

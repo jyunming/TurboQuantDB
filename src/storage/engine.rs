@@ -458,7 +458,7 @@ impl TurboQuantEngine {
                         rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                             .copy_from_slice(&entry.gamma.to_le_bytes());
                         rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                            .copy_from_slice(&0.0_f32.to_le_bytes()); // norm not in WAL
+                            .copy_from_slice(&entry.norm.to_le_bytes());
                         rec[mse_len + qjl_len + 8] = 0u8;
                         s
                     } else {
@@ -472,7 +472,7 @@ impl TurboQuantEngine {
                         rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                             .copy_from_slice(&entry.gamma.to_le_bytes());
                         rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                            .copy_from_slice(&0.0_f32.to_le_bytes()); // norm not in WAL
+                            .copy_from_slice(&entry.norm.to_le_bytes());
                         rec[mse_len + qjl_len + 8] = 0u8;
                         s
                     };
@@ -564,6 +564,7 @@ impl TurboQuantEngine {
             quantized_indices: Vec::new(),
             qjl_bits: Vec::new(),
             gamma: 0.0,
+            norm: 0.0,
             metadata_json: "{}".to_string(),
             is_deleted: true,
         };
@@ -754,6 +755,7 @@ impl TurboQuantEngine {
                 quantized_indices: Vec::new(),
                 qjl_bits: Vec::new(),
                 gamma: 0.0,
+                norm: 0.0,
                 metadata_json: "{}".to_string(),
                 is_deleted: true,
             };
@@ -861,7 +863,16 @@ impl TurboQuantEngine {
                                 .try_into()
                                 .unwrap(),
                         );
-                        q.dequantize(&idx, &rec[mse_len..mse_len + qjl_len], gamma as f64)
+                        let doc_norm = f32::from_le_bytes(
+                            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let mut v =
+                            q.dequantize(&idx, &rec[mse_len..mse_len + qjl_len], gamma as f64);
+                        // Dequantize returns unit vector; scale back to original norm for L2.
+                        v.mapv_inplace(|x| x * doc_norm as f64);
+                        v
                     })
                     .collect()
             } else {
@@ -907,9 +918,12 @@ impl TurboQuantEngine {
                             &[]
                         };
                         let to_g = all_gamma[to_idx];
+                        let to_n = all_norm[to_idx];
+                        // Vectors stored unit-normalized; scale score to estimate <from, to>.
                         (
                             to,
-                            quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64),
+                            quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64)
+                                * to_n as f64,
                         )
                     })
                     .collect()
@@ -947,12 +961,15 @@ impl TurboQuantEngine {
                             &[]
                         };
                         let to_g = all_gamma[to_idx];
-                        let to_n = all_norm[to_idx];
                         let ip = quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64);
-                        let score = if from_norm > 0.0 && to_n > 0.0 {
-                            ip / (from_norm * to_n as f64)
+                        // With unit-normalized codes:
+                        //   has_vraw=true:  prep built from raw from_vec; ip ≈ <from_raw, unit_to>
+                        //                  cosine = ip / ||from||
+                        //   has_vraw=false: prep built from unit_from codes; ip ≈ cosine(from,to)
+                        let score = if has_vraw {
+                            if from_norm > 0.0 { ip / from_norm } else { 0.0 }
                         } else {
-                            0.0
+                            ip
                         };
                         (to, score)
                     })
@@ -1115,9 +1132,15 @@ impl TurboQuantEngine {
                                 .try_into()
                                 .unwrap(),
                         );
+                        let doc_norm = f32::from_le_bytes(
+                            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                .try_into()
+                                .unwrap(),
+                        );
                         let mut buf = idx_buf.borrow_mut();
                         quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
                         quantizer_r.score_ip_encoded(&prep, &buf, qjl, gamma as f64)
+                            * doc_norm as f64
                     },
                     slot_set
                         .map(|ss| move |node_idx: u32| ss.contains(&index_ids[node_idx as usize])),
@@ -1142,16 +1165,13 @@ impl TurboQuantEngine {
                                 .try_into()
                                 .unwrap(),
                         );
-                        let doc_norm = f32::from_le_bytes(
-                            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                                .try_into()
-                                .unwrap(),
-                        );
                         let mut buf = idx_buf.borrow_mut();
                         quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
+                        // Vectors are stored unit-normalized; ip estimates <query, unit_doc>.
+                        // cosine(query, doc) = <query, unit_doc> / ||query||
                         let ip = quantizer_r.score_ip_encoded(&prep, &buf, qjl, gamma as f64);
-                        if query_norm > 0.0 && doc_norm > 0.0 {
-                            ip / (query_norm * doc_norm as f64)
+                        if query_norm > 0.0 {
+                            ip / query_norm
                         } else {
                             0.0
                         }
@@ -1181,7 +1201,15 @@ impl TurboQuantEngine {
                         let v = {
                             let mut buf = idx_buf.borrow_mut();
                             quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut buf);
-                            quantizer_r.dequantize(&buf, qjl, gamma as f64)
+                            let doc_norm = f32::from_le_bytes(
+                                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            let mut v = quantizer_r.dequantize(&buf, qjl, gamma as f64);
+                            // Dequantize returns unit vector; scale back to original norm.
+                            v.mapv_inplace(|x| x * doc_norm as f64);
+                            v
                         };
                         score_vectors_with_metric(metric_r, query, &v)
                     },
@@ -1199,14 +1227,20 @@ impl TurboQuantEngine {
 
             // Batch-dequantize all candidates in parallel when reranking without raw vecs.
             let deq_vecs: Vec<Array1<f64>> = if self.rerank_enabled && self.live_vraw.is_none() {
-                let encoded: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> = slots
+                let (encoded, norms): (Vec<_>, Vec<f32>) = slots
                     .iter()
                     .map(|&slot| {
-                        let (idx, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                        (idx, qjl.to_vec(), gamma as f64)
+                        let (idx, qjl, gamma, norm) = self.live_codes_at_slot(slot as usize);
+                        ((idx, qjl.to_vec(), gamma as f64), norm)
                     })
-                    .collect();
-                self.quantizer.dequantize_batch(&encoded)
+                    .unzip();
+                let mut vecs = self.quantizer.dequantize_batch(&encoded);
+                // Dequantize returns unit vectors; scale back to original norm for correct
+                // metric computation (IP, L2). Cosine is scale-invariant so this is safe.
+                for (v, norm) in vecs.iter_mut().zip(norms.iter()) {
+                    v.mapv_inplace(|x| x * *norm as f64);
+                }
+                vecs
             } else {
                 Vec::new()
             };
@@ -1312,12 +1346,18 @@ impl TurboQuantEngine {
                                     .try_into()
                                     .unwrap(),
                             );
+                            let doc_norm = f32::from_le_bytes(
+                                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            // Vectors stored unit-normalized; scale back to recover <q, doc>.
                             let score = quantizer.score_ip_encoded(
                                 &prep,
                                 &idx,
                                 &rec[mse_len..mse_len + qjl_len],
                                 gamma as f64,
-                            );
+                            ) * doc_norm as f64;
                             out.push((slot, score));
                         }
                         out
@@ -1340,22 +1380,15 @@ impl TurboQuantEngine {
                                     .try_into()
                                     .unwrap(),
                             );
-                            let doc_norm = f32::from_le_bytes(
-                                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                                    .try_into()
-                                    .unwrap(),
-                            );
+                            // Vectors stored unit-normalized; ip estimates <query, unit_doc>.
+                            // cosine(query, doc) = <query, unit_doc> / ||query||
                             let ip = quantizer.score_ip_encoded(
                                 &prep,
                                 &idx,
                                 &rec[mse_len..mse_len + qjl_len],
                                 gamma as f64,
                             );
-                            let score = if q_norm > 0.0 && doc_norm > 0.0 {
-                                ip / (q_norm * doc_norm as f64)
-                            } else {
-                                0.0
-                            };
+                            let score = if q_norm > 0.0 { ip / q_norm } else { 0.0 };
                             out.push((slot, score));
                         }
                         out
@@ -1378,11 +1411,18 @@ impl TurboQuantEngine {
                                     .try_into()
                                     .unwrap(),
                             );
-                            let v = quantizer.dequantize(
+                            let doc_norm = f32::from_le_bytes(
+                                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            // Dequantize returns unit vector; scale back to original norm.
+                            let mut v = quantizer.dequantize(
                                 &idx,
                                 &rec[mse_len..mse_len + qjl_len],
                                 gamma as f64,
                             );
+                            v.mapv_inplace(|x| x * doc_norm as f64);
                             let score = score_vectors_with_metric(metric, query, &v);
                             out.push((slot, score));
                         }
@@ -1411,14 +1451,18 @@ impl TurboQuantEngine {
 
         // Batch-dequantize all rerank candidates in parallel when raw vecs unavailable.
         let deq_vecs: Vec<Array1<f64>> = if self.rerank_enabled && self.live_vraw.is_none() {
-            let encoded: Vec<(Vec<CodeIndex>, Vec<u8>, f64)> = slots
+            let (encoded, norms): (Vec<_>, Vec<f32>) = slots
                 .iter()
                 .map(|&slot| {
-                    let (idx, qjl, gamma, _) = self.live_codes_at_slot(slot as usize);
-                    (idx, qjl.to_vec(), gamma as f64)
+                    let (idx, qjl, gamma, norm) = self.live_codes_at_slot(slot as usize);
+                    ((idx, qjl.to_vec(), gamma as f64), norm)
                 })
-                .collect();
-            self.quantizer.dequantize_batch(&encoded)
+                .unzip();
+            let mut vecs = self.quantizer.dequantize_batch(&encoded);
+            for (v, norm) in vecs.iter_mut().zip(norms.iter()) {
+                v.mapv_inplace(|x| x * *norm as f64);
+            }
+            vecs
         } else {
             Vec::new()
         };
@@ -1851,8 +1895,13 @@ impl TurboQuantEngine {
         is_deleted: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let vec_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
-        let (indices, qjl, gamma) = self.quantizer.quantize(&vec_f32);
         let norm = vec_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let vec_unit: Vec<f32> = if norm > 1e-10 {
+            vec_f32.iter().map(|&x| x / norm).collect()
+        } else {
+            vec_f32.clone()
+        };
+        let (indices, qjl, gamma) = self.quantizer.quantize(&vec_unit);
         let meta = VectorMetadata {
             properties: metadata,
             document,
@@ -1862,6 +1911,7 @@ impl TurboQuantEngine {
             quantized_indices: indices,
             qjl_bits: qjl,
             gamma: gamma as f32,
+            norm,
             metadata_json: serde_json::to_string(&meta)?,
             is_deleted,
         };
@@ -1895,10 +1945,31 @@ impl TurboQuantEngine {
         for chunk in items.chunks(5000) {
             let mut wal_entries = Vec::with_capacity(chunk.len());
             let mut metadata_entries: Vec<(u32, VectorMetadata)> = Vec::with_capacity(chunk.len());
-            let vec_refs: Vec<&[f32]> = chunk.iter().map(|i| i.vector.as_slice()).collect();
+            // Normalize each vector to unit sphere before quantization so the
+            // Lloyd-Max codebook (fitted to Beta-distribution unit-sphere coords) is valid.
+            // Compute (unit_vec, norm) once to avoid a second O(d) pass per vector.
+            let unit_vecs_and_norms: Vec<(Vec<f32>, f32)> = chunk
+                .iter()
+                .map(|item| {
+                    let n = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if n > 1e-10 {
+                        (item.vector.iter().map(|&x| x / n).collect(), n)
+                    } else {
+                        (item.vector.clone(), n)
+                    }
+                })
+                .collect();
+            let vec_refs: Vec<&[f32]> = unit_vecs_and_norms
+                .iter()
+                .map(|(v, _)| v.as_slice())
+                .collect();
             let quantized = self.quantizer.quantize_batch(&vec_refs);
 
-            for (_i, (item, (indices, qjl, gamma))) in chunk.iter().zip(quantized).enumerate() {
+            for (_i, (item, ((_unit_vec, norm), (indices, qjl, gamma)))) in chunk
+                .iter()
+                .zip(unit_vecs_and_norms.iter().zip(quantized))
+                .enumerate()
+            {
                 match mode {
                     BatchWriteMode::Insert if self.id_pool.contains(&item.id) => {
                         return Err(format!("ID '{}' already exists", item.id).into());
@@ -1908,7 +1979,6 @@ impl TurboQuantEngine {
                     }
                     _ => {}
                 }
-                let norm = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
                 let meta = VectorMetadata {
                     properties: item.metadata.clone(),
                     document: item.document.clone(),
@@ -1918,6 +1988,7 @@ impl TurboQuantEngine {
                     quantized_indices: indices,
                     qjl_bits: qjl,
                     gamma: gamma as f32,
+                    norm: *norm,
                     metadata_json: serde_json::to_string(&meta)?,
                     is_deleted: false,
                 };
@@ -1926,7 +1997,7 @@ impl TurboQuantEngine {
                     &entry.quantized_indices,
                     &entry.qjl_bits,
                     entry.gamma,
-                    norm,
+                    *norm,
                 )?;
                 self.live_save_raw_vector(slot, &item.vector);
                 metadata_entries.push((slot, meta));
