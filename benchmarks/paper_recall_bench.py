@@ -562,7 +562,12 @@ def _git_info() -> tuple[str, str]:
 def _tqdb_version() -> str:
     try:
         import importlib.metadata
-        return importlib.metadata.version("turboquantdb")
+        for dist_name in ("tqdb", "turboquantdb"):
+            try:
+                return importlib.metadata.version(dist_name)
+            except Exception:
+                continue
+        return "unknown"
     except Exception:
         return "unknown"
 
