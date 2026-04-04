@@ -78,6 +78,7 @@ convert_pdf.py
 /benchmarks/store_comparison_bench.py
 /benchmarks/_combine_bench_results.py
 /benchmarks/_full_bench_report.txt
+/benchmarks/_full_bench_report.md
 
 # Benchmark output artifacts
 bench_results_*.json
