@@ -8,18 +8,29 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ## [Unreleased]
 
----
+### Performance
 
-## [0.2.0] — 2026-04-15
-
-### Changed
-
-- **Package renamed from `turboquantdb` to `tqdb`** — `import tqdb` replaces `import turboquantdb`; the `Database` class is the same
-- `src/lib.rs` doc comment updated to reference `tqdb` Python package
+- **feat(perf)**: comprehensive regression gate tracking all metrics across recall, latency, disk, and RAM
+- **feat(perf)**: paper-methodology precommit regression gate + competitor comparison bench
 
 ---
 
-## [0.1.1] — 2026-04-10
+## [0.2.0] — 2026-04-04
+
+### Changed (breaking)
+
+- **Rename Python import namespace** — `from tqdb import Database` replaces `from turboquantdb import Database`; the `Database` class and all parameters are unchanged
+- Server binary renamed `turboquantdb-server` → `tqdb-server`
+- Rust crate renamed `turboquantdb` → `tqdb`
+
+### Fixed
+
+- **fix(quantizer)**: normalize vectors to unit sphere before quantization — fixes 2× recall gap for non-normalized input vectors; Lloyd-Max codebook assumes unit-sphere variance
+- **fix(wal)**: store and restore vector norm in WAL entries — norms written as `0.0` during crash recovery caused all recovered vectors to score `0.0` under IP metric
+
+---
+
+## [0.1.1] — 2026-04-04
 
 ### Fixed
 
