@@ -79,6 +79,13 @@ convert_pdf.py
 /benchmarks/_combine_bench_results.py
 /benchmarks/_full_bench_report.txt
 /benchmarks/_full_bench_report.md
+/benchmarks/run_bench_private.py
+/benchmarks/_bench_*_results.json
+/benchmarks/_private_report.md
+/benchmarks/_private_plots.png
+/benchmarks/_perf_history.html
+!/benchmarks/perf_history.json
+!/benchmarks/benchmark_plots.png
 
 # Benchmark output artifacts
 bench_results_*.json

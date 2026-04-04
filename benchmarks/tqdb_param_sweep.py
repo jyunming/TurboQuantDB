@@ -38,7 +38,7 @@ import psutil
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-K_VALUES   = [1, 4, 8]
+K_VALUES   = [1, 2, 4, 8, 16, 32, 64]
 CHUNK_SIZE = 2000
 CACHE_DIR  = Path(__file__).parent / "_paper_bench_cache"
 PROCESS    = psutil.Process(os.getpid())
@@ -254,8 +254,12 @@ def run_tqdb(
             "p50_ms":         float(np.percentile(lats, 50)),
             "p95_ms":         float(np.percentile(lats, 95)),
             "recall_1_at_1":  recalls[1],
+            "recall_1_at_2":  recalls[2],
             "recall_1_at_4":  recalls[4],
             "recall_1_at_8":  recalls[8],
+            "recall_1_at_16": recalls[16],
+            "recall_1_at_32": recalls[32],
+            "recall_1_at_64": recalls[64],
         }
     except Exception as exc:
         return {"name": label, "error": str(exc)}
@@ -278,8 +282,12 @@ COLS = [
     ("p50 ms",       "p50_ms",         ">", 8),
     ("p95 ms",       "p95_ms",         ">", 8),
     ("R@1@1",        "recall_1_at_1",  ">", 6),
+    ("R@1@2",        "recall_1_at_2",  ">", 6),
     ("R@1@4",        "recall_1_at_4",  ">", 6),
     ("R@1@8",        "recall_1_at_8",  ">", 6),
+    ("R@1@16",       "recall_1_at_16", ">", 7),
+    ("R@1@32",       "recall_1_at_32", ">", 7),
+    ("R@1@64",       "recall_1_at_64", ">", 7),
 ]
 
 FMT: dict = {
@@ -292,8 +300,12 @@ FMT: dict = {
     "p50_ms":         lambda v: f"{v:.2f}"   if v else "—",
     "p95_ms":         lambda v: f"{v:.2f}"   if v else "—",
     "recall_1_at_1":  lambda v: f"{v:.3f}",
+    "recall_1_at_2":  lambda v: f"{v:.3f}",
     "recall_1_at_4":  lambda v: f"{v:.3f}",
     "recall_1_at_8":  lambda v: f"{v:.3f}",
+    "recall_1_at_16": lambda v: f"{v:.3f}",
+    "recall_1_at_32": lambda v: f"{v:.3f}",
+    "recall_1_at_64": lambda v: f"{v:.3f}",
 }
 
 SEP = "  "
