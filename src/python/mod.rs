@@ -46,6 +46,10 @@ impl Database {
     ///         data at risk if the process crashes before flush. Default ``5000``.
     ///         Set to ``100`` to restore old conservative behaviour (more flushes, same final
     ///         disk/RAM — ``close()`` always trims the file to the exact slot count).
+    ///     normalize: When ``True`` the engine L2-normalises every inserted vector and every
+    ///         query vector internally so that IP scoring equals cosine similarity.  Callers
+    ///         that already emit unit vectors can set this to avoid repeating the normalisation
+    ///         themselves.  Default ``False``.
     ///
     /// Returns:
     ///     An open :class:`Database` instance.
@@ -53,8 +57,10 @@ impl Database {
     /// Example::
     ///
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="cosine")
+    ///     # Equivalent cosine-via-IP with auto-normalization:
+    ///     db = Database.open("mydb", dimension=1536, bits=4, metric="ip", normalize=True)
     #[staticmethod]
-    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None))]
+    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false))]
     fn open(
         path: String,
         dimension: usize,
@@ -66,6 +72,7 @@ impl Database {
         rerank_precision: Option<&str>,
         collection: Option<&str>,
         wal_flush_threshold: Option<usize>,
+        normalize: bool,
     ) -> PyResult<Self> {
         let engine_path = match collection {
             Some(col) if !col.is_empty() => {
@@ -115,6 +122,7 @@ impl Database {
             fast_mode,
             precision,
             wal_flush_threshold,
+            normalize,
         )
         .map_err(to_py_runtime)?;
         Ok(Self {
@@ -685,6 +693,34 @@ impl Database {
                 .list_with_filter_page(filter_ref, limit, offset)
                 .map_err(to_py_runtime)
         })
+    }
+
+    /// Return a ``{value: count}`` dict of all unique values of *field* across active vectors.
+    ///
+    /// Useful for enumerating distinct sources, categories, or any other metadata dimension
+    /// without a full ``list_all()`` scan.  Supports dotted paths (e.g. ``"meta.source"``).
+    /// Non-string values are stringified via their JSON representation.
+    ///
+    /// Args:
+    ///     field: Metadata field name (or dotted path) to aggregate.
+    ///
+    /// Returns:
+    ///     Dict mapping each unique field value to its occurrence count.
+    ///
+    /// Example::
+    ///
+    ///     counts = db.list_metadata_values("source")
+    ///     # → {"docs/readme.md": 42, "src/main.py": 17}
+    fn list_metadata_values(&self, py: Python<'_>, field: String) -> PyResult<PyObject> {
+        let counts = py.allow_threads(|| {
+            let engine = self.engine.read().unwrap();
+            engine.list_metadata_values(&field).map_err(to_py_runtime)
+        })?;
+        let dict = PyDict::new_bound(py);
+        for (k, v) in counts {
+            dict.set_item(k, v)?;
+        }
+        Ok(dict.into())
     }
 }
 

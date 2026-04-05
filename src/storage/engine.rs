@@ -82,6 +82,12 @@ pub struct Manifest {
     /// `F16`/`F32` create `live_vectors.bin` on new DBs for exact fast reranking.
     #[serde(default)]
     pub rerank_precision: RerankPrecision,
+    /// When true the engine L2-normalises every inserted vector and every query
+    /// vector internally so that IP scoring equals cosine similarity.  Callers
+    /// that already emit unit vectors (e.g. Axon RAG) can set this to avoid
+    /// repeating the normalisation themselves.
+    #[serde(default)]
+    pub normalize: bool,
 }
 
 fn default_rerank_enabled() -> bool {
@@ -191,6 +197,9 @@ pub struct TurboQuantEngine {
     /// When false, `live_compact_slab` is skipped on WAL flush — a pure insert
     /// workload never needs to compact (no dead slots to remove).
     has_pending_deletes: bool,
+    /// When true, input vectors and query vectors are L2-normalised internally
+    /// before quantisation / scoring so that IP ≡ cosine similarity.
+    pub normalize: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -259,7 +268,7 @@ impl TurboQuantEngine {
             RerankPrecision::Disabled
         };
         Self::open_with_options(
-            uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision, None,
+            uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision, None, false,
         )
     }
 
@@ -274,6 +283,7 @@ impl TurboQuantEngine {
         fast_mode: bool,
         rerank_precision: RerankPrecision,
         wal_flush_threshold: Option<usize>,
+        normalize: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(local_dir)?;
         let manifest_path = format!("{}/manifest.json", local_dir);
@@ -347,6 +357,7 @@ impl TurboQuantEngine {
                 rerank_enabled: rerank,
                 fast_mode,
                 rerank_precision,
+                normalize,
             };
             save_quantizer_state(local_dir, &backend, &q)?;
             m.save(&manifest_path)?;
@@ -395,6 +406,7 @@ impl TurboQuantEngine {
             None
         };
 
+        let normalize_flag = normalize || manifest.normalize;
         let mut engine = Self {
             d: manifest.d,
             b: manifest.b,
@@ -417,6 +429,7 @@ impl TurboQuantEngine {
             pending_manifest_updates: 0,
             has_pending_deletes: false,
             rerank_enabled: manifest.rerank_enabled,
+            normalize: normalize_flag,
         };
 
         let id_pool_loaded = if let Ok(ip) = load_id_pool(local_dir, &engine.backend) {
@@ -678,6 +691,33 @@ impl TurboQuantEngine {
                 .collect();
             Ok(ids)
         }
+    }
+
+    /// Return a `{value: count}` map of all unique values of `field` across active vectors.
+    ///
+    /// Supports dotted paths (e.g. `"meta.source"`) using the same nested-field resolution
+    /// as the filter system.  Non-string values are stringified via their JSON representation.
+    /// O(n) scan — identical cost to a filtered `count()`.
+    pub fn list_metadata_values(
+        &self,
+        field: &str,
+    ) -> Result<HashMap<String, usize>, Box<dyn std::error::Error + Send + Sync>> {
+        let active = self.id_pool.iter_active();
+        let slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
+        let meta_map = self.metadata.get_many(&slots)?;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for (_, slot) in &active {
+            if let Some(meta) = meta_map.get(slot) {
+                if let Some(val) = get_nested_field(&meta.properties, field) {
+                    let key = match val {
+                        JsonValue::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    *counts.entry(key).or_insert(0) += 1;
+                }
+            }
+        }
+        Ok(counts)
     }
 
     /// Update metadata and/or document for an existing vector without re-quantising.
@@ -1075,6 +1115,20 @@ impl TurboQuantEngine {
         if self.id_pool.active_count() == 0 || top_k == 0 {
             return Ok(Vec::new());
         }
+
+        // When normalize=true, L2-normalise the query so IP ≡ cosine similarity.
+        let normalized_query;
+        let query = if self.normalize {
+            let qn = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+            normalized_query = if qn > 1e-10 {
+                query / qn
+            } else {
+                query.to_owned()
+            };
+            &normalized_query
+        } else {
+            query
+        };
 
         let has_index = self.graph.has_index();
         let not_empty = !self.index_ids.is_empty();
@@ -1899,6 +1953,10 @@ impl TurboQuantEngine {
         } else {
             vec_f32.clone()
         };
+        // When normalize=true, treat the vector as unit-length so IP ≡ cosine.
+        // The stored norm drives IP score scaling; setting it to 1.0 removes that scaling.
+        let stored_norm = if self.normalize { 1.0f32 } else { norm };
+        let raw_for_rerank = if self.normalize { &vec_unit } else { &vec_f32 };
         let (indices, qjl, gamma) = self.quantizer.quantize(&vec_unit);
         let meta = VectorMetadata {
             properties: metadata,
@@ -1909,7 +1967,7 @@ impl TurboQuantEngine {
             quantized_indices: indices,
             qjl_bits: qjl,
             gamma: gamma as f32,
-            norm,
+            norm: stored_norm,
             metadata_json: serde_json::to_string(&meta)?,
             is_deleted,
         };
@@ -1921,9 +1979,9 @@ impl TurboQuantEngine {
                 &entry.quantized_indices,
                 &entry.qjl_bits,
                 entry.gamma,
-                norm,
+                stored_norm,
             )?;
-            self.live_save_raw_vector(slot, &vec_f32);
+            self.live_save_raw_vector(slot, raw_for_rerank);
             self.metadata.put(slot, &meta)?;
         }
         self.invalidate_index_state()?;
@@ -1963,7 +2021,7 @@ impl TurboQuantEngine {
                 .collect();
             let quantized = self.quantizer.quantize_batch(&vec_refs);
 
-            for (_i, (item, ((_unit_vec, norm), (indices, qjl, gamma)))) in chunk
+            for (_i, (item, ((unit_vec, norm), (indices, qjl, gamma)))) in chunk
                 .iter()
                 .zip(unit_vecs_and_norms.iter().zip(quantized))
                 .enumerate()
@@ -1977,6 +2035,13 @@ impl TurboQuantEngine {
                     }
                     _ => {}
                 }
+                // When normalize=true, store norm=1.0 so IP ≡ cosine (no scaling).
+                let stored_norm = if self.normalize { 1.0f32 } else { *norm };
+                let raw_for_rerank: &[f32] = if self.normalize {
+                    unit_vec
+                } else {
+                    &item.vector
+                };
                 let meta = VectorMetadata {
                     properties: item.metadata.clone(),
                     document: item.document.clone(),
@@ -1986,7 +2051,7 @@ impl TurboQuantEngine {
                     quantized_indices: indices,
                     qjl_bits: qjl,
                     gamma: gamma as f32,
-                    norm: *norm,
+                    norm: stored_norm,
                     metadata_json: serde_json::to_string(&meta)?,
                     is_deleted: false,
                 };
@@ -1995,9 +2060,9 @@ impl TurboQuantEngine {
                     &entry.quantized_indices,
                     &entry.qjl_bits,
                     entry.gamma,
-                    *norm,
+                    stored_norm,
                 )?;
-                self.live_save_raw_vector(slot, &item.vector);
+                self.live_save_raw_vector(slot, raw_for_rerank);
                 metadata_entries.push((slot, meta));
                 wal_entries.push(entry);
             }
@@ -2571,6 +2636,7 @@ mod tests {
             false,
             RerankPrecision::F16,
             None,
+            false,
         )
         .unwrap();
         let mut v = vec![0.0f64; d];
@@ -2603,6 +2669,7 @@ mod tests {
             false,
             RerankPrecision::F16,
             None,
+            false,
         )
         .unwrap();
         // v = [0.1, 0.2, ..., 1.6]; expected IP = sum((0.1*i)^2) for i=1..=16
@@ -2810,6 +2877,7 @@ mod tests {
             false,
             RerankPrecision::Disabled,
             None,
+            false,
         )
         .unwrap();
         for i in 0..5u32 {
@@ -2941,6 +3009,7 @@ mod tests {
             false,
             RerankPrecision::Disabled,
             None,
+            false,
         )
         .unwrap();
         for i in 0..15u32 {
@@ -3182,6 +3251,7 @@ mod tests {
             false,
             RerankPrecision::Disabled,
             Some(100),
+            false,
         )
         .unwrap();
         for i in 0..100 {
@@ -3237,6 +3307,7 @@ mod tests {
             false,
             RerankPrecision::F16,
             None,
+            false,
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3272,6 +3343,7 @@ mod tests {
             false,
             RerankPrecision::F16,
             None,
+            false,
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3309,6 +3381,7 @@ mod tests {
             false,
             RerankPrecision::Disabled,
             None,
+            false,
         )
         .unwrap();
         for i in 0..30u32 {
@@ -3353,6 +3426,7 @@ mod tests {
             false,
             RerankPrecision::F32,
             None,
+            false,
         )
         .unwrap();
         e.insert(
@@ -3430,6 +3504,7 @@ mod tests {
             false,
             RerankPrecision::Disabled,
             None,
+            false,
         )
         .unwrap();
         e.insert("a".into(), &Array1::from_vec(vec![0.0f64; d]), no_meta())
@@ -3889,6 +3964,7 @@ mod tests {
             false,
             RerankPrecision::Disabled, // no raw vecs → live_vraw=None
             None,
+            false,
         )
         .unwrap();
         for i in 0..30u32 {
