@@ -155,13 +155,14 @@ results = db.search(
     query,                       # np.ndarray (float32) or list[float]
     top_k=10,                    # int
     filter=None,                 # dict | None  (see Metadata Filtering below)
-    _use_ann=False,              # bool — use HNSW index if available (opt-in)
     ann_search_list_size=None,   # int | None — HNSW ef_search (default: max_degree × 2)
     include=None,                # list[str] | None — fields to return; default all
                                  #   valid values: "id", "score", "metadata", "document"
 )
 # Returns list of dicts: {"id": str, "score": float, "metadata": dict, "document": str | None}
 ```
+
+The HNSW index is used **automatically** when one has been built via `create_index()`. No extra flag is needed — search detects the index at runtime. Without an index the search falls back to exhaustive (brute-force) scoring.
 
 `ann_search_list_size` trades recall for latency — higher values find better results but take longer. Values between 64 and 256 cover the practical range.
 
@@ -174,7 +175,6 @@ all_results = db.query(
     query_embeddings,            # np.ndarray shape (N, D), float32 or float64
     n_results=10,                # int — results per query
     where_filter=None,           # dict | None
-    _use_ann=False,
     ann_search_list_size=None,
 )
 # Returns list[list[dict]] — one inner list per query vector

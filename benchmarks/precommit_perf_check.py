@@ -50,6 +50,8 @@ from pathlib import Path
 
 import numpy as np
 
+sys.stdout.reconfigure(encoding="utf-8")
+
 # ---------------------------------------------------------------------------
 # Metric registry — drives all comparison logic.
 # Each entry: (key, higher_is_better, display_label, unit, tol_override_pct | None)
@@ -186,7 +188,12 @@ def run_benchmark(config: dict) -> dict:
                                 corpus[start:start + CHUNK_SIZE])
             db.flush()
             ingest_walls.append(time.perf_counter() - wall_start)
-            stats = db.stats()  # deterministic — same on every round
+            stats = db.stats()  # RAM metrics — capture before close
+            db.close()  # trims GROW_SLOTS pre-allocation from live_codes.bin
+            # measure disk post-close so pre-allocated capacity is excluded
+            stats["total_disk_bytes"] = sum(
+                p.stat().st_size for p in Path(db_dir).iterdir() if p.is_file()
+            )
 
     # ── query: per-query minimum latency across QUERY_ROUNDS ───────────────
     # Taking the per-query minimum (not the best-round p50) eliminates

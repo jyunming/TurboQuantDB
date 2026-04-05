@@ -363,6 +363,22 @@ impl Database {
         Ok(engine.list_all())
     }
 
+    /// Search for the nearest neighbours of a query vector.
+    ///
+    /// The HNSW index is used automatically when one has been built via
+    /// :meth:`create_index` — no extra flag needed.  Without an index the
+    /// search falls back to exhaustive (brute-force) scoring.
+    ///
+    /// Args:
+    ///     query: Query vector (1-D numpy array, float32 or float64).
+    ///     top_k: Number of results to return.
+    ///     filter: Optional metadata filter dict.
+    ///     ann_search_list_size: HNSW ef_search override (larger = more recall, slower).
+    ///     include: Subset of fields to return — ``["id", "score", "metadata", "document"]``.
+    ///              Defaults to all four.
+    ///
+    /// Returns:
+    ///     List of dicts, each with keys ``id``, ``score``, ``metadata``, ``document``.
     #[pyo3(signature = (query, top_k, filter=None, _use_ann=false, ann_search_list_size=None, include=None))]
     fn search(
         &self,
@@ -545,8 +561,12 @@ impl Database {
     ///     query_embeddings: 2-D array of shape ``(N, D)``.
     ///     n_results: Number of results per query. Default 10.
     ///     where_filter: Optional metadata filter (same syntax as :meth:`search`).
-    ///     _use_ann: Use HNSW index if available. Default ``False``.
-    ///     ann_search_list_size: HNSW ef_search override.
+    ///     ann_search_list_size: HNSW ef_search override (larger = more recall, slower).
+    ///         Only relevant when an index has been built via :meth:`create_index`.
+    ///
+    /// Note:
+    ///     The HNSW index is used automatically when one has been built.
+    ///     No extra flag is needed — ``search`` and ``query`` detect the index at runtime.
     ///
     /// Returns:
     ///     List of N result lists, each in the same format as :meth:`search`.
