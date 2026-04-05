@@ -140,16 +140,29 @@ def generate_html_plotly(history: list[dict], out_path: Path) -> None:
                         marker=dict(size=7),
                         legendgroup=cfg_label,
                         showlegend=(mi == 0),
+                        hovertemplate=f"<b>{cfg_label}</b>: %{{y:.4g}}<extra></extra>",
                     ),
                     row=row, col=col,
                 )
 
         fig.update_layout(
-            height=300 * n_rows,
+            height=300 * n_rows + 120,  # extra room for legend below
             width=1100,
             template="plotly_white",
             font=dict(size=11),
-            margin=dict(t=50, b=30, l=60, r=20),
+            hovermode="x unified",
+            margin=dict(t=50, b=150, l=60, r=20),
+            legend=dict(
+                orientation="h",
+                xanchor="center",
+                x=0.5,
+                y=-0.18,
+                yanchor="top",
+                bgcolor="rgba(255,255,255,0.85)",
+                bordercolor="#ccc",
+                borderwidth=1,
+                tracegroupgap=4,
+            ),
         )
 
         html_parts.append(f"<h2>{ds}</h2>")
