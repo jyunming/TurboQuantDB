@@ -958,7 +958,9 @@ impl TurboQuantEngine {
                 // vectors are unavailable. When vraw is present, use exact rotation.
                 // In both cases, `to` candidates use pre-cached encoded data.
                 let prep = if has_vraw {
-                    let rec = vraw_ref.unwrap().get_slot(from_slot);
+                    let rec = vraw_ref
+                        .expect("invariant: has_vraw=true implies live_vraw is Some")
+                        .get_slot(from_slot);
                     let mut out = Array1::<f64>::zeros(d);
                     if matches!(vraw_precision, RerankPrecision::F16) {
                         for i in 0..d {
@@ -999,7 +1001,9 @@ impl TurboQuantEngine {
                     .collect()
             } else if matches!(metric, DistanceMetric::Cosine) {
                 let (prep, from_norm) = if has_vraw {
-                    let rec = vraw_ref.unwrap().get_slot(from_slot);
+                    let rec = vraw_ref
+                        .expect("invariant: has_vraw=true implies live_vraw is Some")
+                        .get_slot(from_slot);
                     let mut out = Array1::<f64>::zeros(d);
                     if matches!(vraw_precision, RerankPrecision::F16) {
                         for i in 0..d {
@@ -1057,7 +1061,9 @@ impl TurboQuantEngine {
                     .collect()
             } else {
                 // L2 with raw vecs: read from vraw directly.
-                let vraw = vraw_ref.unwrap();
+                // Invariant: precomputed_l2 is empty only when has_vraw=true (L2 + rerank=true).
+                let vraw =
+                    vraw_ref.expect("invariant: L2 raw-vec path only reached when rerank=true");
                 let rec = vraw.get_slot(from_slot);
                 let mut from_vec = Array1::<f64>::zeros(d);
                 for i in 0..d {
@@ -1319,7 +1325,11 @@ impl TurboQuantEngine {
                     document: meta.document,
                 });
             }
-            out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            out.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             if out.len() > top_k {
                 out.truncate(top_k);
             }
@@ -1340,7 +1350,11 @@ impl TurboQuantEngine {
                 let mut dark_results =
                     self.exhaustive_search_simd(query, top_k, filter, Some(dark_slots))?;
                 out.append(&mut dark_results);
-                out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+                out.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
                 out.truncate(top_k);
             }
 
@@ -5161,6 +5175,207 @@ mod tests {
         assert!(
             dark_found,
             "at least one post-index vector must appear in ANN results (hybrid search)"
+        );
+    }
+
+    // ── Compaction edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn compact_with_all_deleted_vectors_leaves_empty_live_slab() {
+        // All vectors are deleted before the WAL flush that triggers live_compact_slab.
+        // Verifies that the slab truncates to 0 active slots without panicking.
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+        let threshold = e.wal_flush_threshold;
+
+        // Insert exactly threshold-1 vectors then delete all of them so that
+        // the final delete_batch call brings the WAL buffer to threshold → flush.
+        for i in 0..threshold - 1 {
+            e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
+                .unwrap();
+        }
+        let to_delete: Vec<String> = (0..threshold - 1).map(|i| format!("v{i}")).collect();
+        e.delete_batch(to_delete).unwrap();
+
+        // After compaction the live slab should have 0 active slots and 0 vectors.
+        let stats = e.stats();
+        assert_eq!(
+            stats.vector_count, 0,
+            "all vectors deleted: vector_count must be 0"
+        );
+        assert_eq!(
+            stats.live_slot_count as u64, 0,
+            "all vectors deleted: live_slot_count must be 0 (no ghost slots)"
+        );
+
+        // Reopen must succeed and DB must still be empty.
+        let e2 = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+        assert_eq!(e2.stats().vector_count, 0);
+        assert!(e2.list_all().is_empty());
+    }
+
+    #[test]
+    fn compact_called_before_wal_flush_flushes_wal_first() {
+        // compact() must flush the WAL before running compaction so that vectors
+        // sitting in the WAL buffer are not silently dropped.
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let n = 10usize;
+        let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+
+        // Insert well below the WAL flush threshold so the WAL is NOT auto-flushed.
+        for i in 0..n {
+            e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
+                .unwrap();
+        }
+        // All n vectors still in WAL buffer at this point.
+        assert_eq!(e.stats().segment_count, 0, "no segments written yet");
+
+        // Calling compact() explicitly must flush the WAL first.
+        e.compact().unwrap();
+
+        // After compact() all vectors must be accessible — none dropped.
+        let e2 = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+        assert_eq!(
+            e2.stats().vector_count,
+            n as u64,
+            "compact() must flush WAL: all inserted vectors must survive"
+        );
+        for i in 0..n {
+            assert!(
+                e2.get(&format!("v{i}")).unwrap().is_some(),
+                "v{i} must be present after compact()+reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_then_search_returns_correct_results() {
+        // Compaction invalidates the HNSW index. Search after compaction must fall
+        // back to exhaustive scan and still return the correct nearest neighbours.
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+        let threshold = e.wal_flush_threshold;
+
+        // Insert enough vectors to trigger a WAL flush and then build an index.
+        for i in 0..threshold {
+            let mut v = vec![0.0f64; d];
+            v[i % d] = (i as f64 + 1.0) * 0.1;
+            e.insert(format!("v{i}"), &Array1::from_vec(v), no_meta())
+                .unwrap();
+        }
+        e.create_index_with_params(4, 16, 16, 1.2, 0).unwrap();
+        assert!(e.stats().has_index, "index must exist before compaction");
+
+        // Delete some vectors and trigger compaction (invalidates index).
+        let to_delete: Vec<String> = (0..5).map(|i| format!("v{i}")).collect();
+        e.delete_batch(to_delete).unwrap();
+        e.compact().unwrap();
+
+        // Search must succeed (falls back to exhaustive) and must not return deleted IDs.
+        let q = make_vec(d, 0.5);
+        let results = e
+            .search_with_filter_and_ann(&q, 10, None, None, true)
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "search after compaction must return results"
+        );
+        let deleted_owned: Vec<String> = (0..5usize).map(|i| format!("v{i}")).collect();
+        let deleted_set: std::collections::HashSet<&str> =
+            deleted_owned.iter().map(|s| s.as_str()).collect();
+        for r in &results {
+            assert!(
+                !deleted_set.contains(r.id.as_str()),
+                "deleted vector {} must not appear in search results after compaction",
+                r.id
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_compaction_state_on_disk_is_recovered_on_reopen() {
+        // Simulate a crash after the Prepared marker is written and the new segment
+        // exists on disk. On reopen, recover_if_needed() must detect the Prepared
+        // state, validate the new segment, delete old segments, and leave the DB intact.
+        use serde_json::json;
+        use std::fs;
+
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let threshold;
+        {
+            let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+            threshold = e.wal_flush_threshold;
+
+            // Write enough vectors to produce at least one segment on disk.
+            for i in 0..threshold {
+                e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
+                    .unwrap();
+            }
+            // Force another flush so we have a second segment (more realistic).
+            for i in threshold..threshold * 2 {
+                e.insert(format!("v{i}"), &make_vec(d, 0.3), no_meta())
+                    .unwrap();
+            }
+        }
+
+        // Find the segment files on disk — we need their names for the compaction state.
+        let seg_names: Vec<String> = fs::read_dir(p)
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name().into_string().unwrap();
+                if name.starts_with("seg-") && name.ends_with(".bin") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            !seg_names.is_empty(),
+            "test requires at least one segment on disk"
+        );
+
+        // Write a fake Prepared compaction marker that claims old_segments = seg_names
+        // and new_segment = a non-existent file. This simulates a crash before the new
+        // segment was written → recovery should abandon (keep old segments).
+        let fake_state = json!({
+            "phase": "Prepared",
+            "old_segment_names": seg_names,
+            "new_segment_name": "seg-deadbeef.bin"
+        });
+        let state_path = std::path::Path::new(p).join("compaction_state.json");
+        fs::write(&state_path, serde_json::to_vec_pretty(&fake_state).unwrap()).unwrap();
+        assert!(state_path.exists(), "compaction state file must be written");
+
+        // Reopen: recover_if_needed() must run, detect missing new segment,
+        // preserve old segments, and clean up the marker.
+        let e2 = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+
+        // Marker file must be gone.
+        assert!(
+            !state_path.exists(),
+            "compaction_state.json must be cleaned up on reopen"
+        );
+        // All original segments preserved (new_segment was missing → rollback).
+        for name in &seg_names {
+            assert!(
+                std::path::Path::new(p).join(name).exists(),
+                "old segment {name} must be preserved after aborted compaction recovery"
+            );
+        }
+        // All vectors still accessible.
+        assert_eq!(
+            e2.stats().vector_count,
+            (threshold * 2) as u64,
+            "all vectors must survive aborted compaction recovery"
         );
     }
 }
