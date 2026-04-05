@@ -150,7 +150,7 @@ impl Database {
         };
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine
                 .insert_with_document(id, &vec, props, document)
                 .map_err(to_py_runtime)
@@ -195,7 +195,7 @@ impl Database {
                     });
                 }
                 py.allow_threads(|| {
-                    let mut engine = self.engine.write().unwrap();
+                    let mut engine = self.write_engine()?;
                     engine
                         .insert_many_with_mode(chunk_items, b_mode)
                         .map_err(to_py_runtime)
@@ -223,7 +223,7 @@ impl Database {
                     });
                 }
                 py.allow_threads(|| {
-                    let mut engine = self.engine.write().unwrap();
+                    let mut engine = self.write_engine()?;
                     engine
                         .insert_many_with_mode(chunk_items, b_mode)
                         .map_err(to_py_runtime)
@@ -251,7 +251,7 @@ impl Database {
         };
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine
                 .upsert_with_document(id, &vec, props, document)
                 .map_err(to_py_runtime)
@@ -276,7 +276,7 @@ impl Database {
         };
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine
                 .update_with_document(id, &vec, props, document)
                 .map_err(to_py_runtime)
@@ -285,7 +285,7 @@ impl Database {
 
     fn delete(&self, py: Python<'_>, id: String) -> PyResult<bool> {
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine.delete(id).map_err(to_py_runtime)
         })
     }
@@ -303,7 +303,7 @@ impl Database {
     ///     deleted = db.delete_batch(["id1", "id2", "id3"])
     fn delete_batch(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<usize> {
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine.delete_batch(ids).map_err(to_py_runtime)
         })
     }
@@ -335,14 +335,14 @@ impl Database {
             Some(&parsed_filter)
         };
         py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.count_with_filter(filter_ref).map_err(to_py_runtime)
         })
     }
 
     fn get(&self, py: Python<'_>, id: String) -> PyResult<Option<PyObject>> {
         let got = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.get(&id).map_err(to_py_runtime)
         })?;
         Ok(match got {
@@ -353,7 +353,7 @@ impl Database {
 
     fn get_many(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<PyObject> {
         let results = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.get_many(&ids).map_err(to_py_runtime)
         })?;
         let py_list = PyList::empty_bound(py);
@@ -367,7 +367,7 @@ impl Database {
     }
 
     fn list_all(&self, _py: Python<'_>) -> PyResult<Vec<String>> {
-        let engine = self.engine.read().unwrap();
+        let engine = self.read_engine()?;
         Ok(engine.list_all())
     }
 
@@ -419,7 +419,7 @@ impl Database {
         let inc = parse_include_set(include, &["id", "score", "metadata", "document"]);
 
         let results = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine
                 .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, _use_ann)
                 .map_err(to_py_runtime)
@@ -462,7 +462,7 @@ impl Database {
         n_refinements: Option<usize>,
     ) -> PyResult<()> {
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine
                 .create_index_with_params(
                     max_degree.unwrap_or(32),
@@ -477,7 +477,7 @@ impl Database {
 
     fn stats(&self, py: Python<'_>) -> PyResult<PyObject> {
         let stats = {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.stats()
         };
         let dict = PyDict::new_bound(py);
@@ -511,28 +511,28 @@ impl Database {
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine.flush_wal_to_segment().map_err(to_py_runtime)
         })
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine.close().map_err(to_py_runtime)
         })
     }
 
     /// `len(db)` — total number of active vectors.
     fn __len__(&self) -> PyResult<usize> {
-        let engine = self.engine.read().unwrap();
+        let engine = self.read_engine()?;
         engine.count_with_filter(None).map_err(to_py_runtime)
     }
 
     /// `id in db` — True if the ID exists in the database.
     fn __contains__(&self, py: Python<'_>, id: String) -> PyResult<bool> {
         py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.get(&id).map(|r| r.is_some()).map_err(to_py_runtime)
         })
     }
@@ -559,7 +559,7 @@ impl Database {
     ) -> PyResult<()> {
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
-            let mut engine = self.engine.write().unwrap();
+            let mut engine = self.write_engine()?;
             engine
                 .update_metadata_only(&id, props, document)
                 .map_err(to_py_runtime)
@@ -625,7 +625,7 @@ impl Database {
         };
 
         let batch = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine
                 .search_batch(
                     &queries,
@@ -688,7 +688,7 @@ impl Database {
             Some(&parsed_filter)
         };
         py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine
                 .list_with_filter_page(filter_ref, limit, offset)
                 .map_err(to_py_runtime)
@@ -713,7 +713,7 @@ impl Database {
     ///     # → {"docs/readme.md": 42, "src/main.py": 17}
     fn list_metadata_values(&self, py: Python<'_>, field: String) -> PyResult<PyObject> {
         let counts = py.allow_threads(|| {
-            let engine = self.engine.read().unwrap();
+            let engine = self.read_engine()?;
             engine.list_metadata_values(&field).map_err(to_py_runtime)
         })?;
         let dict = PyDict::new_bound(py);
@@ -721,6 +721,24 @@ impl Database {
             dict.set_item(k, v)?;
         }
         Ok(dict.into())
+    }
+}
+
+impl Database {
+    fn read_engine(&self) -> PyResult<std::sync::RwLockReadGuard<'_, TurboQuantEngine>> {
+        self.engine.read().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "database lock poisoned: a previous operation panicked; re-open the database",
+            )
+        })
+    }
+
+    fn write_engine(&self) -> PyResult<std::sync::RwLockWriteGuard<'_, TurboQuantEngine>> {
+        self.engine.write().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "database lock poisoned: a previous operation panicked; re-open the database",
+            )
+        })
     }
 }
 

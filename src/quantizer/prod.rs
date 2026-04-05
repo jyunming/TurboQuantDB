@@ -559,6 +559,7 @@ impl ProdQuantizer {
     /// with Hamming distance gives a fast (~64× cheaper than LUT) proxy for inner
     /// product proximity, enabling fast HNSW navigation followed by accurate LUT
     /// re-scoring of the final candidate set.
+    #[allow(dead_code)]
     pub(crate) fn prepare_navigation_bits(&self, query: &Array1<f64>) -> Vec<u8> {
         let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
         let (_, qjl_bits, _) = self.quantize(&query_f32);
@@ -574,6 +575,7 @@ impl ProdQuantizer {
 ///
 /// The shorter slice determines the number of bits compared; any extra bytes in
 /// the longer slice are ignored.
+#[allow(dead_code)]
 pub(crate) fn hamming_score(a: &[u8], b: &[u8]) -> f64 {
     let n_bytes = a.len().min(b.len());
     if n_bytes == 0 {
