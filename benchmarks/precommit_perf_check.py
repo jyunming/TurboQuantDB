@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -91,6 +92,78 @@ METRIC_DEFS: list[tuple[str, bool, str, str, float | None]] = [
 ]
 
 METRIC_KEYS = {key for key, *_ in METRIC_DEFS}
+
+
+# ---------------------------------------------------------------------------
+# Perf history tracking — append results and regenerate HTML dashboard
+# ---------------------------------------------------------------------------
+
+BENCH_DIR    = Path(__file__).parent
+HISTORY_PATH = BENCH_DIR / "perf_history.json"
+
+
+def _git_info() -> tuple[str, str]:
+    def _run(cmd: list[str]) -> str:
+        try:
+            return subprocess.check_output(
+                cmd, cwd=BENCH_DIR.parent, stderr=subprocess.DEVNULL
+            ).decode().strip()
+        except Exception:
+            return "unknown"
+    return _run(["git", "rev-parse", "--short", "HEAD"]), \
+           _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+
+
+def _append_perf_history(measured: dict, config: dict) -> None:
+    """Append measured values to perf_history.json and regenerate HTML."""
+    commit, branch = _git_info()
+    try:
+        import importlib.metadata
+        version = importlib.metadata.version("tqdb")
+    except Exception:
+        version = "unknown"
+
+    entry = {
+        "timestamp": __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc
+        ).isoformat(),
+        "git_commit": commit,
+        "git_branch": branch,
+        "version": version,
+        "source": "precommit",
+        "results": {
+            "glove-200": {
+                "b4_rerankF_brute_r1at1":      measured.get("recall_1_at_1", 0.0),
+                "b4_rerankF_brute_throughput": measured.get("insert_throughput_vps", 0.0),
+                "b4_rerankF_brute_p50_ms":     measured.get("p50_latency_ms", 0.0),
+                "b4_rerankF_brute_disk_mb":    measured.get("disk_bytes", 0.0) / (1 << 20),
+                "b4_rerankF_brute_ram_delta_mb": measured.get("ram_estimate_bytes", 0.0) / (1 << 20),
+                "b4_rerankF_brute_mrr":        measured.get("recall_1_at_1", 0.0),
+            }
+        },
+    }
+
+    history: list = []
+    if HISTORY_PATH.exists():
+        try:
+            history = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            history = []
+    history.append(entry)
+    HISTORY_PATH.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+    # Regenerate HTML dashboard
+    tracker_path = BENCH_DIR / "perf_tracker.py"
+    if tracker_path.exists():
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("perf_tracker", tracker_path)
+            pt = importlib.util.module_from_spec(spec)   # type: ignore[arg-type]
+            spec.loader.exec_module(pt)                  # type: ignore[union-attr]
+            h = pt.load_history(HISTORY_PATH)
+            pt.generate_html_plotly(h, BENCH_DIR / "_perf_history.html")
+        except Exception as exc:
+            print(f"[pre-commit] warning: HTML not regenerated: {exc}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +507,7 @@ def main() -> None:
 
     if not failures:
         print("[pre-commit] ✓ all metrics within 5% of best")
+        _append_perf_history(measured, config)
         return
 
     print("\n[pre-commit] FAIL — regression(s) detected:")
@@ -445,6 +519,7 @@ def main() -> None:
             "\n[pre-commit] ⚠ override active (--force / TQDB_PERF_SKIP=1) — "
             "proceeding despite regression"
         )
+        _append_perf_history(measured, config)
         return
 
     print(

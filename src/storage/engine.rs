@@ -4136,7 +4136,58 @@ mod tests {
         }
     }
 
-    // ── insert_many WAL flush at buffer==threshold (line 1859) ───────────────
+    #[test]
+    fn delete_batch_deferred_flush_compacts_when_later_insert_triggers_wal_flush() {
+        // Companion to the test above: delete_batch does NOT trigger the WAL flush
+        // itself (buffer stays below threshold), but has_pending_deletes=true is still
+        // set, so when a later insert causes the flush, compaction runs correctly.
+        let dir = tempdir().unwrap();
+        let p = dir.path().to_str().unwrap();
+        let d = 8;
+        let n = 3usize;
+        {
+            let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+            let threshold = e.wal_flush_threshold;
+
+            // Insert just a few vectors — WAL buffer stays well below threshold.
+            for i in 0..10usize {
+                e.insert(format!("v{i}"), &make_vec(d, 0.5), no_meta())
+                    .unwrap();
+            }
+
+            // delete_batch: buffer stays below threshold (10 + n << threshold).
+            let to_delete: Vec<String> = (0..n).map(|i| format!("v{i}")).collect();
+            let deleted = e.delete_batch(to_delete).unwrap();
+            assert_eq!(deleted, n);
+
+            // Now flood inserts until we cross the threshold — this triggers the WAL flush.
+            let remaining = threshold - (10 + n); // how many more to cross threshold
+            for i in 10..10 + remaining {
+                e.insert(format!("w{i}"), &make_vec(d, 0.5), no_meta())
+                    .unwrap();
+            }
+
+            // Compaction must have run: live_slot_count == vector_count (no ghost slots).
+            let stats = e.stats();
+            assert_eq!(
+                stats.live_slot_count as u64, stats.vector_count,
+                "compaction must run during flush triggered by inserts after delete_batch"
+            );
+            assert_eq!(
+                stats.vector_count,
+                (10 - n + remaining) as u64,
+                "vector count must be correct after deferred compaction"
+            );
+        }
+        // Confirm deleted IDs are gone after reload.
+        let e2 = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+        for i in 0..n {
+            assert!(
+                e2.get(&format!("v{i}")).unwrap().is_none(),
+                "v{i} should be deleted after deferred-flush compaction and reopen"
+            );
+        }
+    }
 
     #[test]
     fn insert_many_at_threshold_triggers_wal_flush() {
