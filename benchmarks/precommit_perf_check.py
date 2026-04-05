@@ -105,9 +105,9 @@ HISTORY_PATH = BENCH_DIR / "perf_history.json"
 # Datasets run for history tracking (smaller n than full benchmark for speed)
 HISTORY_DS_CONFIGS: list[tuple[str, int, int, int]] = [
     # (ds_label, n, d, n_queries)
-    ("glove-200",    10_000, 200,  100),
-    ("dbpedia-1536",  2_000, 1536,  30),
-    ("dbpedia-3072",  1_000, 3072,  20),
+    ("glove-200",    10_000, 200,  1000),   # cache has 10k queries
+    ("dbpedia-1536",  2_000, 1536,  500),   # cache has 1k queries
+    ("dbpedia-3072",  1_000, 3072,  500),   # cache has 1k queries
 ]
 
 # Full config set matching perf_tracker.py CONFIGS: (bits, rerank, ann)
@@ -167,16 +167,37 @@ def _run_one_config_for_history(
     ids = [f"vec_{i}" for i in range(n)]
     max_k = 8
 
+    # Lazy-import CpuRamSampler for realistic RSS-delta RAM measurement
+    _CpuRamSampler = None
+    try:
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("bench_core", Path(__file__).parent / "bench_core.py")
+        if _spec is not None:
+            _bc = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_bc)  # type: ignore[union-attr]
+            _CpuRamSampler = _bc.CpuRamSampler
+    except Exception:
+        pass
+
     # Ingest pass — single round (trending, not gating)
     with tempfile.TemporaryDirectory() as db_dir:
+        sampler = _CpuRamSampler() if _CpuRamSampler else None
+        if sampler:
+            sampler.start()
         db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
         t0 = time.perf_counter()
         for start in range(0, n, CHUNK_SIZE):
             db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
         db.flush()
         ingest_s = time.perf_counter() - t0
-        ram_mb = db.stats()["ram_estimate_bytes"] / (1 << 20)
+        if sampler:
+            sampler.stop()
+            ram_mb = sampler.delta_ram_mb
+        else:
+            ram_mb = db.stats()["ram_estimate_bytes"] / (1 << 20)
         db.close()
+        # Reopen then close to trim pre-allocated mmap capacity before measuring disk
+        tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip").close()
         disk_mb = sum(
             p.stat().st_size for p in Path(db_dir).iterdir() if p.is_file()
         ) / (1 << 20)
