@@ -33,10 +33,15 @@ db = Database.open(
                              #            "f32" = float32 exact reranking (+n×d×4 bytes)
     collection=None,         # str|None — subdirectory name for the collection; if given,
                              #            the DB is stored at path/collection/ instead of path/
+    normalize=False,         # bool — L2-normalize every inserted vector and every query at
+                             #        write time; makes inner-product scoring equivalent to
+                             #        cosine similarity without changing the metric parameter
 )
 ```
 
 `path` must use the same `dimension`, `bits`, `seed`, and `metric` every time it is opened — these are baked into the quantizer and cannot be changed after creation.
+
+Pass an `s3://bucket/prefix` URI (requires the `cloud` Cargo feature) to store segments in Amazon S3 with a local write-through cache (see [On-disk Layout](#on-disk-layout)).
 
 ### Multi-collection pattern
 
@@ -252,6 +257,23 @@ Filter semantics:
 - `$contains` does substring matching on string fields only
 - No implicit type coercion — `{"year": "2023"}` will not match `{"year": 2023}`
 
+### Enumerating metadata values
+
+Use `list_metadata_values` to discover all distinct values for a field — useful for building filter UIs or faceted search:
+
+```python
+topics = db.list_metadata_values("topic")
+# ["finance", "ml", "sports", ...]
+```
+
+Returns a `list` of all distinct non-null values stored for that field across active vectors.
+
+---
+
+## Hybrid search (post-index inserts)
+
+Vectors inserted **after** `create_index()` are still searched correctly. The engine automatically detects "dark slots" (active but not yet indexed) and runs a targeted brute-force scan over them, merging results with the HNSW candidates before returning top-k. There is no extra configuration required; the fallback incurs zero overhead when all vectors are indexed.
+
 ---
 
 ## RAG Integration
@@ -296,6 +318,73 @@ for r in results:
 ```
 
 Returns a `list[dict]` with keys: `"text"`, `"metadata"`, `"score"`.
+
+---
+
+## ChromaDB Compatibility Shim
+
+`tqdb.chroma_compat` provides a drop-in `PersistentClient` that mirrors the chromadb ≥ 1.5 API. Each collection is stored as a `tqdb.Database` under `{path}/{collection_name}/`.
+
+```python
+from tqdb.chroma_compat import PersistentClient
+
+client = PersistentClient(path="/data/chroma")
+col = client.get_or_create_collection("docs", metadata={"hnsw:space": "cosine"})
+
+col.add(ids=["a", "b"], embeddings=[[0.1, ...], [0.2, ...]], metadatas=[{"src": "web"}, {}])
+col.upsert(ids=["a"], embeddings=[[0.3, ...]], metadatas=[{"src": "updated"}])
+
+results = col.query(query_embeddings=[[0.1, ...]], n_results=5)
+# {"ids": [[...]], "distances": [[...]], "metadatas": [[...]], "documents": [[...]]}
+
+col.delete(ids=["b"])
+col.delete(where={"src": {"$eq": "web"}})
+
+print(col.count())          # int
+print(col.peek(limit=3))    # dict same shape as query result
+```
+
+**Metric mapping:** `metadata={"hnsw:space": "cosine"}` → `metric="cosine"`, `"ip"` → inner product (default), `"l2"` → L2. The metric is fixed at collection creation and cannot be changed.
+
+**Not implemented:** `HttpClient`, `Settings`, server/cloud mode, `chromadb.Client()` (ephemeral), `where_document` filtering, automatic text embedding (pass pre-computed `embeddings`; or provide an `embedding_function` callable at collection creation time).
+
+**Where-filter operators supported:** `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$and`, `$or`.
+
+---
+
+## LanceDB Compatibility Shim
+
+`tqdb.lancedb_compat` provides a `connect()` factory mirroring the LanceDB v0/v1 Python API. Each table is stored as a `tqdb.Database` under `{uri}/{table_name}/`.
+
+```python
+from tqdb.lancedb_compat import connect
+import pyarrow as pa
+
+db = connect("/data/lancedb")
+
+# Create from PyArrow Table or list[dict] with "id" + "vector" columns
+tbl = db.create_table("docs", data=pa_table)
+tbl = db.create_table("docs", data=pa_table, mode="overwrite")  # wipe and recreate
+
+# Fluent query builder
+results = (
+    tbl.search(query_vec)
+       .metric("dot")          # "dot"/"ip" → ip, "cosine" → cosine, "l2"/"euclidean" → l2
+       .limit(10)
+       .where("id IN ('a', 'b', 'c')")
+       .to_list()               # list[dict] with all fields + "_distance"
+)
+
+tbl.delete("id IN ('a', 'b')")
+tbl.delete("status = 'archived'")
+
+print(tbl.count_rows())
+tbl.optimize()   # no-op; tqdb handles compaction automatically
+```
+
+**SQL WHERE parser:** only `id IN ('a', 'b', ...)` and `field = 'value'` are supported. Complex predicates raise `NotImplementedError`.
+
+**Not implemented:** `update(where, values)`, `merge_insert()`, `create_fts_index`, `create_scalar_index`, `drop_database`, remote/cloud URIs.
 
 ---
 
