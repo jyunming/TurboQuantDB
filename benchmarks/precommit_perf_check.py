@@ -110,11 +110,23 @@ HISTORY_DS_CONFIGS: list[tuple[str, int, int, int]] = [
     ("dbpedia-3072",  1_000, 3072,  20),
 ]
 
-# Same config set tracked by perf_tracker.py CONFIGS (brute only for precommit speed)
-HISTORY_BENCH_CONFIGS: list[tuple[int, bool]] = [
-    (4, False),  # b=4 rerank=F brute
-    (4, True),   # b=4 rerank=T brute
+# Full config set matching perf_tracker.py CONFIGS: (bits, rerank, ann)
+HISTORY_BENCH_CONFIGS: list[tuple[int, bool, bool]] = [
+    (2, False, False),  # b=2 rerank=F brute
+    (2, True,  False),  # b=2 rerank=T brute
+    (4, False, False),  # b=4 rerank=F brute
+    (4, True,  False),  # b=4 rerank=T brute
+    (2, False, True),   # b=2 rerank=F ANN
+    (2, True,  True),   # b=2 rerank=T ANN
+    (4, False, True),   # b=4 rerank=F ANN
+    (4, True,  True),   # b=4 rerank=T ANN
 ]
+
+# ANN index params (consistent with "Balanced" preset in README)
+ANN_MAX_DEGREE      = 32
+ANN_EF_CONSTRUCTION = 200
+ANN_N_REFINEMENTS   = 5
+ANN_SEARCH_LIST     = 200
 
 HISTORY_QUERY_ROUNDS = 3  # fewer rounds than gate check; just for trending
 
@@ -133,10 +145,11 @@ def _git_info() -> tuple[str, str]:
     )
 
 
-def _config_key(bits: int, rerank: bool) -> str:
-    """Key prefix matching paper_recall_bench.py config_label format."""
+def _config_key(bits: int, rerank: bool, ann: bool = False) -> str:
+    """Key prefix matching perf_tracker.py CONFIGS format."""
     rr = "rerankT" if rerank else "rerankF"
-    return f"b{bits}_{rr}_brute"
+    mode = "ANN" if ann else "brute"
+    return f"b{bits}_{rr}_{mode}"
 
 
 def _run_one_config_for_history(
@@ -145,6 +158,7 @@ def _run_one_config_for_history(
     true_top1s: list[str],
     bits: int,
     rerank: bool,
+    ann: bool = False,
 ) -> dict:
     """Run one config, return metrics matching perf_history.json key suffixes."""
     import tqdb as tq  # noqa: PLC0415
@@ -167,12 +181,18 @@ def _run_one_config_for_history(
             p.stat().st_size for p in Path(db_dir).iterdir() if p.is_file()
         ) / (1 << 20)
 
-    # Query pass
+    # Query pass (with optional ANN index)
     with tempfile.TemporaryDirectory() as db_dir:
         db = tq.Database.open(db_dir, dimension=d, bits=bits, rerank=rerank, metric="ip")
         for start in range(0, n, CHUNK_SIZE):
             db.insert_batch(ids[start:start + CHUNK_SIZE], corpus[start:start + CHUNK_SIZE])
         db.flush()
+        if ann:
+            db.create_index(
+                max_degree=ANN_MAX_DEGREE,
+                ef_construction=ANN_EF_CONSTRUCTION,
+                n_refinements=ANN_N_REFINEMENTS,
+            )
 
         min_lats = [float("inf")] * len(qs)
         last_returned: list[list[str]] = []
@@ -180,7 +200,11 @@ def _run_one_config_for_history(
             round_ret: list[list[str]] = []
             for j, q in enumerate(qs):
                 t0 = time.perf_counter()
-                results = db.search(q, top_k=max_k)
+                results = db.search(
+                    q, top_k=max_k,
+                    _use_ann=ann,
+                    ann_search_list_size=ANN_SEARCH_LIST if ann else None,
+                )
                 min_lats[j] = min(min_lats[j], (time.perf_counter() - t0) * 1000)
                 round_ret.append([r["id"] for r in results])
             if rnd == HISTORY_QUERY_ROUNDS - 1:
@@ -241,10 +265,10 @@ def _append_perf_history() -> None:
         corpus, qs, _ = load_data(n, d, n_queries, seed=42)
         true_top1s = [f"vec_{int(np.argmax(corpus @ q))}" for q in qs]
         ds_snap: dict = {}
-        for bits, rerank in HISTORY_BENCH_CONFIGS:
-            key = _config_key(bits, rerank)
+        for bits, rerank, ann in HISTORY_BENCH_CONFIGS:
+            key = _config_key(bits, rerank, ann)
             print(f"    {key} ...", flush=True)
-            metrics = _run_one_config_for_history(corpus, qs, true_top1s, bits, rerank)
+            metrics = _run_one_config_for_history(corpus, qs, true_top1s, bits, rerank, ann)
             for suffix, val in metrics.items():
                 ds_snap[f"{key}_{suffix}"] = val
         entry["results"][ds_label] = ds_snap
