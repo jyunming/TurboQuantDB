@@ -57,17 +57,16 @@ Three presets covering the main use cases — pick one and you're ready:
 ```python
 from tqdb import Database
 
-# High Quality — best recall, exact reranking
+# High Quality — maximum recall via exact brute-force + raw f16 reranking
 db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
-db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
-results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
-# ~100% Recall@10 at 100k×1536  |  401 MB disk  |  38ms p50 (brute-force)
+results = db.search(query, top_k=10, _use_ann=False)
+# ~100% Recall@10 at 100k×1536  |  401 MB disk  |  ~38ms p50
 
 # Balanced — recommended default (dequant reranking, zero extra disk)
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
 results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
-# ~99.4% Recall@5 at 100k×1536  |  117 MB disk  |  59ms rerank / 8ms no-rerank
+# ~99.4% Recall@5 at 100k×1536  |  117 MB disk  |  8ms (ANN) / 59ms (brute+dequant)
 
 # Fast ANN — lowest latency, good recall
 db = Database.open(path, dimension=DIM, bits=4, rerank=False)
@@ -140,7 +139,7 @@ db.create_index(max_degree=32, ef_construction=200, n_refinements=5,
                 search_list_size=128, alpha=1.2)
 
 # Metadata filter operators
-# $eq $ne $gt $gte $lt $lte $in $nin $exists $contains $and $or
+# $eq $ne $gt $gte $lt $lte $in $nin $exists $and $or
 db.search(query, top_k=5, filter={"year": {"$gte": 2023}})
 db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 2023}}]})
 ```
@@ -153,9 +152,8 @@ db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 20
 
 ```python
 db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
-db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
-results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
-# 100% Recall@10 at 100k×1536  |  38ms p50 (brute-force)  |  401 MB disk
+results = db.search(query, top_k=10, _use_ann=False)
+# 100% Recall@10 at 100k×1536  |  ~38ms p50 (brute-force)  |  401 MB disk
 ```
 
 ### Balanced — default recommendation
@@ -164,7 +162,7 @@ results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
 results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
-# 99.4% Recall@5, 96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms (ANN) / 45ms (brute+dequant)
+# 99.4% Recall@5, 96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms (ANN) / 59ms (brute+dequant)
 ```
 
 ### Minimum Disk — compress aggressively
@@ -430,8 +428,8 @@ See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/serv
 
 ## Performance Roadmap
 
-The current implementation already uses AVX2 SIMD for FWHT, the MSE centroid scan,
-and the QJL bit-unpack inner product.
+The current implementation uses SIMD-accelerated scoring (AVX2) for the brute-force search inner loop, the MSE centroid scan,
+and the QJL bit-unpack inner product. The FWHT transform (legacy SRHT path) also has an AVX2 fast path.
 
 **GPU acceleration** — batch ingest would benefit from cuBLAS GEMM (~3–5× for
 large batches on high-end cards). The ANN search path is memory-bound, not
