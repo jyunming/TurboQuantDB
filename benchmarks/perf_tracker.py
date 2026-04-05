@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 perf_tracker.py — Performance history visualization for TurboQuantDB.
 
@@ -64,10 +65,10 @@ def generate_html_plotly(history: list[dict], out_path: Path) -> None:
     try:
         import plotly.graph_objects as go  # noqa: PLC0415
         from plotly.subplots import make_subplots  # noqa: PLC0415
-    except ImportError:
-        print("  plotly not installed — falling back to matplotlib HTML", flush=True)
-        generate_html_matplotlib(history, out_path)
-        return
+    except ImportError as exc:
+        raise ImportError(
+            "plotly is required for HTML reports. Install it with: pip install plotly"
+        ) from exc
 
     n_metrics = len(TRACKED_METRICS)
     n_ds      = len(DATASETS)

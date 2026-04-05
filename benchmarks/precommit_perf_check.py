@@ -99,7 +99,7 @@ METRIC_KEYS = {key for key, *_ in METRIC_DEFS}
 # ---------------------------------------------------------------------------
 
 BENCH_DIR    = Path(__file__).parent
-HISTORY_PATH = BENCH_DIR / "perf_history.json"
+HISTORY_PATH = BENCH_DIR / "precommit_history.json"
 
 
 def _git_info() -> tuple[str, str]:
@@ -161,7 +161,7 @@ def _append_perf_history(measured: dict, config: dict) -> None:
             pt = importlib.util.module_from_spec(spec)   # type: ignore[arg-type]
             spec.loader.exec_module(pt)                  # type: ignore[union-attr]
             h = pt.load_history(HISTORY_PATH)
-            pt.generate_html_plotly(h, BENCH_DIR / "_perf_history.html")
+            pt.generate_html_plotly(h, BENCH_DIR / "_precommit_history.html")
         except Exception as exc:
             print(f"[pre-commit] warning: HTML not regenerated: {exc}", flush=True)
 
