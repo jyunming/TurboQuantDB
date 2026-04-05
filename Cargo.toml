@@ -33,8 +33,12 @@ mimalloc = { version = "0.1", default-features = false }
 pyo3 = { version = "0.21.0", features = ["extension-module"] }
 numpy = "0.21.0"
 
+object_store = { version = "0.11", features = ["aws"], optional = true }
+tokio = { version = "1", features = ["rt", "macros"], optional = true }
+futures = { version = "0.3", optional = true }
+
 [features]
-cloud = []
+cloud = ["object_store", "tokio", "futures"]
 
 [build-dependencies]
 pyo3-build-config = "0.21.0"
