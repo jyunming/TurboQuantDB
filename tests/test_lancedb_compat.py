@@ -217,3 +217,152 @@ class TestCountAndOptimize:
         db = connect(str(tmp_path))
         tbl = db.create_table("t", data=make_rows(3))
         tbl.optimize()  # should be a no-op without raising
+
+
+# ---------------------------------------------------------------------------
+# to_arrow / to_pandas — must return real records, not bare ID strings
+# ---------------------------------------------------------------------------
+
+class TestToArrow:
+    def test_to_arrow_returns_records(self, tmp_path):
+        db = connect(str(tmp_path))
+        tbl = db.create_table("t", data=make_rows(4))
+        arrow_tbl = tbl.to_arrow()
+        assert arrow_tbl.num_rows == 4
+        assert "id" in arrow_tbl.schema.names
+
+    def test_to_arrow_empty(self, tmp_path):
+        db = connect(str(tmp_path))
+        tbl = db.create_table("t")
+        arrow_tbl = tbl.to_arrow()
+        assert arrow_tbl.num_rows == 0
+
+    def test_to_pandas_returns_records(self, tmp_path):
+        pd = pytest.importorskip("pandas")
+        db = connect(str(tmp_path))
+        tbl = db.create_table("t", data=make_rows(3))
+        df = tbl.to_pandas()
+        assert len(df) == 3
+        assert "id" in df.columns
+
+
+# ---------------------------------------------------------------------------
+# count_rows with id-based filter
+# ---------------------------------------------------------------------------
+
+class TestCountRowsFilter:
+    def test_count_rows_id_in_filter(self, tmp_path):
+        db = connect(str(tmp_path))
+        tbl = db.create_table("t", data=make_rows(5))
+        assert tbl.count_rows("id IN ('id_0', 'id_1')") == 2
+
+    def test_count_rows_id_in_single(self, tmp_path):
+        db = connect(str(tmp_path))
+        tbl = db.create_table("t", data=make_rows(5))
+        assert tbl.count_rows("id IN ('id_0')") == 1
+
+
+# ---------------------------------------------------------------------------
+# SQL WHERE parser extensions
+# ---------------------------------------------------------------------------
+
+class TestSQLParser:
+    def test_field_in_non_id(self):
+        from tqdb.lancedb_compat import _parse_sql_where
+        result = _parse_sql_where("tag IN ('a', 'b')")
+        assert result == {"tag": {"$in": ["a", "b"]}}
+
+    def test_field_neq(self):
+        from tqdb.lancedb_compat import _parse_sql_where
+        result = _parse_sql_where("status != 'deleted'")
+        assert result == {"status": {"$ne": "deleted"}}
+
+    def test_field_eq_integer(self):
+        from tqdb.lancedb_compat import _parse_sql_where
+        result = _parse_sql_where("count = 42")
+        assert result == {"count": {"$eq": 42.0}}
+
+    def test_field_gt_numeric(self):
+        from tqdb.lancedb_compat import _parse_sql_where
+        result = _parse_sql_where("score > 0.5")
+        assert result == {"score": {"$gt": 0.5}}
+
+    def test_field_gte_numeric(self):
+        from tqdb.lancedb_compat import _parse_sql_where
+        result = _parse_sql_where("score >= 1.0")
+        assert result == {"score": {"$gte": 1.0}}
+
+    def test_field_lt_numeric(self):
+        from tqdb.lancedb_compat import _parse_sql_where
+        result = _parse_sql_where("rank < 10")
+        assert result == {"rank": {"$lt": 10.0}}
+
+    def test_field_lte_numeric(self):
+        from tqdb.lancedb_compat import _parse_sql_where
+        result = _parse_sql_where("rank <= 5")
+        assert result == {"rank": {"$lte": 5.0}}
+
+    def test_field_in_used_in_delete(self, tmp_path):
+        """field IN (...) for non-id field works end-to-end in delete()."""
+        rows = [
+            {"id": "a", "vector": rand_vecs(1)[0].tolist(), "tag": "del"},
+            {"id": "b", "vector": rand_vecs(1)[0].tolist(), "tag": "del"},
+            {"id": "c", "vector": rand_vecs(1)[0].tolist(), "tag": "keep"},
+        ]
+        db = connect(str(tmp_path))
+        tbl = db.create_table("t", data=rows)
+        tbl.delete("tag IN ('del')")
+        assert tbl.count_rows() == 1
+
+
+# ---------------------------------------------------------------------------
+# Metric override warning
+# ---------------------------------------------------------------------------
+
+class TestMetricWarn:
+    def test_metric_override_warns(self, tmp_path):
+        """search().metric('cosine') on an ip-table should emit a warning."""
+        import warnings
+        db = connect(str(tmp_path))
+        tbl = db.create_table("t", data=make_rows(5))  # default metric=ip
+        q = rand_vecs(1)[0].astype(np.float32)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            tbl.search(q).metric("cosine").limit(3).to_list()
+        assert any("cosine" in str(warning.message).lower() for warning in w), (
+            "Expected a warning about metric mismatch"
+        )
+
+    def test_same_metric_no_warn(self, tmp_path):
+        """No warning when the requested metric matches the table metric."""
+        import warnings
+        db = connect(str(tmp_path))
+        tbl = db.create_table("t", data=make_rows(5))  # metric=ip
+        q = rand_vecs(1)[0].astype(np.float32)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            tbl.search(q).metric("ip").limit(3).to_list()
+        metric_warns = [x for x in w if "metric" in str(x.message).lower()]
+        assert len(metric_warns) == 0
+
+
+# ---------------------------------------------------------------------------
+# Dim recovery from manifest.json when _lance_meta.json is absent
+# ---------------------------------------------------------------------------
+
+class TestDimRecovery:
+    def test_dim_from_manifest_fallback(self, tmp_path):
+        """open_table() still works after _lance_meta.json is deleted."""
+        import os
+        db = connect(str(tmp_path))
+        db.create_table("t", data=make_rows(3))
+
+        # Remove the shim sidecar — only tqdb's manifest.json remains
+        lance_meta = tmp_path / "t" / "_lance_meta.json"
+        if lance_meta.exists():
+            lance_meta.unlink()
+
+        tbl = db.open_table("t")
+        q = rand_vecs(1)[0].astype(np.float32)
+        results = tbl.search(q).limit(2).to_list()
+        assert len(results) == 2

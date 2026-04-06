@@ -93,6 +93,15 @@ def _apply_filter(records: List[Dict[str, Any]], where: Dict[str, Any]) -> List[
                     return False
                 elif op == "$nin" and val in rhs:
                     return False
+                elif op == "$exists":
+                    present = field in metadata
+                    if rhs and not present:
+                        return False
+                    if not rhs and present:
+                        return False
+                elif op == "$contains":
+                    if not (isinstance(val, str) and rhs in val):
+                        return False
             else:
                 # bare equality
                 if val != cond:
@@ -127,12 +136,13 @@ class CompatCollection:
         self._embedding_function = embedding_function
         self._db: Optional[Database] = None
         self._dim: Optional[int] = None
-        # Load dim from stats if the DB already exists
-        if os.path.exists(os.path.join(path, "manifest.json")):
+        # Load dim from manifest.json if the DB already exists
+        manifest = os.path.join(path, "manifest.json")
+        if os.path.exists(manifest):
             try:
-                db = self._open_db(None)
-                s = db.stats()
-                self._dim = s["dimension"]
+                import json as _json
+                with open(manifest) as _f:
+                    self._dim = _json.load(_f)["d"]
             except Exception:
                 pass
 
@@ -194,9 +204,16 @@ class CompatCollection:
         metadatas: Optional[List[Dict[str, Any]]] = None,
         documents: Optional[List[str]] = None,
     ) -> None:
-        embeddings = self._embed(documents or [""] * len(ids), embeddings)
+        if embeddings is None:
+            if documents is not None:
+                embeddings = self._embed(documents, None)
+            else:
+                raise ValueError(
+                    "No embedding_function set. Pass embeddings explicitly, or "
+                    "install tqdb[embed] and pass an embedding_function."
+                )
         dim = self._ensure_dim(embeddings)
-        vecs = np.asarray(embeddings, dtype=np.float64)
+        vecs = np.asarray(embeddings, dtype=np.float32)
         metas = [_sanitize_metadata(m) if m else {} for m in (metadatas or [{}] * len(ids))]
         db = self._open_db(dim)
         db.insert_batch(ids, vecs, metas, documents, "insert")
@@ -208,9 +225,16 @@ class CompatCollection:
         metadatas: Optional[List[Dict[str, Any]]] = None,
         documents: Optional[List[str]] = None,
     ) -> None:
-        embeddings = self._embed(documents or [""] * len(ids), embeddings)
+        if embeddings is None:
+            if documents is not None:
+                embeddings = self._embed(documents, None)
+            else:
+                raise ValueError(
+                    "No embedding_function set. Pass embeddings explicitly, or "
+                    "install tqdb[embed] and pass an embedding_function."
+                )
         dim = self._ensure_dim(embeddings)
-        vecs = np.asarray(embeddings, dtype=np.float64)
+        vecs = np.asarray(embeddings, dtype=np.float32)
         metas = [_sanitize_metadata(m) if m else {} for m in (metadatas or [{}] * len(ids))]
         db = self._open_db(dim)
         db.insert_batch(ids, vecs, metas, documents, "upsert")
@@ -223,15 +247,24 @@ class CompatCollection:
         documents: Optional[List[str]] = None,
     ) -> None:
         db = self._open_db(None)
+        emb_ids: List[str] = []
+        emb_vecs: List[List[float]] = []
+        emb_metas: List[Dict[str, Any]] = []
+        emb_docs: List[Optional[str]] = []
         for i, id_ in enumerate(ids):
             emb = embeddings[i] if embeddings else None
             meta = _sanitize_metadata(metadatas[i]) if metadatas else None
             doc = documents[i] if documents else None
             if emb is not None:
-                vec = np.asarray(emb, dtype=np.float64)
-                db.insert_batch([id_], vec.reshape(1, -1), [meta] if meta else None, [doc] if doc else None, "update")
+                emb_ids.append(id_)
+                emb_vecs.append(emb)
+                emb_metas.append(meta or {})
+                emb_docs.append(doc)
             else:
                 db.update_metadata(id_, meta, doc)
+        if emb_ids:
+            vecs = np.asarray(emb_vecs, dtype=np.float32)
+            db.insert_batch(emb_ids, vecs, emb_metas, emb_docs, "update")
 
     def delete(
         self,
@@ -242,11 +275,12 @@ class CompatCollection:
         if ids and not where:
             db.delete_batch(ids)
             return
-        # Filter path: find matching IDs then delete
+        # Filter path: use list_ids for efficient Rust-side filtering
         if where:
-            filter_ids = [r["id"] for r in self._list_all_records(db) if _apply_filter([r], where)]
+            filter_ids = db.list_ids(where_filter=where)
             if ids:
-                filter_ids = [fid for fid in filter_ids if fid in set(ids)]
+                id_set = set(ids)
+                filter_ids = [fid for fid in filter_ids if fid in id_set]
             if filter_ids:
                 db.delete_batch(filter_ids)
 
@@ -265,11 +299,13 @@ class CompatCollection:
 
         if ids:
             records = [r for r in db.get_many(ids) if r is not None]
+            if where:
+                records = _apply_filter(records, where)
+        elif where:
+            matched_ids = db.list_ids(where_filter=where)
+            records = [r for r in db.get_many(matched_ids) if r is not None]
         else:
             records = self._list_all_records(db)
-
-        if where:
-            records = _apply_filter(records, where)
 
         records = records[offset:]
         if limit is not None:
@@ -298,7 +334,7 @@ class CompatCollection:
 
         all_ids, all_distances, all_metas, all_docs = [], [], [], []
         for qvec in query_embeddings:
-            q = np.asarray(qvec, dtype=np.float64)
+            q = np.asarray(qvec, dtype=np.float32)
             results = db.search(q, n_results, filter=where)
             all_ids.append([r["id"] for r in results])
             all_distances.append([r["score"] for r in results])

@@ -268,3 +268,195 @@ class TestMutations:
         col = client.get_or_create_collection("col", embedding_function=embed_fn)
         col.add(ids=["a"], documents=["hello"])
         assert col.count() == 1
+
+
+# ---------------------------------------------------------------------------
+# dtype — vectors must be float32
+# ---------------------------------------------------------------------------
+
+class TestDtypes:
+    def test_add_uses_float32(self, tmp_path):
+        """The numpy array built inside add() must have dtype float32."""
+        import tqdb.chroma_compat as mod
+        from unittest.mock import patch
+
+        captured = {}
+        orig_asarray = mod.np.asarray
+
+        def spy(arr, dtype=None, **kw):
+            result = orig_asarray(arr, dtype=dtype, **kw)
+            if dtype is not None:
+                captured["dtype"] = result.dtype
+            return result
+
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        with patch.object(mod.np, "asarray", side_effect=spy):
+            col.add(ids=["a"], embeddings=rand_vecs(1))
+
+        assert captured.get("dtype") == np.float32, (
+            f"Expected float32, got {captured.get('dtype')}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# update — batching and metadata-only paths
+# ---------------------------------------------------------------------------
+
+class TestUpdate:
+    def test_update_batch_embeddings(self, tmp_path):
+        """Updating multiple items with new embeddings works in one call."""
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        col.add(
+            ids=["a", "b", "c"],
+            embeddings=rand_vecs(3),
+            metadatas=[{"v": 0}, {"v": 0}, {"v": 0}],
+        )
+        new_vecs = rand_vecs(3)
+        col.update(
+            ids=["a", "b", "c"],
+            embeddings=new_vecs,
+            metadatas=[{"v": 1}, {"v": 2}, {"v": 3}],
+        )
+        res = col.get(ids=["a", "b", "c"])
+        meta_by_id = {r["id"]: r["metadata"] for r in zip(
+            res["ids"], res["metadatas"]
+        ) for r in [{"id": res["ids"][i], "metadata": res["metadatas"][i]}
+                    for i in range(len(res["ids"]))]}
+        assert meta_by_id["a"]["v"] == 1
+        assert meta_by_id["b"]["v"] == 2
+        assert meta_by_id["c"]["v"] == 3
+
+    def test_update_metadata_only(self, tmp_path):
+        """Updating metadata without embeddings calls update_metadata, not insert_batch."""
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        col.add(ids=["a"], embeddings=rand_vecs(1), documents=["original"])
+        col.update(ids=["a"], metadatas=[{"updated": True}])
+        res = col.get(ids=["a"])
+        assert res["metadatas"][0].get("updated") is True
+        # document should remain unchanged (update_metadata preserves it if doc=None)
+        assert res["documents"][0] == "original"
+
+
+# ---------------------------------------------------------------------------
+# get / delete — list_ids fast path
+# ---------------------------------------------------------------------------
+
+class TestGetOptimized:
+    def test_get_where_returns_only_matching(self, tmp_path):
+        """get(where=...) without ids should return only records matching the filter."""
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        col.add(
+            ids=["x", "y", "z"],
+            embeddings=rand_vecs(3),
+            metadatas=[{"tag": "a"}, {"tag": "b"}, {"tag": "a"}],
+        )
+        res = col.get(where={"tag": {"$eq": "a"}})
+        assert sorted(res["ids"]) == ["x", "z"]
+        assert "y" not in res["ids"]
+
+    def test_get_where_with_ids_intersection(self, tmp_path):
+        """get(ids=..., where=...) should return the intersection."""
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        col.add(
+            ids=["a", "b", "c"],
+            embeddings=rand_vecs(3),
+            metadatas=[{"tag": "x"}, {"tag": "x"}, {"tag": "y"}],
+        )
+        res = col.get(ids=["a", "b"], where={"tag": {"$eq": "x"}})
+        assert sorted(res["ids"]) == ["a", "b"]
+
+
+class TestDeleteOptimized:
+    def test_delete_where_only_removes_matching(self, tmp_path):
+        """delete(where=...) removes exactly the records matching the filter."""
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        col.add(
+            ids=["a", "b", "c"],
+            embeddings=rand_vecs(3),
+            metadatas=[{"tag": "del"}, {"tag": "del"}, {"tag": "keep"}],
+        )
+        col.delete(where={"tag": {"$eq": "del"}})
+        assert col.count() == 1
+        res = col.get()
+        assert res["ids"] == ["c"]
+
+
+# ---------------------------------------------------------------------------
+# $exists and $contains filter operators
+# ---------------------------------------------------------------------------
+
+class TestFilters:
+    def test_filter_exists_true(self, tmp_path):
+        """`$exists: True` keeps only records where the field is present."""
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        col.add(
+            ids=["has", "missing"],
+            embeddings=rand_vecs(2),
+            metadatas=[{"rare": "yes"}, {}],
+        )
+        res = col.get(where={"rare": {"$exists": True}})
+        assert res["ids"] == ["has"]
+
+    def test_filter_exists_false(self, tmp_path):
+        """`$exists: False` keeps only records where the field is absent."""
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        col.add(
+            ids=["has", "missing"],
+            embeddings=rand_vecs(2),
+            metadatas=[{"rare": "yes"}, {}],
+        )
+        res = col.get(where={"rare": {"$exists": False}})
+        assert res["ids"] == ["missing"]
+
+    def test_filter_contains(self, tmp_path):
+        """`$contains` filters by substring match."""
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        col.add(
+            ids=["match", "no_match"],
+            embeddings=rand_vecs(2),
+            metadatas=[{"text": "hello world"}, {"text": "goodbye"}],
+        )
+        res = col.get(where={"text": {"$contains": "world"}})
+        assert res["ids"] == ["match"]
+
+
+# ---------------------------------------------------------------------------
+# Auto-embed: no documents + no embed_fn must raise, not embed empty strings
+# ---------------------------------------------------------------------------
+
+class TestAutoEmbed:
+    def test_add_no_docs_no_embeddings_raises(self, tmp_path):
+        """add() with no embeddings and no documents must raise ValueError."""
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        with pytest.raises(ValueError):
+            col.add(ids=["a"])
+
+    def test_add_docs_with_embed_fn_receives_real_docs(self, tmp_path):
+        """The embedding_function receives actual document strings, not empty strings."""
+        received = {}
+
+        def embed_fn(texts):
+            received["texts"] = list(texts)
+            return np.ones((len(texts), DIM), dtype=np.float32).tolist()
+
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col", embedding_function=embed_fn)
+        col.add(ids=["a"], documents=["real document"])
+        assert received["texts"] == ["real document"]
+
+    def test_upsert_no_docs_no_embeddings_raises(self, tmp_path):
+        """upsert() with no embeddings and no documents must raise ValueError."""
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        with pytest.raises(ValueError):
+            col.upsert(ids=["a"])

@@ -66,9 +66,23 @@ def _map_metric(m: str) -> str:
 _ID_IN_PATTERN = re.compile(
     r"""^\s*id\s+IN\s*\(([^)]+)\)\s*$""", re.IGNORECASE
 )
-_FIELD_EQ_PATTERN = re.compile(
+_FIELD_IN_PATTERN = re.compile(
+    r"""^\s*(\w+)\s+IN\s*\(([^)]+)\)\s*$""", re.IGNORECASE
+)
+_FIELD_EQ_STR_PATTERN = re.compile(
     r"""^\s*(\w+)\s*=\s*'([^']*)'\s*$"""
 )
+_FIELD_NEQ_STR_PATTERN = re.compile(
+    r"""^\s*(\w+)\s*!=\s*'([^']*)'\s*$"""
+)
+_FIELD_EQ_NUM_PATTERN = re.compile(
+    r"""^\s*(\w+)\s*=\s*(\d+(?:\.\d+)?)\s*$"""
+)
+_FIELD_CMP_PATTERN = re.compile(
+    r"""^\s*(\w+)\s*(>=|<=|>|<)\s*(\d+(?:\.\d+)?)\s*$"""
+)
+
+_CMP_OPS = {">=": "$gte", "<=": "$lte", ">": "$gt", "<": "$lt"}
 
 
 def _parse_sql_where(where: str) -> Dict[str, Any]:
@@ -77,7 +91,11 @@ def _parse_sql_where(where: str) -> Dict[str, Any]:
 
     Supported forms:
     - ``id IN ('a', 'b', 'c')``
+    - ``field IN ('a', 'b')``
     - ``field = 'value'``
+    - ``field != 'value'``
+    - ``field = 42``
+    - ``field > 5``, ``field >= 5``, ``field < 5``, ``field <= 5``
 
     Anything else raises ``NotImplementedError``.
     """
@@ -86,13 +104,33 @@ def _parse_sql_where(where: str) -> Dict[str, Any]:
         ids_raw = m.group(1)
         ids = [s.strip().strip("'\"") for s in ids_raw.split(",")]
         return {"id": {"$in": ids}}
-    m = _FIELD_EQ_PATTERN.match(where)
+    m = _FIELD_IN_PATTERN.match(where)
+    if m:
+        field = m.group(1)
+        vals_raw = m.group(2)
+        vals = [s.strip().strip("'\"") for s in vals_raw.split(",")]
+        return {field: {"$in": vals}}
+    m = _FIELD_EQ_STR_PATTERN.match(where)
     if m:
         field, value = m.group(1), m.group(2)
         return {field: {"$eq": value}}
+    m = _FIELD_NEQ_STR_PATTERN.match(where)
+    if m:
+        field, value = m.group(1), m.group(2)
+        return {field: {"$ne": value}}
+    m = _FIELD_EQ_NUM_PATTERN.match(where)
+    if m:
+        field = m.group(1)
+        num = float(m.group(2))
+        return {field: {"$eq": num}}
+    m = _FIELD_CMP_PATTERN.match(where)
+    if m:
+        field, op, num_str = m.group(1), m.group(2), m.group(3)
+        return {field: {_CMP_OPS[op]: float(num_str)}}
     raise NotImplementedError(
         f"Complex SQL WHERE clause not supported: '{where}'. "
-        "Only 'id IN (...)' and \"field = 'value'\" are handled."
+        "Supported: 'field IN (...)', \"field = 'value'\", \"field != 'value'\", "
+        "'field = 42', 'field > 5', etc."
     )
 
 
@@ -131,7 +169,7 @@ class CompatQuery:
 
     def __init__(self, table: "CompatTable", query: Any):
         self._table = table
-        self._query = np.asarray(query, dtype=np.float64).flatten()
+        self._query = np.asarray(query, dtype=np.float32).flatten()
         self._metric: Optional[str] = None   # mapped metric override
         self._k: int = 10
         self._where: Optional[str] = None
@@ -162,12 +200,31 @@ class CompatQuery:
 
     def to_list(self) -> List[Dict[str, Any]]:
         tqdb_filter: Optional[Dict[str, Any]] = None
+        id_allowset: Optional[set] = None
         if self._where:
-            tqdb_filter = _parse_sql_where(self._where)
+            parsed = _parse_sql_where(self._where)
+            # tqdb filter operates on metadata fields only, not the primary key.
+            # For id-based IN filters, post-filter results instead.
+            id_cond = parsed.get("id")
+            if id_cond and "$in" in id_cond:
+                id_allowset = set(id_cond["$in"])
+            else:
+                tqdb_filter = parsed
 
         # tqdb bakes metric into the DB at creation; per-query metric override is ignored.
+        if self._metric is not None and self._metric != self._table._metric:
+            import warnings
+            warnings.warn(
+                f"Metric override '{self._metric}' ignored; table was created with "
+                f"metric='{self._table._metric}'. Re-create the table to change metric.",
+                stacklevel=2,
+            )
         db = self._table._open_db()
-        results = db.search(self._query, self._k, filter=tqdb_filter)
+        # If id-filtering, over-fetch so post-filter can find enough results
+        fetch_k = len(db) if id_allowset else self._k
+        results = db.search(self._query, fetch_k, filter=tqdb_filter)
+        if id_allowset:
+            results = [r for r in results if r["id"] in id_allowset][: self._k]
 
         rows = []
         for r in results:
@@ -214,6 +271,13 @@ class CompatTable:
             with open(meta_path) as f:
                 info = json.load(f)
             self._dim = info.get("dim")
+        # Fallback: read from tqdb manifest.json when _lance_meta.json is absent
+        if self._dim is None:
+            manifest = os.path.join(path, "manifest.json")
+            if os.path.exists(manifest):
+                import json
+                with open(manifest) as f:
+                    self._dim = json.load(f).get("d")
 
     def _open_db(self) -> Database:
         if self._db is not None:
@@ -249,9 +313,9 @@ class CompatTable:
             return
         vectors = [r["vector"] for r in rows]
         if isinstance(vectors[0], (list, tuple)):
-            vecs = np.asarray(vectors, dtype=np.float64)
+            vecs = np.asarray(vectors, dtype=np.float32)
         else:
-            vecs = np.stack([np.asarray(v, dtype=np.float64) for v in vectors])
+            vecs = np.stack([np.asarray(v, dtype=np.float32) for v in vectors])
         dim = vecs.shape[1]
         if self._dim is None:
             self._dim = dim
@@ -299,8 +363,12 @@ class CompatTable:
             return 0
         db = self._open_db()
         if filter:
-            tqdb_filter = _parse_sql_where(filter)
-            return db.count(filter=tqdb_filter)
+            parsed = _parse_sql_where(filter)
+            id_cond = parsed.get("id")
+            if id_cond and "$in" in id_cond:
+                id_set = set(id_cond["$in"])
+                return sum(1 for id_ in db.list_all() if id_ in id_set)
+            return db.count(filter=parsed)
         return len(db)
 
     def optimize(self, cleanup_older_than=None, delete_unverified: bool = False) -> None:
@@ -321,16 +389,23 @@ class CompatTable:
 
     def to_arrow(self):
         import pyarrow as pa  # type: ignore
-        db = self._open_db()
-        rows = db.list_all()
-        if not rows:
+        if not os.path.exists(os.path.join(self._path, "manifest.json")):
             return pa.table({})
-        return pa.Table.from_pylist(rows)
+        db = self._open_db()
+        ids = db.list_all()
+        if not ids:
+            return pa.table({})
+        records = [r for r in db.get_many(ids) if r is not None]
+        return pa.Table.from_pylist(records)
 
     def to_pandas(self):
         import pandas as pd  # type: ignore
+        if not os.path.exists(os.path.join(self._path, "manifest.json")):
+            return pd.DataFrame()
         db = self._open_db()
-        return pd.DataFrame(db.list_all())
+        ids = db.list_all()
+        records = [r for r in db.get_many(ids) if r is not None]
+        return pd.DataFrame(records)
 
 
 # ---------------------------------------------------------------------------
