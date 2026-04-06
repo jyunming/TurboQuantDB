@@ -346,23 +346,20 @@ struct DeleteCollectionResponse {
     deleted: bool,
 }
 
+/// All job-enqueue endpoints are always asynchronous.  The `async` field was
+/// previously accepted but silently ignored; it is removed to avoid misleading
+/// callers into thinking synchronous execution is supported.
 #[derive(Deserialize)]
-struct CompactRequest {
-    r#async: Option<bool>,
-}
+struct CompactRequest {}
 #[derive(Deserialize)]
-struct IndexRequest {
-    r#async: Option<bool>,
-}
+struct IndexRequest {}
 #[derive(Deserialize)]
 struct SnapshotRequest {
-    r#async: Option<bool>,
     snapshot_name: Option<String>,
 }
 #[derive(Deserialize)]
 struct RestoreRequest {
     snapshot_name: String,
-    r#async: Option<bool>,
 }
 #[derive(Deserialize)]
 struct AddVectorsRequest {
@@ -1633,7 +1630,7 @@ async fn start_compact_job(
     State(state): State<AppState>,
     Path((tenant, database, collection)): Path<(String, String, String)>,
     Extension(ctx): Extension<RequestContext>,
-    Json(body): Json<CompactRequest>,
+    Json(_body): Json<CompactRequest>,
 ) -> Result<(StatusCode, Json<JobEnqueueResponse>), ApiError> {
     authorize(
         &ctx,
@@ -1650,7 +1647,6 @@ async fn start_compact_job(
         Some(&collection),
         ctx.request_id.clone(),
     )?;
-    let _ = body.r#async.unwrap_or(true);
     let (job_id, status) = enqueue_job(
         &state,
         JobType::Compact,
@@ -1670,7 +1666,7 @@ async fn start_index_job(
     State(state): State<AppState>,
     Path((tenant, database, collection)): Path<(String, String, String)>,
     Extension(ctx): Extension<RequestContext>,
-    Json(body): Json<IndexRequest>,
+    Json(_body): Json<IndexRequest>,
 ) -> Result<(StatusCode, Json<JobEnqueueResponse>), ApiError> {
     authorize(
         &ctx,
@@ -1687,7 +1683,6 @@ async fn start_index_job(
         Some(&collection),
         ctx.request_id.clone(),
     )?;
-    let _ = body.r#async.unwrap_or(true);
     let (job_id, status) = enqueue_job(
         &state,
         JobType::IndexBuild,
@@ -1731,7 +1726,6 @@ async fn start_snapshot_job(
         &collection,
         ctx.request_id.clone(),
     )?;
-    let _ = body.r#async.unwrap_or(true);
     let (job_id, status) = enqueue_job(
         &state,
         JobType::Snapshot,
@@ -1768,7 +1762,6 @@ async fn start_restore_job(
         Some(&collection),
         ctx.request_id.clone(),
     )?;
-    let _ = body.r#async.unwrap_or(true);
     let (job_id, status) = enqueue_job(
         &state,
         JobType::Restore,

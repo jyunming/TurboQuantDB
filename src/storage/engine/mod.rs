@@ -1054,7 +1054,7 @@ impl TurboQuantEngine {
                             let mse_score =
                                 quantizer.score_ip_encoded_lite(&mse_prep, to_i, &[], 0.0);
                             let hamming_bonus = if !from_q.is_empty() && !to_q.is_empty() {
-                                quantizer.hamming_score(from_q, to_q) - 0.5
+                                quantizer.hamming_proximity(from_q, to_q) - 0.5
                             } else {
                                 0.0
                             };
@@ -1124,7 +1124,7 @@ impl TurboQuantEngine {
                             let mse_score =
                                 quantizer.score_ip_encoded_lite(&mse_prep, to_i, &[], 0.0);
                             let hamming_bonus = if !from_q.is_empty() && !to_q.is_empty() {
-                                quantizer.hamming_score(from_q, to_q) - 0.5
+                                quantizer.hamming_proximity(from_q, to_q) - 0.5
                             } else {
                                 0.0
                             };

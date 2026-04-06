@@ -166,6 +166,14 @@ impl S3Provider {
             .with_bucket_name(bucket)
             .build()?;
         fs::create_dir_all(local_cache)?;
+        // Detect accidental use from inside an existing Tokio runtime.
+        // S3Provider is designed for synchronous callers (embedded engine or
+        // spawn_blocking); calling block_on() inside an async context panics.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err("S3Provider::new() called from within a Tokio runtime; \
+                 use spawn_blocking() to invoke S3 operations from async code"
+                .into());
+        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
