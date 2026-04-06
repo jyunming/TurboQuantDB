@@ -115,3 +115,4 @@ coverage.lcov
 .coverage
 
 /test_bench_tmp/
+benchmarks/rerank_mode_bench.py
