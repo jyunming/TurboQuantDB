@@ -116,6 +116,21 @@ impl ProdQuantizer {
         }
     }
 
+    /// Hamming similarity between two QJL bit codes: (matching bits) / (total bits).
+    /// Returns a value in [0, 1] where 1 = identical codes and 0.5 = random (expected
+    /// value for independent bits). Used as a proxy for inner-product proximity during
+    /// HNSW construction when raw vectors are unavailable (replaces the broken sq=0 path).
+    pub fn hamming_score(&self, from_qjl: &[u8], to_qjl: &[u8]) -> f64 {
+        let n_bytes = from_qjl.len().min(to_qjl.len());
+        if n_bytes == 0 {
+            return 0.5;
+        }
+        let matching_bits: u32 = (0..n_bytes)
+            .map(|i| (!(from_qjl[i] ^ to_qjl[i])).count_ones())
+            .sum();
+        matching_bits as f64 / (n_bytes as f64 * 8.0)
+    }
+
     /// Build a `PreparedIpQueryLite` directly from stored MSE codes without any SRHT.
     ///
     /// Each `y[i]` is set to `centroids[idx[i]]` — the quantized approximation of the

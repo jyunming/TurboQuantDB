@@ -959,7 +959,7 @@ impl TurboQuantEngine {
                 // For IP: prepare from-query via O(n) centroid lookup (no SRHT) when raw
                 // vectors are unavailable. When vraw is present, use exact rotation.
                 // In both cases, `to` candidates use pre-cached encoded data.
-                let prep = if has_vraw {
+                if has_vraw {
                     let rec = vraw_ref
                         .expect("invariant: has_vraw=true implies live_vraw is Some")
                         .get_slot(from_slot);
@@ -975,34 +975,71 @@ impl TurboQuantEngine {
                             out[i] = f32::from_le_bytes(bytes) as f64;
                         }
                     }
-                    quantizer.prepare_ip_query_lite(&out)
+                    let prep = quantizer.prepare_ip_query_lite(&out);
+                    candidates
+                        .iter()
+                        .map(|&to| {
+                            let to_idx = to as usize;
+                            let to_i = &all_mse[to_idx * qn..(to_idx + 1) * qn];
+                            let to_q = if cached_qjl_len > 0 {
+                                &all_qjl_flat
+                                    [to_idx * cached_qjl_len..(to_idx + 1) * cached_qjl_len]
+                            } else {
+                                &[]
+                            };
+                            let to_g = all_gamma[to_idx];
+                            let to_n = all_norm[to_idx];
+                            (
+                                to,
+                                quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64)
+                                    * to_n as f64,
+                            )
+                        })
+                        .collect()
                 } else {
-                    // O(n) centroid lookup from pre-cached MSE indices.
+                    // No raw vectors: use MSE centroid-lookup score blended with Hamming
+                    // similarity between from-QJL bits and to-QJL bits.
+                    //
+                    // Background: prepare_ip_query_from_codes sets sq=0 (the QJL
+                    // projection of the from-vector is unknown without raw data), making
+                    // score_ip_encoded_lite skip the QJL term. This MSE-only topology
+                    // mismatches the full-LUT scoring used at search time → poor recall.
+                    //
+                    // Fix: hamming_score(from_q, to_q) ∈ [0,1] approximates cos(from,to)
+                    // in QJL-sign space. Subtracting 0.5 centres it so it contributes
+                    // positively for near neighbours and negatively for far ones.
                     let from_i = &all_mse[from_idx * qn..(from_idx + 1) * qn];
-                    quantizer.prepare_ip_query_from_codes(from_i)
-                };
-                candidates
-                    .iter()
-                    .map(|&to| {
-                        let to_idx = to as usize;
-                        let to_i = &all_mse[to_idx * qn..(to_idx + 1) * qn];
-                        let to_q = if cached_qjl_len > 0 {
-                            &all_qjl_flat[to_idx * cached_qjl_len..(to_idx + 1) * cached_qjl_len]
-                        } else {
-                            &[]
-                        };
-                        let to_g = all_gamma[to_idx];
-                        let to_n = all_norm[to_idx];
-                        // Vectors stored unit-normalized; scale score to estimate <from, to>.
-                        (
-                            to,
-                            quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64)
-                                * to_n as f64,
-                        )
-                    })
-                    .collect()
+                    let from_q = if cached_qjl_len > 0 {
+                        &all_qjl_flat[from_idx * cached_qjl_len..(from_idx + 1) * cached_qjl_len]
+                    } else {
+                        &[]
+                    };
+                    let mse_prep = quantizer.prepare_ip_query_from_codes(from_i);
+                    candidates
+                        .iter()
+                        .map(|&to| {
+                            let to_idx = to as usize;
+                            let to_i = &all_mse[to_idx * qn..(to_idx + 1) * qn];
+                            let to_q = if cached_qjl_len > 0 {
+                                &all_qjl_flat
+                                    [to_idx * cached_qjl_len..(to_idx + 1) * cached_qjl_len]
+                            } else {
+                                &[]
+                            };
+                            let to_n = all_norm[to_idx];
+                            let mse_score =
+                                quantizer.score_ip_encoded_lite(&mse_prep, to_i, &[], 0.0);
+                            let hamming_bonus = if !from_q.is_empty() && !to_q.is_empty() {
+                                quantizer.hamming_score(from_q, to_q) - 0.5
+                            } else {
+                                0.0
+                            };
+                            (to, (mse_score + hamming_bonus) * to_n as f64)
+                        })
+                        .collect()
+                }
             } else if matches!(metric, DistanceMetric::Cosine) {
-                let (prep, from_norm) = if has_vraw {
+                if has_vraw {
                     let rec = vraw_ref
                         .expect("invariant: has_vraw=true implies live_vraw is Some")
                         .get_slot(from_slot);
@@ -1018,38 +1055,59 @@ impl TurboQuantEngine {
                             out[i] = f32::from_le_bytes(bytes) as f64;
                         }
                     }
-                    let norm = out.iter().map(|x| x * x).sum::<f64>().sqrt();
-                    (quantizer.prepare_ip_query_lite(&out), norm)
+                    let from_norm = out.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    let prep = quantizer.prepare_ip_query_lite(&out);
+                    candidates
+                        .iter()
+                        .map(|&to| {
+                            let to_idx = to as usize;
+                            let to_i = &all_mse[to_idx * qn..(to_idx + 1) * qn];
+                            let to_q = if cached_qjl_len > 0 {
+                                &all_qjl_flat
+                                    [to_idx * cached_qjl_len..(to_idx + 1) * cached_qjl_len]
+                            } else {
+                                &[]
+                            };
+                            let to_g = all_gamma[to_idx];
+                            // prep built from raw from_vec; ip ≈ <from_raw, unit_to>
+                            let ip =
+                                quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64);
+                            let score = if from_norm > 0.0 { ip / from_norm } else { 0.0 };
+                            (to, score)
+                        })
+                        .collect()
                 } else {
-                    // Use stored norm + centroid lookup from pre-cached data.
+                    // No raw vectors: same Hamming-blend fix as for IP above.
+                    // Vectors are stored unit-normalised, so cosine ≈ inner product.
                     let from_i = &all_mse[from_idx * qn..(from_idx + 1) * qn];
-                    let from_norm = all_norm[from_idx] as f64;
-                    (quantizer.prepare_ip_query_from_codes(from_i), from_norm)
-                };
-                candidates
-                    .iter()
-                    .map(|&to| {
-                        let to_idx = to as usize;
-                        let to_i = &all_mse[to_idx * qn..(to_idx + 1) * qn];
-                        let to_q = if cached_qjl_len > 0 {
-                            &all_qjl_flat[to_idx * cached_qjl_len..(to_idx + 1) * cached_qjl_len]
-                        } else {
-                            &[]
-                        };
-                        let to_g = all_gamma[to_idx];
-                        let ip = quantizer.score_ip_encoded_lite(&prep, to_i, to_q, to_g as f64);
-                        // With unit-normalized codes:
-                        //   has_vraw=true:  prep built from raw from_vec; ip ≈ <from_raw, unit_to>
-                        //                  cosine = ip / ||from||
-                        //   has_vraw=false: prep built from unit_from codes; ip ≈ cosine(from,to)
-                        let score = if has_vraw {
-                            if from_norm > 0.0 { ip / from_norm } else { 0.0 }
-                        } else {
-                            ip
-                        };
-                        (to, score)
-                    })
-                    .collect()
+                    let from_q = if cached_qjl_len > 0 {
+                        &all_qjl_flat[from_idx * cached_qjl_len..(from_idx + 1) * cached_qjl_len]
+                    } else {
+                        &[]
+                    };
+                    let mse_prep = quantizer.prepare_ip_query_from_codes(from_i);
+                    candidates
+                        .iter()
+                        .map(|&to| {
+                            let to_idx = to as usize;
+                            let to_i = &all_mse[to_idx * qn..(to_idx + 1) * qn];
+                            let to_q = if cached_qjl_len > 0 {
+                                &all_qjl_flat
+                                    [to_idx * cached_qjl_len..(to_idx + 1) * cached_qjl_len]
+                            } else {
+                                &[]
+                            };
+                            let mse_score =
+                                quantizer.score_ip_encoded_lite(&mse_prep, to_i, &[], 0.0);
+                            let hamming_bonus = if !from_q.is_empty() && !to_q.is_empty() {
+                                quantizer.hamming_score(from_q, to_q) - 0.5
+                            } else {
+                                0.0
+                            };
+                            (to, mse_score + hamming_bonus)
+                        })
+                        .collect()
+                }
             } else if !precomputed_l2.is_empty() {
                 // L2 without raw vecs: use pre-computed dequantized vectors (no per-call
                 // SRHT — each vector was dequantized exactly once in parallel above).
@@ -1437,108 +1495,193 @@ impl TurboQuantEngine {
         let quantizer = &self.quantizer;
         let metric = &self.metric;
 
-        // Parallel scoring: each 512-slot chunk reuses one CodeIndex scratch buffer.
+        // Scoring: sequential for small N (avoids Rayon thread park/unpark on Windows
+        // where scheduler granularity dominates the actual sub-millisecond work);
+        // parallel chunk-based for large N where the work outweighs the thread overhead.
+        const SEQ_THRESHOLD: usize = 20_000;
         const CHUNK: usize = 512;
-        let scored: Vec<(u32, f64)> = match metric {
-            DistanceMetric::Ip => {
-                let prep = quantizer.prepare_ip_query(query);
-                candidate_slots
-                    .par_chunks(CHUNK)
-                    .flat_map(|chunk| {
-                        let mut idx = vec![0u16; quantizer.n];
-                        let mut out = Vec::with_capacity(chunk.len());
-                        for &slot in chunk {
-                            let rec =
-                                &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
-                            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
-                            let gamma = f32::from_le_bytes(
-                                rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                                    .try_into()
-                                    .unwrap(),
-                            );
-                            let doc_norm = f32::from_le_bytes(
-                                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                                    .try_into()
-                                    .unwrap(),
-                            );
-                            // Vectors stored unit-normalized; scale back to recover <q, doc>.
-                            let score = quantizer.score_ip_encoded(
-                                &prep,
-                                &idx,
-                                &rec[mse_len..mse_len + qjl_len],
-                                gamma as f64,
-                            ) * doc_norm as f64;
-                            out.push((slot, score));
-                        }
-                        out
-                    })
-                    .collect()
+        let n_candidates = candidate_slots.len();
+        let scored: Vec<(u32, f64)> = if n_candidates <= SEQ_THRESHOLD {
+            // Sequential path: single idx buffer reused across all slots.
+            let mut out = Vec::with_capacity(n_candidates);
+            let mut idx = vec![0u16; quantizer.n];
+            match metric {
+                DistanceMetric::Ip => {
+                    let prep = quantizer.prepare_ip_query(query);
+                    for &slot in &candidate_slots {
+                        let rec =
+                            &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
+                        quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                        let gamma = f32::from_le_bytes(
+                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let doc_norm = f32::from_le_bytes(
+                            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let score = quantizer.score_ip_encoded(
+                            &prep,
+                            &idx,
+                            &rec[mse_len..mse_len + qjl_len],
+                            gamma as f64,
+                        ) * doc_norm as f64;
+                        out.push((slot, score));
+                    }
+                }
+                DistanceMetric::Cosine => {
+                    let prep = quantizer.prepare_ip_query(query);
+                    for &slot in &candidate_slots {
+                        let rec =
+                            &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
+                        quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                        let gamma = f32::from_le_bytes(
+                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let ip = quantizer.score_ip_encoded(
+                            &prep,
+                            &idx,
+                            &rec[mse_len..mse_len + qjl_len],
+                            gamma as f64,
+                        );
+                        let score = if q_norm > 0.0 { ip / q_norm } else { 0.0 };
+                        out.push((slot, score));
+                    }
+                }
+                _ => {
+                    for &slot in &candidate_slots {
+                        let rec =
+                            &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
+                        quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                        let gamma = f32::from_le_bytes(
+                            rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let doc_norm = f32::from_le_bytes(
+                            rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        let mut v = quantizer.dequantize(
+                            &idx,
+                            &rec[mse_len..mse_len + qjl_len],
+                            gamma as f64,
+                        );
+                        v.mapv_inplace(|x| x * doc_norm as f64);
+                        let score = score_vectors_with_metric(metric, query, &v);
+                        out.push((slot, score));
+                    }
+                }
             }
-            DistanceMetric::Cosine => {
-                let prep = quantizer.prepare_ip_query(query);
-                candidate_slots
-                    .par_chunks(CHUNK)
-                    .flat_map(|chunk| {
-                        let mut idx = vec![0u16; quantizer.n];
-                        let mut out = Vec::with_capacity(chunk.len());
-                        for &slot in chunk {
-                            let rec =
-                                &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
-                            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
-                            let gamma = f32::from_le_bytes(
-                                rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                                    .try_into()
-                                    .unwrap(),
-                            );
-                            // Vectors stored unit-normalized; ip estimates <query, unit_doc>.
-                            // cosine(query, doc) = <query, unit_doc> / ||query||
-                            let ip = quantizer.score_ip_encoded(
-                                &prep,
-                                &idx,
-                                &rec[mse_len..mse_len + qjl_len],
-                                gamma as f64,
-                            );
-                            let score = if q_norm > 0.0 { ip / q_norm } else { 0.0 };
-                            out.push((slot, score));
-                        }
-                        out
-                    })
-                    .collect()
-            }
-            _ => {
-                // L2 and any future metrics: dequantize then compute distance
-                candidate_slots
-                    .par_chunks(CHUNK)
-                    .flat_map(|chunk| {
-                        let mut idx = vec![0u16; quantizer.n];
-                        let mut out = Vec::with_capacity(chunk.len());
-                        for &slot in chunk {
-                            let rec =
-                                &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
-                            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
-                            let gamma = f32::from_le_bytes(
-                                rec[mse_len + qjl_len..mse_len + qjl_len + 4]
-                                    .try_into()
-                                    .unwrap(),
-                            );
-                            let doc_norm = f32::from_le_bytes(
-                                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
-                                    .try_into()
-                                    .unwrap(),
-                            );
-                            // Dequantize returns unit vector; scale back to original norm.
-                            let mut v = quantizer.dequantize(
-                                &idx,
-                                &rec[mse_len..mse_len + qjl_len],
-                                gamma as f64,
-                            );
-                            v.mapv_inplace(|x| x * doc_norm as f64);
-                            let score = score_vectors_with_metric(metric, query, &v);
-                            out.push((slot, score));
-                        }
-                        out
-                    })
-                    .collect()
+            out
+        } else {
+            // Parallel path: each 512-slot chunk reuses one CodeIndex scratch buffer.
+            match metric {
+                DistanceMetric::Ip => {
+                    let prep = quantizer.prepare_ip_query(query);
+                    candidate_slots
+                        .par_chunks(CHUNK)
+                        .flat_map(|chunk| {
+                            let mut idx = vec![0u16; quantizer.n];
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for &slot in chunk {
+                                let rec = &codes_bytes
+                                    [slot as usize * stride..(slot as usize + 1) * stride];
+                                quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                                let gamma = f32::from_le_bytes(
+                                    rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                let doc_norm = f32::from_le_bytes(
+                                    rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                // Vectors stored unit-normalized; scale back to recover <q, doc>.
+                                let score = quantizer.score_ip_encoded(
+                                    &prep,
+                                    &idx,
+                                    &rec[mse_len..mse_len + qjl_len],
+                                    gamma as f64,
+                                ) * doc_norm as f64;
+                                out.push((slot, score));
+                            }
+                            out
+                        })
+                        .collect()
+                }
+                DistanceMetric::Cosine => {
+                    let prep = quantizer.prepare_ip_query(query);
+                    candidate_slots
+                        .par_chunks(CHUNK)
+                        .flat_map(|chunk| {
+                            let mut idx = vec![0u16; quantizer.n];
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for &slot in chunk {
+                                let rec = &codes_bytes
+                                    [slot as usize * stride..(slot as usize + 1) * stride];
+                                quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                                let gamma = f32::from_le_bytes(
+                                    rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                // Vectors stored unit-normalized; ip estimates <query, unit_doc>.
+                                // cosine(query, doc) = <query, unit_doc> / ||query||
+                                let ip = quantizer.score_ip_encoded(
+                                    &prep,
+                                    &idx,
+                                    &rec[mse_len..mse_len + qjl_len],
+                                    gamma as f64,
+                                );
+                                let score = if q_norm > 0.0 { ip / q_norm } else { 0.0 };
+                                out.push((slot, score));
+                            }
+                            out
+                        })
+                        .collect()
+                }
+                _ => {
+                    // L2 and any future metrics: dequantize then compute distance
+                    candidate_slots
+                        .par_chunks(CHUNK)
+                        .flat_map(|chunk| {
+                            let mut idx = vec![0u16; quantizer.n];
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for &slot in chunk {
+                                let rec = &codes_bytes
+                                    [slot as usize * stride..(slot as usize + 1) * stride];
+                                quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx);
+                                let gamma = f32::from_le_bytes(
+                                    rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                let doc_norm = f32::from_le_bytes(
+                                    rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                // Dequantize returns unit vector; scale back to original norm.
+                                let mut v = quantizer.dequantize(
+                                    &idx,
+                                    &rec[mse_len..mse_len + qjl_len],
+                                    gamma as f64,
+                                );
+                                v.mapv_inplace(|x| x * doc_norm as f64);
+                                let score = score_vectors_with_metric(metric, query, &v);
+                                out.push((slot, score));
+                            }
+                            out
+                        })
+                        .collect()
+                }
             }
         };
 

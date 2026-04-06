@@ -614,6 +614,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exit 0 even on regression (records override; use for intentional tradeoffs)",
     )
+    p.add_argument(
+        "--track",
+        action="store_true",
+        help="Run full paper benchmark (N=100k, ~20 min) and append to perf_history.json. "
+             "Use before merging to main. Also enabled by TQDB_TRACK=1.",
+    )
     return p.parse_args()
 
 
@@ -669,9 +675,16 @@ def main() -> None:
         save_doc(baseline_path, doc)
         print(f"[pre-commit] ↑ baseline raised → stage: git add {baseline_path}")
 
+    # History tracking (paper benchmark, N=100k, ~20 min) is opt-in.
+    # Set TQDB_TRACK=1 or pass --track to run it.  Never runs automatically
+    # in the pre-commit hook — call manually before merging to main:
+    #   TQDB_TRACK=1 python benchmarks/precommit_perf_check.py
+    track = getattr(args, "track", False) or os.environ.get("TQDB_TRACK", "").strip() not in ("", "0")
+
     if not failures:
         print("[pre-commit] ✓ all metrics within 5% of best")
-        _append_perf_history()
+        if track:
+            _append_perf_history()
         return
 
     print("\n[pre-commit] FAIL — regression(s) detected:")
@@ -683,7 +696,8 @@ def main() -> None:
             "\n[pre-commit] ⚠ override active (--force / TQDB_PERF_SKIP=1) — "
             "proceeding despite regression"
         )
-        _append_perf_history()
+        if track:
+            _append_perf_history()
         return
 
     print(

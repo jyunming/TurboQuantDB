@@ -101,6 +101,7 @@ convert_pdf.py
 /benchmarks/_private_report.md
 /benchmarks/_private_plots.png
 /benchmarks/_perf_history.html
+!/benchmarks/_perf_history.html
 /benchmarks/_ingest_speedup_plots.png
 /benchmarks/_ivf_prefilter_plots.png
 !/benchmarks/perf_history.json

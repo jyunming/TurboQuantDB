@@ -20,7 +20,7 @@
     },
     "recall_1_at_4": {
       "higher_is_better": true,
-      "best": 0.97
+      "best": 0.95
     },
     "recall_1_at_8": {
       "higher_is_better": true,
@@ -28,23 +28,23 @@
     },
     "avg_latency_ms": {
       "higher_is_better": false,
-      "best": 1.197523997107055
+      "best": 1.2306250038091093
     },
     "p50_latency_ms": {
       "higher_is_better": false,
-      "best": 1.1921999976038933
+      "best": 1.236499985679984
     },
     "p95_latency_ms": {
       "higher_is_better": false,
-      "best": 1.259699986258056
+      "best": 1.2913949962239712
     },
     "disk_bytes": {
       "higher_is_better": false,
-      "best": 2420318.0
+      "best": 2460348.0
     },
     "compression_ratio": {
       "higher_is_better": true,
-      "best": 3.305350784483692
+      "best": 3.2515725417705137
     },
     "ram_estimate_bytes": {
       "higher_is_better": false,

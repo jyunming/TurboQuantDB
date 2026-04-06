@@ -34,6 +34,7 @@ Issues = "https://github.com/jyunming/TurboQuantDB/issues"
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
+include = ["python/tqdb/*.pyi"]
 
 [tool.pytest.ini_options]
 tmp_path_retention_policy = "failed"
