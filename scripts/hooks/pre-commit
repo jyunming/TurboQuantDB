@@ -16,6 +16,19 @@ pass() { echo -e "${GREEN}[pre-commit] $*${NC}"; }
 warn() { echo -e "${YELLOW}[pre-commit] $*${NC}"; }
 fail() { echo -e "${RED}[pre-commit] FAIL — $*${NC}"; exit 1; }
 
+# ── 0. Skip all checks for documentation-only commits ─────────────────────────
+# A commit is doc-only when every staged file matches one of these patterns:
+#   *.md, *.txt, docs/*, website/*, .github/ISSUE_TEMPLATE/*, PULL_REQUEST_TEMPLATE.md
+STAGED=$(git diff --cached --name-only)
+NON_DOC=$(echo "$STAGED" | grep -Ev \
+    '^(docs/|website/|\.github/ISSUE_TEMPLATE/|\.github/PULL_REQUEST_TEMPLATE\.md|CHANGELOG\.md|README\.md|CODE_OF_CONDUCT\.md|CONTRIBUTING\.md|.*\.txt$|.*\.md$)' \
+    || true)
+
+if [ -z "$NON_DOC" ] && [ -n "$STAGED" ]; then
+    pass "doc-only commit — skipping Rust checks"
+    exit 0
+fi
+
 # ── 1. Formatting ──────────────────────────────────────────────────────────────
 echo -n "[pre-commit] cargo fmt check ... "
 if ! cargo fmt --all -- --check 2>/dev/null; then
