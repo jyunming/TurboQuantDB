@@ -20,7 +20,7 @@ class Database:
     @staticmethod
     def open(
         path: str,
-        dimension: int,
+        dimension: int | None = None,
         bits: int = 4,
         seed: int = 42,
         metric: str = "ip",
@@ -35,7 +35,10 @@ class Database:
 
         Args:
             path: Directory for database files; created if absent.
-            dimension: Vector dimension; must stay the same on every reopen.
+            dimension: Vector dimension. Required when creating a new database.
+                Omit (or pass ``None``) to reopen an existing database — the
+                dimension and other fixed parameters are read from the stored
+                ``manifest.json`` automatically.
             bits: Quantization bits per coordinate (any int >= 2).
                 ``2`` = highest compression (16×); ``4`` = better recall (default);
                 ``8`` = near-lossless.
@@ -154,8 +157,20 @@ class Database:
         """
         ...
 
-    def delete_batch(self, ids: list[str]) -> int:
+    def delete_batch(
+        self,
+        ids: list[str] = [],
+        where_filter: dict | None = None,
+    ) -> int:
         """Delete multiple vectors.
+
+        Args:
+            ids: Explicit list of IDs to delete. Silently skips missing IDs.
+                May be empty when *where_filter* is provided.
+            where_filter: Optional metadata filter (same syntax as
+                :meth:`search`). All matching vectors are deleted in addition
+                to any IDs listed explicitly. Overlapping entries are not
+                double-counted.
 
         Returns:
             Number of IDs that were found and deleted.

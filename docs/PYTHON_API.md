@@ -21,7 +21,9 @@ from tqdb import Database
 
 db = Database.open(
     path,                    # str — base directory path, created if it doesn't exist
-    dimension,               # int — vector dimension, must match on every reopen
+    dimension=None,          # int|None — vector dimension. Required for new databases.
+                             #            Omit to reopen an existing database — the
+                             #            dimension and fixed params are loaded from manifest.json.
     bits=4,                  # int — quantization bits (any int >= 2; 2 = highest compression,
                              #        4 = better recall (default), 8 = near-lossless)
     seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
@@ -37,9 +39,12 @@ db = Database.open(
                              #        write time; makes inner-product scoring equivalent to
                              #        cosine similarity without changing the metric parameter
 )
+
+# Parameterless reopen — reads all parameters from manifest.json:
+db = Database.open("./mydb")
 ```
 
-`path` must use the same `dimension`, `bits`, `seed`, and `metric` every time it is opened — these are baked into the quantizer and cannot be changed after creation.
+When reopening an existing database, `dimension` may be omitted; `bits`, `seed`, and `metric` are loaded from the stored `manifest.json` automatically.  `dimension` is required only when creating a new database (no manifest present).
 
 Pass an `s3://bucket/prefix` URI (requires the `cloud` Cargo feature) to store segments in Amazon S3 with a local write-through cache (see [On-disk Layout](#on-disk-layout)).
 
@@ -125,7 +130,13 @@ db.update(id, vector, metadata=None, document=None)  # raises RuntimeError if id
 
 ```python
 db.delete(id)                    # bool — True if id existed
-db.delete_batch(ids)             # → int — count of ids that were deleted
+db.delete_batch(                 # → int — count of ids that were deleted
+    ids=[],                      # list[str] — explicit IDs to delete (may be empty)
+    where_filter=None,           # dict | None — delete all vectors matching this filter
+)                                #   Examples:
+                                 #     db.delete_batch(["id1", "id2"])
+                                 #     db.delete_batch(where_filter={"year": {"$lt": 2020}})
+                                 #     db.delete_batch(["id1"], where_filter={"tag": "old"})
 
 db.get(id)                       # dict | None — {id, metadata, document}
 db.get_many(ids)                 # list[dict | None]
@@ -366,7 +377,7 @@ print(col.peek(limit=3))    # dict same shape as query result
 
 **Not implemented:** `HttpClient`, `Settings`, server/cloud mode, `chromadb.Client()` (ephemeral), `where_document` filtering, automatic text embedding (pass pre-computed `embeddings`; or provide an `embedding_function` callable at collection creation time).
 
-**Where-filter operators supported:** `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$and`, `$or`.
+**Where-filter operators supported:** `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$and`, `$or`, `$exists`, `$contains`.
 
 ---
 

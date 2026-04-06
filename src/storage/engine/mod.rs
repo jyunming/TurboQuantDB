@@ -120,7 +120,7 @@ impl Manifest {
         Ok(())
     }
 
-    fn load<P: AsRef<std::path::Path>>(
+    pub fn load<P: AsRef<std::path::Path>>(
         path: P,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let json = std::fs::read_to_string(path)?;
@@ -844,6 +844,30 @@ impl TurboQuantEngine {
             }
         }
         Ok(deleted)
+    }
+
+    /// Delete all vectors whose metadata matches `filter`.
+    ///
+    /// Atomically collects matching IDs (under the same write lock held by the
+    /// caller) and then delegates to [`delete_batch`].  Returns the count of
+    /// deleted vectors.
+    pub fn delete_where(
+        &mut self,
+        filter: &HashMap<String, JsonValue>,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let active = self.id_pool.iter_active();
+        let slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
+        let meta_map = self.metadata.get_many(&slots)?;
+        let ids_to_delete: Vec<String> = active
+            .into_iter()
+            .filter(|(_, slot)| {
+                meta_map
+                    .get(slot)
+                    .is_some_and(|m| metadata_matches_filter(&m.properties, filter))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        self.delete_batch(ids_to_delete)
     }
 
     pub fn create_index_with_params(

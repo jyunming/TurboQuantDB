@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::storage::engine::{
-    BatchWriteItem, BatchWriteMode, DistanceMetric, GetResult, RerankPrecision, TurboQuantEngine,
+    BatchWriteItem, BatchWriteMode, DistanceMetric, GetResult, Manifest, RerankPrecision,
+    TurboQuantEngine,
 };
 
 /// Thread-safe handle to a TurboQuantDB database.
@@ -57,13 +58,15 @@ impl Database {
     /// Example::
     ///
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="cosine")
+    ///     # Re-open an existing database without specifying parameters:
+    ///     db = Database.open("mydb")
     ///     # Equivalent cosine-via-IP with auto-normalization:
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="ip", normalize=True)
     #[staticmethod]
-    #[pyo3(signature = (path, dimension, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false))]
+    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=true, fast_mode=false, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false))]
     fn open(
         path: String,
-        dimension: usize,
+        dimension: Option<usize>,
         bits: usize,
         seed: u64,
         metric: &str,
@@ -84,14 +87,34 @@ impl Database {
         std::fs::create_dir_all(&engine_path)
             .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
 
-        let dist_metric = match metric.to_lowercase().as_str() {
+        // If dimension is not provided, load it (and other fixed params) from
+        // the existing manifest.  This allows callers to reopen a database
+        // with just its path: `Database.open("./mydb")`.
+        let manifest_path = format!("{}/manifest.json", engine_path);
+        let (dimension, bits, seed, metric_str) = if let Some(d) = dimension {
+            (d, bits, seed, metric.to_string())
+        } else if std::path::Path::new(&manifest_path).exists() {
+            let m = Manifest::load(&manifest_path).map_err(to_py_runtime)?;
+            let m_metric = match m.metric {
+                DistanceMetric::Ip => "ip",
+                DistanceMetric::Cosine => "cosine",
+                DistanceMetric::L2 => "l2",
+            };
+            (m.d, m.b, m.seed, m_metric.to_string())
+        } else {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "dimension is required when opening a new database",
+            ));
+        };
+
+        let dist_metric = match metric_str.to_lowercase().as_str() {
             "ip" => DistanceMetric::Ip,
             "cosine" => DistanceMetric::Cosine,
             "l2" => DistanceMetric::L2,
             _ => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Invalid metric: {}",
-                    metric
+                    metric_str
                 )));
             }
         };
@@ -294,6 +317,11 @@ impl Database {
     ///
     /// Args:
     ///     ids: List of IDs to delete. IDs not present are silently skipped.
+    ///         May be empty when ``where_filter`` is provided.
+    ///     where_filter: Optional metadata filter (same syntax as :meth:`search`).
+    ///         When provided, all vectors matching the filter are deleted in
+    ///         addition to any explicitly listed IDs.  Overlapping entries are
+    ///         not double-counted.
     ///
     /// Returns:
     ///     The number of vectors that were found and deleted.
@@ -301,10 +329,28 @@ impl Database {
     /// Example::
     ///
     ///     deleted = db.delete_batch(["id1", "id2", "id3"])
-    fn delete_batch(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<usize> {
+    ///     # Delete all vectors older than 2020:
+    ///     deleted = db.delete_batch(where_filter={"year": {"$lt": 2020}})
+    #[pyo3(signature = (ids=vec![], where_filter=None))]
+    fn delete_batch(
+        &self,
+        py: Python<'_>,
+        ids: Vec<String>,
+        where_filter: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<usize> {
+        let has_filter = where_filter.is_some();
+        let parsed_filter = parse_pydict(where_filter)?;
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
-            engine.delete_batch(ids).map_err(to_py_runtime)
+            let mut deleted = if !ids.is_empty() {
+                engine.delete_batch(ids).map_err(to_py_runtime)?
+            } else {
+                0
+            };
+            if has_filter {
+                deleted += engine.delete_where(&parsed_filter).map_err(to_py_runtime)?;
+            }
+            Ok(deleted)
         })
     }
 
