@@ -2474,17 +2474,34 @@ impl TurboQuantEngine {
             // Normalize each vector to unit sphere before quantization so the
             // Lloyd-Max codebook (fitted to Beta-distribution unit-sphere coords) is valid.
             // Compute (unit_vec, norm) once to avoid a second O(d) pass per vector.
-            let unit_vecs_and_norms: Vec<(Vec<f32>, f32)> = chunk
-                .iter()
-                .map(|item| {
-                    let n = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    if n > 1e-10 {
-                        (item.vector.iter().map(|&x| x / n).collect(), n)
-                    } else {
-                        (item.vector.clone(), n)
-                    }
-                })
-                .collect();
+            // Use Rayon for large chunks; sequential for small ones to avoid
+            // thread park/unpark overhead (same threshold as quantize_batch).
+            const NORM_PAR_THRESHOLD: usize = 512;
+            let unit_vecs_and_norms: Vec<(Vec<f32>, f32)> = if chunk.len() > NORM_PAR_THRESHOLD {
+                chunk
+                    .par_iter()
+                    .map(|item| {
+                        let n = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        if n > 1e-10 {
+                            (item.vector.iter().map(|&x| x / n).collect(), n)
+                        } else {
+                            (item.vector.clone(), n)
+                        }
+                    })
+                    .collect()
+            } else {
+                chunk
+                    .iter()
+                    .map(|item| {
+                        let n = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        if n > 1e-10 {
+                            (item.vector.iter().map(|&x| x / n).collect(), n)
+                        } else {
+                            (item.vector.clone(), n)
+                        }
+                    })
+                    .collect()
+            };
             let vec_refs: Vec<&[f32]> = unit_vecs_and_norms
                 .iter()
                 .map(|(v, _)| v.as_slice())
