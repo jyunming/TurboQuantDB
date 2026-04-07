@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import subprocess
@@ -129,6 +130,9 @@ def run_config(
             t_idx = time.perf_counter()
             db.create_index(max_degree=32, search_list_size=128, alpha=1.2)
             index_s = round(time.perf_counter() - t_idx, 3)
+            # Re-measure disk after index build so graph.bin + graph_ids.json are included.
+            # No close needed — files are fully flushed once create_index() returns.
+            dm = disk_size_mb(tmp)
 
         # ── Query phase ───────────────────────────────────────────────────────
         # Warmup: page the mmap into OS cache before timing (avoids cold-cache
@@ -331,11 +335,15 @@ def _make_dataset_tables(ds_label: str, ds_results: list[dict]) -> str:
 
 
 def make_readme_section(all_results: dict[str, list[dict]]) -> str:
-    _img = (
+    _img_recall = (
         "![Benchmark recall curves — TQDB vs paper]"
         "(https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots.png)"
     )
-    parts: list[str] = [_img, ""]
+    _img_perf = (
+        "![Config trade-off overview — latency, disk, RAM, CPU]"
+        "(https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots_perf.png)"
+    )
+    parts: list[str] = [_img_recall, "", _img_perf, ""]
     for ds_label, ds_results in all_results.items():
         parts.append(_make_dataset_tables(ds_label, ds_results))
         parts.append("")
@@ -400,12 +408,15 @@ _PAPER_STYLES: list[tuple[int, str, str, str]] = [
 ]
 
 _METRIC_ROWS: list[tuple[str, str]] = [
-    ("throughput_vps", "Throughput (vps)"),
-    ("p50_ms",         "p50 latency (ms)"),
-    ("disk_mb",        "Disk (MB)"),
-    ("ram_delta_mb",   "ΔRSS (MB)"),
-    ("mrr",            "MRR"),
-    ("cpu_query_pct",  "CPU @ query (%)"),
+    ("throughput_vps",      "Ingest (vps)"),
+    ("p50_ms",              "Query p50 (ms)"),
+    ("p99_ms",              "Query p99 (ms)"),
+    ("disk_mb",             "Disk (MB)"),
+    ("ram_ingest_peak_mb",  "RAM @ ingest peak (MB)"),
+    ("ram_query_peak_mb",   "RAM @ query peak (MB)"),
+    ("cpu_ingest_pct",      "CPU @ ingest (%)"),
+    ("cpu_query_pct",       "CPU @ query (%)"),
+    ("mrr",                 "MRR"),
 ]
 
 # ds_label → short x-axis label
@@ -417,47 +428,50 @@ _DS_SHORT = {
 
 
 def generate_plots(all_results: dict[str, list[dict]], out_path: Path) -> None:
-    """Generate public benchmark plots and save to *out_path*."""
+    """Generate two benchmark plots: paper comparison and performance panel."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import matplotlib.lines as mlines
     except ImportError:
         print("  matplotlib not available — skipping plot generation", flush=True)
         return
 
-    datasets = list(all_results.keys())
-    n_ds   = len(datasets)
-    n_cols = max(n_ds, 3)
-
-    # Recall row  +  ceil(metrics / n_cols) metric rows
-    n_metric_rows = (len(_METRIC_ROWS) + n_cols - 1) // n_cols
-    n_rows = 1 + n_metric_rows
-
-    fig, axes = plt.subplots(n_rows, n_cols,
-                             figsize=(5.5 * n_cols, 4.2 * n_rows + 1.4))
-    fig.suptitle("TurboQuantDB vs Paper — arXiv:2504.19874",
-                 fontsize=14, fontweight="bold", y=1.01)
-
-    if n_rows == 1:
-        axes = [axes]
-    if n_cols == 1:
-        axes = [[ax] for ax in axes]
-
-    # Build lookup: internal_label → (display, color, ls, lw, alpha, marker)
     style_map = {s[0]: s[1:] for s in _PLOT_STYLES}
+    datasets = list(all_results.keys())
+    n_ds = len(datasets)
 
-    # ── Row 0: Recall@1@k curves per dataset ─────────────────────────────────
-    legend_handles: list = []   # collect once from first subplot
+    # ── Plot 1: Paper comparison (brute-force only vs paper reference) ────────
+    _generate_paper_comparison_plot(all_results, datasets, n_ds, style_map, plt, out_path)
+
+    # ── Plot 2: Performance panel (all configs, all metrics) ──────────────────
+    perf_path = out_path.parent / (out_path.stem + "_perf.png")
+    _generate_perf_panel_plot(all_results, datasets, n_ds, style_map, plt, perf_path)
+
+
+def _generate_paper_comparison_plot(
+    all_results: dict, datasets: list, n_ds: int, style_map: dict, plt, out_path: Path
+) -> None:
+    """Recall@1@k curves for brute configs vs paper reference. One subplot per dataset,
+    y-axis auto-scaled per subplot so differences are visible."""
+    fig, axes = plt.subplots(1, n_ds, figsize=(5.5 * n_ds, 4.5))
+    if n_ds == 1:
+        axes = [axes]
+    fig.suptitle("TurboQuantDB Recall vs arXiv:2504.19874",
+                 fontsize=13, fontweight="bold")
+
+    legend_handles: list = []
     legend_labels:  list = []
 
     for col, ds_label in enumerate(datasets):
-        ax = axes[0][col]
+        ax = axes[col]
         ds_results = all_results[ds_label]
-        first_col  = (col == 0)
+        first_col = (col == 0)
 
+        # Brute-force TQDB lines only
         for r in ds_results:
+            if r["ann"]:
+                continue
             lbl = r["label"]
             sty = style_map.get(lbl)
             if sty is None:
@@ -465,12 +479,12 @@ def generate_plots(all_results: dict[str, list[dict]], out_path: Path) -> None:
             display, color, ls, lw, alpha, marker = sty
             ys = [r["recall"][str(k)] for k in K_VALUES]
             line, = ax.plot(K_VALUES, ys, color=color, linestyle=ls,
-                            linewidth=lw, alpha=alpha,
-                            marker=marker, markersize=5)
+                            linewidth=lw, alpha=alpha, marker=marker, markersize=5)
             if first_col:
                 legend_handles.append(line)
                 legend_labels.append(display)
 
+        # Paper reference lines
         paper = PAPER_RECALL.get(ds_label, {})
         for bits, display, color, ls in _PAPER_STYLES:
             if bits in paper:
@@ -484,74 +498,69 @@ def generate_plots(all_results: dict[str, list[dict]], out_path: Path) -> None:
         ax.set_xscale("log", base=2)
         ax.set_xticks(K_VALUES)
         ax.set_xticklabels([str(k) for k in K_VALUES], fontsize=9)
-        ax.set_ylim(0, 1.05)
         ax.set_xlabel("top-k", fontsize=10)
         ax.set_ylabel("Recall@1@k", fontsize=10)
-        ds_title = _DS_SHORT.get(ds_label, ds_label)
-        ax.set_title(ds_title.replace("\n", "  "), fontsize=11, fontweight="bold")
+        ax.set_title(_DS_SHORT.get(ds_label, ds_label).replace("\n", "  "),
+                     fontsize=11, fontweight="bold")
         ax.grid(True, alpha=0.3)
         ax.tick_params(labelsize=9)
+        # Auto y-axis per subplot — shows differences clearly
+        ax.margins(y=0.05)
 
-    # hide unused recall columns
-    for col in range(n_ds, n_cols):
-        axes[0][col].set_visible(False)
-
-    # Shared legend below recall row, above metric rows
     fig.legend(legend_handles, legend_labels,
-               loc="upper center",
-               bbox_to_anchor=(0.5, 0.995 - (1 / (n_rows + 0.5))),
-               ncol=min(len(legend_handles), 5),
+               loc="lower center", bbox_to_anchor=(0.5, -0.02),
+               ncol=min(len(legend_handles), 6),
                fontsize=9, framealpha=0.9,
                title="Configuration", title_fontsize=9)
+    plt.tight_layout(rect=[0, 0.08, 1, 0.96])
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Paper comparison plot saved to {out_path}", flush=True)
 
-    # ── Rows 1+: Metric vs dataset (x = dimension / dataset) ─────────────────
+
+def _generate_perf_panel_plot(
+    all_results: dict, datasets: list, n_ds: int, style_map: dict, plt, out_path: Path
+) -> None:
+    """Performance panel: one row per metric, one column per dataset.
+    Includes all 8 configs (brute + ANN). Y-axis auto-scaled per subplot."""
+    n_metrics = len(_METRIC_ROWS)
+    fig, axes = plt.subplots(n_metrics, n_ds,
+                             figsize=(5.0 * n_ds, 3.2 * n_metrics),
+                             squeeze=False)
+    fig.suptitle("TurboQuantDB — Config Trade-off Overview",
+                 fontsize=13, fontweight="bold")
+
     ds_x = list(range(n_ds))
     ds_labels_short = [_DS_SHORT.get(d, d).replace("\n", "\n") for d in datasets]
 
-    for ax_idx, (metric_key, metric_label) in enumerate(_METRIC_ROWS):
-        row = 1 + ax_idx // n_cols
-        col = ax_idx % n_cols
-        ax  = axes[row][col]
+    for row, (metric_key, metric_label) in enumerate(_METRIC_ROWS):
+        for col, ds_label in enumerate(datasets):
+            ax = axes[row][col]
 
-        for r_cfg in all_results.get(datasets[0], []):
-            lbl = r_cfg["label"]
-            sty = style_map.get(lbl)
-            if sty is None:
-                continue
-            display, color, ls, lw, alpha, marker = sty
+            for r in all_results[ds_label]:
+                lbl = r["label"]
+                sty = style_map.get(lbl)
+                if sty is None:
+                    continue
+                display, color, ls, lw, alpha, marker = sty
+                val = r.get(metric_key)
+                if val is not None:
+                    ax.bar(display, val, color=color, alpha=0.75)
 
-            ys: list[float | None] = []
-            for ds_label in datasets:
-                match = next(
-                    (r for r in all_results[ds_label] if r["label"] == lbl), None
-                )
-                ys.append(match[metric_key] if match and match.get(metric_key) is not None else None)
-
-            valid_x = [x for x, y in zip(ds_x, ys) if y is not None]
-            valid_y = [y for y in ys if y is not None]
-            if valid_y:
-                ax.plot(valid_x, valid_y, color=color, linestyle=ls,
-                        linewidth=lw, alpha=alpha,
-                        marker=marker, markersize=5, label=display)
-
-        ax.set_xticks(ds_x)
-        ax.set_xticklabels(ds_labels_short, fontsize=8)
-        ax.set_ylabel(metric_label, fontsize=9)
-        ax.set_title(metric_label, fontsize=10, fontweight="bold")
-        ax.grid(True, alpha=0.3)
-        ax.tick_params(labelsize=8)
-
-    # hide spare metric subplots
-    for spare in range(len(_METRIC_ROWS), n_metric_rows * n_cols):
-        r = 1 + spare // n_cols
-        c = spare % n_cols
-        if r < n_rows and c < n_cols:
-            axes[r][c].set_visible(False)
+            if row == 0:
+                ax.set_title(_DS_SHORT.get(ds_label, ds_label).replace("\n", "  "),
+                             fontsize=10, fontweight="bold")
+            if col == 0:
+                ax.set_ylabel(metric_label, fontsize=9)
+            ax.tick_params(axis="x", labelsize=7, rotation=35)
+            ax.tick_params(axis="y", labelsize=8)
+            ax.grid(True, axis="y", alpha=0.3)
+            ax.margins(y=0.12)
 
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Plots saved to {out_path}", flush=True)
+    print(f"  Performance panel plot saved to {out_path}", flush=True)
 
 
 # ── Performance history tracking ──────────────────────────────────────────────
@@ -596,12 +605,20 @@ def update_perf_history(all_results: dict[str, list[dict]]) -> None:
         ds_snap: dict = {}
         for r in ds_results:
             key = r["label"].replace(" ", "_").replace("=", "")
-            ds_snap[key + "_r1at1"]       = r["recall"].get("1", 0.0)
-            ds_snap[key + "_throughput"]  = r["throughput_vps"]
-            ds_snap[key + "_p50_ms"]      = r["p50_ms"]
-            ds_snap[key + "_disk_mb"]     = r["disk_mb"]
-            ds_snap[key + "_ram_delta_mb"] = r["ram_delta_mb"]
-            ds_snap[key + "_mrr"]         = r["mrr"]
+            ds_snap[key + "_r1at1"]             = r["recall"].get("1", 0.0)
+            ds_snap[key + "_recall"]            = r["recall"]
+            ds_snap[key + "_throughput"]        = r["throughput_vps"]
+            ds_snap[key + "_ingest_s"]          = r["ingest_s"]
+            ds_snap[key + "_p50_ms"]            = r["p50_ms"]
+            ds_snap[key + "_p95_ms"]            = r["p95_ms"]
+            ds_snap[key + "_p99_ms"]            = r["p99_ms"]
+            ds_snap[key + "_disk_mb"]           = r["disk_mb"]
+            ds_snap[key + "_ram_delta_mb"]      = r["ram_delta_mb"]
+            ds_snap[key + "_ram_ingest_peak_mb"] = r["ram_ingest_peak_mb"]
+            ds_snap[key + "_ram_query_peak_mb"] = r["ram_query_peak_mb"]
+            ds_snap[key + "_cpu_ingest_pct"]    = r["cpu_ingest_pct"]
+            ds_snap[key + "_cpu_query_pct"]     = r["cpu_query_pct"]
+            ds_snap[key + "_mrr"]               = r["mrr"]
         entry["results"][ds_label] = ds_snap
 
     history: list = []
