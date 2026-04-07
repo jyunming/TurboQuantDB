@@ -127,7 +127,7 @@ def run_config(
         index_s = None
         if ann:
             t_idx = time.perf_counter()
-            db.create_index(max_degree=16, search_list_size=64, alpha=1.2)
+            db.create_index(max_degree=32, search_list_size=128, alpha=1.2)
             index_s = round(time.perf_counter() - t_idx, 3)
 
         # ── Query phase ───────────────────────────────────────────────────────
