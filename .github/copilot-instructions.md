@@ -180,3 +180,68 @@ python benchmarks/paper_recall_bench.py --plots-only
 ```
 
 Both `benchmarks/benchmark_plots.png` and `benchmarks/perf_history.json` are tracked in git and must be committed with any perf-relevant change.
+
+---
+
+## Roadmap & Development Cycle
+
+TurboQuantDB follows a weekly sprint cycle tracked on **GitHub Project board #3** (`https://github.com/users/jyunming/projects/3`).
+
+### Sprint schedule
+
+| Sprint | Milestone | Due | Status |
+|--------|-----------|-----|--------|
+| 1 | v0.3 · Quality Foundation | Apr 12, 2026 | Released v0.3.0 |
+| 2 | v0.4 · Index + Data Safety | Apr 19, 2026 | In progress |
+| 3 | v0.5 · Ecosystem + Search Quality | Apr 26, 2026 | |
+| 4 | v0.6 · Performance + Structure | May 3, 2026 | |
+| 5 | v0.7–0.9 · Feature Expansion | May 10, 2026 | |
+| 6 | v1.0 · Stable Release | May 17, 2026 | |
+
+### Issue → PR cycle (follow this order exactly)
+
+1. **Open an issue** on `jyunming/TurboQuantDB` using the feature request or bug template.
+2. **Link to the project board**: `GITHUB_TOKEN="" gh project item-add 3 --owner jyunming --url <issue-url>`
+3. **Create a branch** (never commit to `main` directly): `git checkout -b feat/<name>`
+4. **Implement** — add tests, update `docs/PYTHON_API.md`, update `python/tqdb/tqdb.pyi` stubs.
+5. **Commit** — pre-commit hook runs automatically:
+   - `cargo fmt --check` → `cargo check` → `cargo test --lib` (always)
+   - Perf gate via `benchmarks/precommit_perf_check.py` (only when `src/` files are staged)
+   - Doc-only commits (all staged files are `.md`, `docs/`, `website/`) skip all Rust checks
+6. **Before pushing** (when `src/` changed), run the paper benchmark:
+   ```bash
+   TQDB_TRACK=1 python benchmarks/paper_recall_bench.py --update-readme --track
+   git add benchmarks/perf_history.json benchmarks/perf_baseline.json benchmarks/benchmark_plots.png
+   ```
+7. **Push and open PR**: `GITHUB_TOKEN="" git push origin <branch>` then `gh pr create --base main`
+8. **Monitor CI** — Rust (ubuntu + windows), Python smoke, benchmark-artifacts. Fix all failures.
+9. **Address Copilot review comments** — fix every comment, then resolve threads via GraphQL:
+   ```bash
+   # Get thread IDs
+   gh api graphql -f query='{ repository(owner:"jyunming",name:"TurboQuantDB") { pullRequest(number:N) { reviewThreads(first:20) { nodes { id isResolved } } } } }'
+   # Resolve each
+   GITHUB_TOKEN="" gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"PRRT_..."}) { thread { isResolved } } }'
+   ```
+10. **Do not push or merge without explicit user approval.**
+11. **After merge**: tag release, update project board items to Done:
+    ```bash
+    git tag vX.Y.Z && GITHUB_TOKEN="" git push origin vX.Y.Z
+    ```
+
+### v0.3 completed items (reference for what's available in v0.3.0)
+
+- `Database.open(path)` — parameterless reopen reads all params from `manifest.json`
+- `delete_batch(where_filter=...)` — filter-based atomic bulk delete
+- `list_metadata_values(field)` — enumerate distinct metadata values with counts
+- `normalize=True` on `Database.open()` — auto L2-normalise vectors and queries
+- Hybrid ANN + brute-force for post-index inserts ("dark vectors")
+- ChromaDB shim (`tqdb.chroma_compat`), LanceDB shim (`tqdb.lancedb_compat`)
+- S3 segment backend (`--features cloud`), Prometheus `/metrics`, restore endpoint
+- `.pyi` type stubs, WAL v5 CRC32, segment CRC32, engine sub-module decomposition
+
+### v0.4 open issues (Sprint 2, due Apr 19)
+
+- **#16** — Delta index: brute-force overlay for post-index inserts, merged on `create_index()`
+- **#17** — Parallel batch ingest via Rayon
+- **#18** — Compaction crash recovery (atomic rename, `.tmp` rollback on reopen)
+- **#19** — `.unwrap()` audit pass 1 (write-path + Python-reachable sites)
