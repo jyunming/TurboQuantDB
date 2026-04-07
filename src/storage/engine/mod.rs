@@ -926,12 +926,12 @@ impl TurboQuantEngine {
                     gamma_buf[i] = f32::from_le_bytes(
                         rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                             .try_into()
-                            .unwrap(),
+                            .expect("live_codes gamma field is always 4 bytes"),
                     );
                     norm_buf[i] = f32::from_le_bytes(
                         rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                             .try_into()
-                            .unwrap(),
+                            .expect("live_codes norm field is always 4 bytes"),
                     );
                 }
                 (mse_buf, qjl_buf, gamma_buf, norm_buf)
@@ -957,12 +957,12 @@ impl TurboQuantEngine {
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes gamma field is always 4 bytes"),
                         );
                         let doc_norm = f32::from_le_bytes(
                             rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes norm field is always 4 bytes"),
                         );
                         let mut v =
                             q.dequantize(&idx, &rec[mse_len..mse_len + qjl_len], gamma as f64);
@@ -990,12 +990,16 @@ impl TurboQuantEngine {
                     let mut out = Array1::<f64>::zeros(d);
                     if matches!(vraw_precision, RerankPrecision::F16) {
                         for i in 0..d {
-                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
+                                .try_into()
+                                .expect("vraw f16 record has 2 bytes per element");
                             out[i] = half::f16::from_le_bytes(bytes).to_f64();
                         }
                     } else {
                         for i in 0..d {
-                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
+                                .try_into()
+                                .expect("vraw f32 record has 4 bytes per element");
                             out[i] = f32::from_le_bytes(bytes) as f64;
                         }
                     }
@@ -1070,12 +1074,16 @@ impl TurboQuantEngine {
                     let mut out = Array1::<f64>::zeros(d);
                     if matches!(vraw_precision, RerankPrecision::F16) {
                         for i in 0..d {
-                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
+                                .try_into()
+                                .expect("vraw f16 record has 2 bytes per element");
                             out[i] = half::f16::from_le_bytes(bytes).to_f64();
                         }
                     } else {
                         for i in 0..d {
-                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
+                                .try_into()
+                                .expect("vraw f32 record has 4 bytes per element");
                             out[i] = f32::from_le_bytes(bytes) as f64;
                         }
                     }
@@ -1151,7 +1159,9 @@ impl TurboQuantEngine {
                 let rec = vraw.get_slot(from_slot);
                 let mut from_vec = Array1::<f64>::zeros(d);
                 for i in 0..d {
-                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
+                        .try_into()
+                        .expect("vraw f32 record has 4 bytes per element");
                     from_vec[i] = f32::from_le_bytes(bytes) as f64;
                 }
                 candidates
@@ -1161,7 +1171,9 @@ impl TurboQuantEngine {
                         let rec = vraw.get_slot(to_slot);
                         let mut to_vec = Array1::<f64>::zeros(d);
                         for i in 0..d {
-                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
+                                .try_into()
+                                .expect("vraw f32 record has 4 bytes per element");
                             to_vec[i] = f32::from_le_bytes(bytes) as f64;
                         }
                         (to, score_vectors_with_metric(&metric, &from_vec, &to_vec))
@@ -1324,12 +1336,12 @@ impl TurboQuantEngine {
                     let gamma = f32::from_le_bytes(
                         rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                             .try_into()
-                            .unwrap(),
+                            .expect("live_codes gamma field is always 4 bytes"),
                     );
                     let doc_norm = f32::from_le_bytes(
                         rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                             .try_into()
-                            .unwrap(),
+                            .expect("live_codes norm field is always 4 bytes"),
                     );
                     quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut idx_buf_ann);
 
@@ -1539,12 +1551,12 @@ impl TurboQuantEngine {
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes gamma field is always 4 bytes"),
                         );
                         let doc_norm = f32::from_le_bytes(
                             rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes norm field is always 4 bytes"),
                         );
                         let score = quantizer.score_ip_encoded(
                             &prep,
@@ -1564,7 +1576,7 @@ impl TurboQuantEngine {
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes gamma field is always 4 bytes"),
                         );
                         let ip = quantizer.score_ip_encoded(
                             &prep,
@@ -1584,12 +1596,12 @@ impl TurboQuantEngine {
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes gamma field is always 4 bytes"),
                         );
                         let doc_norm = f32::from_le_bytes(
                             rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes norm field is always 4 bytes"),
                         );
                         let mut v = quantizer.dequantize(
                             &idx,
@@ -1620,12 +1632,12 @@ impl TurboQuantEngine {
                                 let gamma = f32::from_le_bytes(
                                     rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                         .try_into()
-                                        .unwrap(),
+                                        .expect("live_codes gamma field is always 4 bytes"),
                                 );
                                 let doc_norm = f32::from_le_bytes(
                                     rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                                         .try_into()
-                                        .unwrap(),
+                                        .expect("live_codes norm field is always 4 bytes"),
                                 );
                                 // Vectors stored unit-normalized; scale back to recover <q, doc>.
                                 let score = quantizer.score_ip_encoded(
@@ -1654,7 +1666,7 @@ impl TurboQuantEngine {
                                 let gamma = f32::from_le_bytes(
                                     rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                         .try_into()
-                                        .unwrap(),
+                                        .expect("live_codes gamma field is always 4 bytes"),
                                 );
                                 // Vectors stored unit-normalized; ip estimates <query, unit_doc>.
                                 // cosine(query, doc) = <query, unit_doc> / ||query||
@@ -1685,12 +1697,12 @@ impl TurboQuantEngine {
                                 let gamma = f32::from_le_bytes(
                                     rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                         .try_into()
-                                        .unwrap(),
+                                        .expect("live_codes gamma field is always 4 bytes"),
                                 );
                                 let doc_norm = f32::from_le_bytes(
                                     rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                                         .try_into()
-                                        .unwrap(),
+                                        .expect("live_codes norm field is always 4 bytes"),
                                 );
                                 // Dequantize returns unit vector; scale back to original norm.
                                 let mut v = quantizer.dequantize(
@@ -2150,12 +2162,12 @@ impl TurboQuantEngine {
         let gamma = f32::from_le_bytes(
             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                 .try_into()
-                .unwrap(),
+                .expect("live_codes gamma field is always 4 bytes"),
         );
         let norm = f32::from_le_bytes(
             rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                 .try_into()
-                .unwrap(),
+                .expect("live_codes norm field is always 4 bytes"),
         );
         (indices, qjl, gamma, norm)
     }
@@ -2169,13 +2181,17 @@ impl TurboQuantEngine {
         match self.manifest.rerank_precision {
             RerankPrecision::F16 => {
                 for i in 0..self.d {
-                    let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                    let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
+                        .try_into()
+                        .expect("vraw f16 record has 2 bytes per element");
                     out[i] = half::f16::from_le_bytes(bytes).to_f64();
                 }
             }
             RerankPrecision::F32 | RerankPrecision::Disabled => {
                 for i in 0..self.d {
-                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
+                        .try_into()
+                        .expect("vraw f32 record has 4 bytes per element");
                     out[i] = f32::from_le_bytes(bytes) as f64;
                 }
             }
