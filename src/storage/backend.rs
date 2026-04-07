@@ -32,6 +32,9 @@ pub trait StorageProvider: Send + Sync {
 
     /// Get file size.
     fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Rename (move) a file atomically within the same storage root.
+    fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Local filesystem storage provider.
@@ -125,6 +128,11 @@ impl StorageProvider for LocalProvider {
     fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let full = self.root.join(path);
         Ok(fs::metadata(full)?.len())
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        fs::rename(self.root.join(from), self.root.join(to))?;
+        Ok(())
     }
 }
 
@@ -290,6 +298,24 @@ impl StorageProvider for S3Provider {
         let meta = self.rt.block_on(self.store.head(&key))?;
         Ok(meta.size as u64)
     }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Rename local cache file atomically, then upload under the new key and
+        // delete the old key from S3. S3 has no atomic rename primitive.
+        let from_cached = self.cached(from);
+        let to_cached = self.cached(to);
+        if let Some(parent) = to_cached.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&from_cached, &to_cached)?;
+        let data = fs::read(&to_cached)?;
+        let to_key = self.s3_key(to);
+        let payload = object_store::PutPayload::from(data);
+        self.rt.block_on(self.store.put(&to_key, payload))?;
+        let from_key = self.s3_key(from);
+        self.rt.block_on(self.store.delete(&from_key))?;
+        Ok(())
+    }
 }
 
 /// A unified storage backend wrapper.
@@ -382,6 +408,14 @@ impl StorageBackend {
 
     pub fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         self.provider.size(path)
+    }
+
+    pub fn rename(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.provider.rename(from, to)
     }
 }
 

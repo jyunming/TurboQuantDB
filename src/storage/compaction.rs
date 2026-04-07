@@ -67,9 +67,29 @@ impl Compactor {
         Ok(())
     }
 
+    /// Delete any segment `.tmp` files left by a mid-write crash.
+    ///
+    /// These files are the result of a crash between `write_batch` and the
+    /// subsequent `rename` in `compact_live_records`. They are always safe to
+    /// discard: the original segments are still intact.
+    pub fn cleanup_tmp_files(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tmp_files = self.backend.list("seg-")?;
+        for name in tmp_files {
+            if name.ends_with(".tmp") {
+                self.backend.delete(&name)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Recover from an interrupted compaction if a marker file exists.
+    /// Also removes any segment `.tmp` files left by a mid-write crash.
     /// Returns true when a marker was found and processed.
     pub fn recover_if_needed(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        // Always clean up orphan .tmp files regardless of whether a compaction
+        // state marker exists: they represent incomplete writes and are safe to drop.
+        self.cleanup_tmp_files()?;
+
         if !self.backend.exists(COMPACTION_STATE_FILE) {
             return Ok(false);
         }
@@ -116,6 +136,11 @@ impl Compactor {
 
     /// Write a new compacted segment from already-resolved live records,
     /// then delete the provided old segment files.
+    ///
+    /// Crash safety: the segment is first written to `<name>.tmp`, then
+    /// renamed atomically to its final name. Any `.tmp` files left by a
+    /// mid-write crash are deleted on the next `recover_if_needed()` call.
+    ///
     /// Advances the compaction marker to `Committed` after deletion so that
     /// a crash between deletion and marker removal is safely recoverable.
     pub fn compact_live_records(
@@ -124,7 +149,15 @@ impl Compactor {
         new_segment_name: &str,
         live_records: &[SegmentRecord],
     ) -> Result<Segment, Box<dyn std::error::Error + Send + Sync>> {
-        let new_seg = Segment::write_batch(&self.backend, new_segment_name, live_records)?;
+        // Write to a temporary file; rename atomically on success.
+        let tmp_name = format!("{}.tmp", new_segment_name);
+        let tmp_seg = Segment::write_batch(&self.backend, &tmp_name, live_records)?;
+        self.backend.rename(&tmp_name, new_segment_name)?;
+        // Adjust the segment handle to reflect the final file name.
+        let new_seg = Segment {
+            name: new_segment_name.to_string(),
+            ..tmp_seg
+        };
         for name in old_segment_names {
             // Guard: never delete the freshly written compacted segment in case a caller
             // bug causes new_segment_name to appear in old_segment_names.
@@ -325,5 +358,49 @@ mod tests {
     fn compactor_new_sets_min_segments_to_10() {
         let (_dir, _backend, compactor) = make_compactor_and_backend();
         assert_eq!(compactor.min_segments, 10);
+    }
+
+    #[test]
+    fn compact_live_records_uses_tmp_then_renames() {
+        let (_dir, backend, compactor) = make_compactor_and_backend();
+        let r = vec![SegmentRecord {
+            id: "a".to_string(),
+            is_deleted: false,
+        }];
+        Segment::write_batch(&backend, "seg-00000000.bin", &r).unwrap();
+
+        let old_names = vec!["seg-00000000.bin".to_string()];
+        let new_seg = compactor
+            .compact_live_records(&old_names, "seg-00000001.bin", &r)
+            .unwrap();
+
+        // Final segment exists with the correct name; no leftover .tmp
+        assert_eq!(new_seg.name, "seg-00000001.bin");
+        assert!(backend.exists("seg-00000001.bin"));
+        assert!(
+            !backend.exists("seg-00000001.bin.tmp"),
+            ".tmp file must be removed after successful rename"
+        );
+        assert!(!backend.exists("seg-00000000.bin"));
+    }
+
+    #[test]
+    fn recover_if_needed_cleans_up_orphan_tmp_files() {
+        let (_dir, backend, compactor) = make_compactor_and_backend();
+        let r = vec![SegmentRecord {
+            id: "a".to_string(),
+            is_deleted: false,
+        }];
+        // Simulate a crash mid-write: .tmp file present, no state marker
+        Segment::write_batch(&backend, "seg-00000001.bin.tmp", &r).unwrap();
+        assert!(backend.exists("seg-00000001.bin.tmp"));
+
+        let recovered = compactor.recover_if_needed().unwrap();
+        // No state marker → returns false, but .tmp must still be removed
+        assert!(!recovered);
+        assert!(
+            !backend.exists("seg-00000001.bin.tmp"),
+            "orphan .tmp file must be deleted on recovery"
+        );
     }
 }
