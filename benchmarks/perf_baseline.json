@@ -40,11 +40,11 @@
     },
     "disk_bytes": {
       "higher_is_better": false,
-      "best": 2460348.0
+      "best": 2420340.0
     },
     "compression_ratio": {
       "higher_is_better": true,
-      "best": 3.2515725417705137
+      "best": 3.3053207400613136
     },
     "ram_estimate_bytes": {
       "higher_is_better": false,
