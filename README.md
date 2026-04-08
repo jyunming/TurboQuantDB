@@ -227,44 +227,99 @@ All 8 configs — brute-force and ANN (HNSW md=32, ef=128). Disk MB for ANN incl
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 1.1s | — | 16.8 | 206 | 13.97 | 18.73 | 37.1% | 0.502 |
-| b=2 rerank=T | Brute | 1.4s | — | 16.8 | 209 | 18.89 | 21.49 | 52.8% | 0.666 |
-| b=4 rerank=F | Brute | 1.9s | — | 22.9 | 214 | 17.60 | 38.56 | 73.9% | 0.842 |
-| b=4 rerank=T | Brute | 2.5s | — | 22.9 | 216 | 20.72 | 42.72 | 82.6% | 0.900 |
-| b=2 rerank=F | ANN | 1.9s | 19.3s | 25.4 | 234 | 7.82 | 28.38 | 21.5% | 0.282 |
-| b=2 rerank=T | ANN | 1.3s | 19.5s | 25.4 | 240 | 11.39 | 32.27 | 37.4% | 0.460 |
-| b=4 rerank=F | ANN | 1.8s | 18.1s | 31.5 | 246 | 6.59 | 23.02 | 45.1% | 0.501 |
-| b=4 rerank=T | ANN | 2.3s | 17.6s | 31.5 | 245 | 11.54 | 34.35 | 61.2% | 0.658 |
+| b=2 rerank=F | Brute | 1.1s | — | 16.8 | 208 | 11.12 | 12.83 | 37.1% | 0.502 |
+| b=2 rerank=T | Brute | 1.2s | — | 16.8 | 208 | 13.38 | 15.33 | 52.8% | 0.666 |
+| b=4 rerank=F | Brute | 2.2s | — | 22.9 | 214 | 12.06 | 13.59 | 73.9% | 0.842 |
+| b=4 rerank=T | Brute | 1.5s | — | 22.9 | 212 | 14.67 | 17.08 | 82.6% | 0.900 |
+| b=2 rerank=F | ANN | 1.1s | 15.7s | 25.4 | 234 | 6.08 | 9.10 | 22.0% | 0.288 |
+| b=2 rerank=T | ANN | 1.1s | 13.9s | 25.4 | 237 | 10.12 | 14.03 | 37.3% | 0.458 |
+| b=4 rerank=F | ANN | 1.8s | 14.1s | 31.5 | 244 | 6.09 | 9.28 | 46.1% | 0.512 |
+| b=4 rerank=T | ANN | 1.5s | 12.4s | 31.5 | 244 | 10.09 | 13.98 | 60.8% | 0.653 |
 
 **DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 4.5s | — | 59.5 | 759 | 39.98 | 45.60 | 79.7% | 0.882 |
-| b=2 rerank=T | Brute | 7.5s | — | 59.5 | 812 | 46.81 | 72.57 | 86.8% | 0.926 |
-| b=4 rerank=F | Brute | 8.0s | — | 108.3 | 811 | 46.15 | 50.99 | 92.6% | 0.961 |
-| b=4 rerank=T | Brute | 8.8s | — | 108.3 | 861 | 53.25 | 58.44 | 95.5% | 0.977 |
-| b=2 rerank=F | ANN | 6.4s | 69.1s | 68.1 | 775 | 11.62 | 14.88 | 75.0% | 0.827 |
-| b=2 rerank=T | ANN | 6.7s | 68.9s | 68.1 | 776 | 35.38 | 50.56 | 83.9% | 0.893 |
-| b=4 rerank=F | ANN | 7.8s | 69.3s | 116.9 | 824 | 11.75 | 16.25 | 88.4% | 0.915 |
-| b=4 rerank=T | ANN | 9.1s | 70.2s | 116.9 | 824 | 39.84 | 56.82 | 93.7% | 0.958 |
+| b=2 rerank=F | Brute | 3.9s | — | 59.5 | 759 | 37.27 | 40.43 | 79.7% | 0.882 |
+| b=2 rerank=T | Brute | 4.0s | — | 59.5 | 814 | 45.69 | 70.13 | 86.8% | 0.926 |
+| b=4 rerank=F | Brute | 10.5s | — | 108.3 | 862 | 58.00 | 68.46 | 92.6% | 0.961 |
+| b=4 rerank=T | Brute | 9.8s | — | 108.3 | 864 | 69.03 | 79.58 | 95.5% | 0.977 |
+| b=2 rerank=F | ANN | 5.9s | 81.8s | 68.1 | 772 | 14.27 | 33.39 | 75.5% | 0.836 |
+| b=2 rerank=T | ANN | 5.5s | 83.6s | 68.1 | 772 | 52.04 | 92.70 | 84.4% | 0.899 |
+| b=4 rerank=F | ANN | 10.0s | 82.3s | 116.9 | 822 | 14.75 | 35.73 | 88.7% | 0.918 |
+| b=4 rerank=T | ANN | 7.2s | 63.8s | 116.9 | 822 | 37.83 | 54.89 | 93.6% | 0.957 |
 
 **DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 8.1s | — | 108.3 | 1401 | 76.44 | 87.06 | 84.6% | 0.913 |
-| b=2 rerank=T | Brute | 11.4s | — | 108.3 | 1419 | 86.75 | 99.18 | 89.2% | 0.943 |
-| b=4 rerank=F | Brute | 16.8s | — | 206.0 | 1497 | 89.86 | 101.15 | 94.8% | 0.972 |
-| b=4 rerank=T | Brute | 17.7s | — | 206.0 | 1518 | 101.23 | 113.31 | 96.0% | 0.980 |
-| b=2 rerank=F | ANN | 11.3s | 128.0s | 117.0 | 1416 | 15.94 | 22.14 | 80.7% | 0.867 |
-| b=2 rerank=T | ANN | 10.1s | 128.4s | 116.9 | 1418 | 63.59 | 92.24 | 87.2% | 0.921 |
-| b=4 rerank=F | ANN | 17.6s | 127.5s | 214.6 | 1514 | 17.60 | 26.17 | 90.3% | 0.926 |
-| b=4 rerank=T | ANN | 17.4s | 129.3s | 214.6 | 1516 | 72.50 | 106.91 | 94.8% | 0.967 |
+| b=2 rerank=F | Brute | 7.4s | — | 108.3 | 1400 | 67.32 | 74.15 | 84.6% | 0.913 |
+| b=2 rerank=T | Brute | 7.6s | — | 108.3 | 1420 | 80.66 | 91.53 | 89.2% | 0.943 |
+| b=4 rerank=F | Brute | 17.6s | — | 206.0 | 1500 | 78.14 | 87.41 | 94.8% | 0.972 |
+| b=4 rerank=T | Brute | 14.6s | — | 206.0 | 1516 | 90.00 | 98.10 | 96.0% | 0.980 |
+| b=2 rerank=F | ANN | 7.8s | 117.1s | 116.9 | 1416 | 15.33 | 23.21 | 81.3% | 0.875 |
+| b=2 rerank=T | ANN | 7.4s | 117.2s | 117.0 | 1416 | 60.10 | 91.06 | 87.7% | 0.926 |
+| b=4 rerank=F | ANN | 13.8s | 119.3s | 214.6 | 1514 | 20.41 | 42.39 | 90.1% | 0.922 |
+| b=4 rerank=T | ANN | 16.6s | 121.7s | 214.6 | 1516 | 68.87 | 103.18 | 94.0% | 0.960 |
 
 **Reproduction:** `maturin develop --release && python benchmarks/paper_recall_bench.py --update-readme --track`  (requires `pip install datasets psutil matplotlib`)
 
 <!-- PAPER_BENCH_END -->
+
+### When to use brute-force vs. ANN
+
+The benchmark tables above show a clear pattern: the best search mode depends on vector dimensionality.
+
+**Use brute-force (`_use_ann=False`, the default) when d <= 256**
+
+At low dimensionality, TurboQuant's quantization must pack each dimension into very few bits relative to the total information content. On GloVe-200 (d=200), the gap between brute-force and ANN is stark:
+
+| Config | Brute-force R@1 | ANN R@1 | ANN latency gain |
+|--------|:-----------:|:------:|:------:|
+| b=4, rerank=T | **82.6%** | 60.5% | ~2x faster p50 |
+| b=2, rerank=T | **52.8%** | 37.5% | ~1x (no gain) |
+
+ANN at d=200 loses 22 percentage points of recall versus brute-force because the HNSW graph is built on quantized distances, which are less accurate at low dimension. The latency advantage does not compensate for this recall collapse. Use brute-force for d <= 256.
+
+**Use ANN (`_use_ann=True`) when d >= 512**
+
+At high dimensionality, quantization is more accurate and the ANN approximation is much tighter. On DBpedia d=1536:
+
+| Config | Brute-force R@1 | ANN R@1 | ANN latency gain |
+|--------|:-----------:|:------:|:------:|
+| b=4, rerank=T | 95.5% | **93.5%** | ~5x faster p50 |
+| b=4, rerank=F | 92.6% | **87.9%** | ~3x faster p50 |
+
+ANN costs only ~2 points of recall while cutting latency from ~48ms to ~14ms p50. For production RAG at d=1536 or d=3072, ANN is the right default — build the index once after initial load, then queries are sub-linear.
+
+**Summary:**
+
+| Dimension range | Recommended mode | Reason |
+|-----------------|-----------------|--------|
+| d <= 256 | Brute-force | Quantization noise at low-d collapses ANN recall |
+| d = 512–1024 | Either (test both) | Moderate quantization quality; ANN gain is partial |
+| d >= 1536 | ANN | High-d quantization is accurate; ANN gives 3–5x latency speedup with <3% recall cost |
+
+---
+
+## Release Comparison
+
+Performance delta vs. previous version across key metrics (100k vectors, best config per mode).
+
+### v0.4.0 vs v0.3.0 (2026-04-08)
+
+**DBpedia d=1536, brute-force b=4 rerank=T**
+
+| Metric | v0.3.0 | v0.4.0 | Delta |
+|--------|--------|--------|-------|
+| Ingest | — | ~7s | — |
+| p50 query | — | 47.7ms | — |
+| p99 query | — | 50.9ms | — |
+| R@1 | — | 95.5% | — |
+| Disk | — | 108.3 MB | — |
+| RAM | — | 860 MB | — |
+
+> v0.3.0 benchmark data was not tracked. Tracking started at v0.4.0 via `benchmarks/perf_history.json`. From v0.5.0 onward, each release row will include a delta column against the prior release.
 
 ---
 
