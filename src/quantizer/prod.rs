@@ -482,7 +482,14 @@ impl ProdQuantizer {
     }
 
     pub fn quantize_batch(&self, xs: &[&[f32]]) -> Vec<(Vec<CodeIndex>, Vec<u8>, f64)> {
-        xs.par_iter().map(|x| self.quantize(x)).collect()
+        // Below this threshold the Rayon thread-park/unpark overhead exceeds the
+        // quantization work on all supported platforms (especially Windows).
+        const PAR_THRESHOLD: usize = 512;
+        if xs.len() <= PAR_THRESHOLD {
+            xs.iter().map(|x| self.quantize(x)).collect()
+        } else {
+            xs.par_iter().map(|x| self.quantize(x)).collect()
+        }
     }
 
     pub fn dequantize(&self, idx: &[CodeIndex], qjl: &[u8], gamma: f64) -> Array1<f64> {

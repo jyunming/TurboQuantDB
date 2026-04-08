@@ -22,6 +22,7 @@ use filter::{get_nested_field, metadata_matches_filter, score_vectors_with_metri
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
 const INDEX_IDS_FILE: &str = "graph_ids.json";
+const DELTA_IDS_FILE: &str = "delta_ids.json";
 const ID_POOL_FILE: &str = "live_ids.bin";
 const MANIFEST_SAVE_INTERVAL_OPS: usize = 64;
 
@@ -184,6 +185,9 @@ pub struct DbStats {
     pub metadata_bytes_estimate: usize,
     pub ann_slot_count: usize,
     pub graph_nodes: usize,
+    /// Number of vectors in the delta overlay (inserted after last `create_index()`).
+    /// When this grows large, consider calling `create_index()` again to merge.
+    pub delta_size: usize,
 }
 
 pub struct TurboQuantEngine {
@@ -204,10 +208,15 @@ pub struct TurboQuantEngine {
     local_dir: String,
 
     index_ids: Vec<u32>,
+    /// Slots inserted after the last `create_index()` call — the "delta" overlay.
+    /// ANN search queries both the HNSW graph and these slots (brute-force).
+    /// Cleared on every `create_index()` and persisted to `delta_ids.json`.
+    delta_slots: Vec<u32>,
     live_codes: LiveCodesFile,
     live_vraw: Option<LiveCodesFile>,
     id_pool: IdPool,
     index_ids_dirty: bool,
+    delta_slots_dirty: bool,
     pending_manifest_updates: usize,
     /// True when at least one delete has been issued since the last compaction.
     /// When false, `live_compact_slab` is skipped on WAL flush — a pure insert
@@ -423,6 +432,7 @@ impl TurboQuantEngine {
         };
 
         let normalize_flag = normalize || manifest.normalize;
+        let delta_slots = load_delta_slots(local_dir, &backend).unwrap_or_default();
         let mut engine = Self {
             d: manifest.d,
             b: manifest.b,
@@ -438,10 +448,12 @@ impl TurboQuantEngine {
             graph,
             local_dir: local_dir.to_string(),
             index_ids: load_index_ids(local_dir).unwrap_or_default(),
+            delta_slots,
             live_codes,
             live_vraw,
             id_pool: IdPool::new(),
             index_ids_dirty: false,
+            delta_slots_dirty: false,
             pending_manifest_updates: 0,
             has_pending_deletes: false,
             rerank_enabled: manifest.rerank_enabled,
@@ -926,12 +938,12 @@ impl TurboQuantEngine {
                     gamma_buf[i] = f32::from_le_bytes(
                         rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                             .try_into()
-                            .unwrap(),
+                            .expect("live_codes gamma field is always 4 bytes"),
                     );
                     norm_buf[i] = f32::from_le_bytes(
                         rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                             .try_into()
-                            .unwrap(),
+                            .expect("live_codes norm field is always 4 bytes"),
                     );
                 }
                 (mse_buf, qjl_buf, gamma_buf, norm_buf)
@@ -957,12 +969,12 @@ impl TurboQuantEngine {
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes gamma field is always 4 bytes"),
                         );
                         let doc_norm = f32::from_le_bytes(
                             rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes norm field is always 4 bytes"),
                         );
                         let mut v =
                             q.dequantize(&idx, &rec[mse_len..mse_len + qjl_len], gamma as f64);
@@ -990,12 +1002,16 @@ impl TurboQuantEngine {
                     let mut out = Array1::<f64>::zeros(d);
                     if matches!(vraw_precision, RerankPrecision::F16) {
                         for i in 0..d {
-                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
+                                .try_into()
+                                .expect("vraw f16 record has 2 bytes per element");
                             out[i] = half::f16::from_le_bytes(bytes).to_f64();
                         }
                     } else {
                         for i in 0..d {
-                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
+                                .try_into()
+                                .expect("vraw f32 record has 4 bytes per element");
                             out[i] = f32::from_le_bytes(bytes) as f64;
                         }
                     }
@@ -1070,12 +1086,16 @@ impl TurboQuantEngine {
                     let mut out = Array1::<f64>::zeros(d);
                     if matches!(vraw_precision, RerankPrecision::F16) {
                         for i in 0..d {
-                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                            let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
+                                .try_into()
+                                .expect("vraw f16 record has 2 bytes per element");
                             out[i] = half::f16::from_le_bytes(bytes).to_f64();
                         }
                     } else {
                         for i in 0..d {
-                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
+                                .try_into()
+                                .expect("vraw f32 record has 4 bytes per element");
                             out[i] = f32::from_le_bytes(bytes) as f64;
                         }
                     }
@@ -1151,7 +1171,9 @@ impl TurboQuantEngine {
                 let rec = vraw.get_slot(from_slot);
                 let mut from_vec = Array1::<f64>::zeros(d);
                 for i in 0..d {
-                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
+                        .try_into()
+                        .expect("vraw f32 record has 4 bytes per element");
                     from_vec[i] = f32::from_le_bytes(bytes) as f64;
                 }
                 candidates
@@ -1161,7 +1183,9 @@ impl TurboQuantEngine {
                         let rec = vraw.get_slot(to_slot);
                         let mut to_vec = Array1::<f64>::zeros(d);
                         for i in 0..d {
-                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                            let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
+                                .try_into()
+                                .expect("vraw f32 record has 4 bytes per element");
                             to_vec[i] = f32::from_le_bytes(bytes) as f64;
                         }
                         (to, score_vectors_with_metric(&metric, &from_vec, &to_vec))
@@ -1180,6 +1204,9 @@ impl TurboQuantEngine {
         )?;
         self.index_ids = indexed_slots;
         self.index_ids_dirty = true;
+        // Delta slots are now part of the rebuilt graph — clear the overlay.
+        self.delta_slots.clear();
+        self.delta_slots_dirty = true;
         self.manifest.index_state = Some(IndexState {
             max_degree,
             ef_construction,
@@ -1324,12 +1351,12 @@ impl TurboQuantEngine {
                     let gamma = f32::from_le_bytes(
                         rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                             .try_into()
-                            .unwrap(),
+                            .expect("live_codes gamma field is always 4 bytes"),
                     );
                     let doc_norm = f32::from_le_bytes(
                         rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                             .try_into()
-                            .unwrap(),
+                            .expect("live_codes norm field is always 4 bytes"),
                     );
                     quantizer_r.unpack_mse_indices(&rec[..mse_len], &mut idx_buf_ann);
 
@@ -1418,22 +1445,20 @@ impl TurboQuantEngine {
                 out.truncate(top_k);
             }
 
-            // Hybrid: score any vectors inserted after create_index() ("dark slots")
-            // that are not in the HNSW graph. Without this, new inserts are silently
-            // invisible to ANN search.
-            let indexed_set: std::collections::HashSet<u32> =
-                self.index_ids.iter().copied().collect();
-            let dark_slots: Vec<u32> = self
-                .id_pool
-                .iter_active()
+            // Delta overlay: brute-force score vectors inserted after create_index()
+            // that are not in the HNSW graph.  delta_slots is maintained incrementally
+            // on every insert, avoiding the O(n) set-difference scan on each search.
+            // is_slot_alive filters deleted slots without allocating strings or a HashSet.
+            let delta: Vec<u32> = self
+                .delta_slots
                 .iter()
-                .map(|(_, s)| *s)
-                .filter(|s| !indexed_set.contains(s))
+                .copied()
+                .filter(|s| self.id_pool.is_slot_alive(*s))
                 .collect();
-            if !dark_slots.is_empty() {
-                let mut dark_results =
-                    self.exhaustive_search_simd(query, top_k, filter, Some(dark_slots))?;
-                out.append(&mut dark_results);
+            if !delta.is_empty() {
+                let mut delta_results =
+                    self.exhaustive_search_simd(query, top_k, filter, Some(delta))?;
+                out.append(&mut delta_results);
                 out.sort_by(|a, b| {
                     b.score
                         .partial_cmp(&a.score)
@@ -1539,12 +1564,12 @@ impl TurboQuantEngine {
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes gamma field is always 4 bytes"),
                         );
                         let doc_norm = f32::from_le_bytes(
                             rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes norm field is always 4 bytes"),
                         );
                         let score = quantizer.score_ip_encoded(
                             &prep,
@@ -1564,7 +1589,7 @@ impl TurboQuantEngine {
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes gamma field is always 4 bytes"),
                         );
                         let ip = quantizer.score_ip_encoded(
                             &prep,
@@ -1584,12 +1609,12 @@ impl TurboQuantEngine {
                         let gamma = f32::from_le_bytes(
                             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes gamma field is always 4 bytes"),
                         );
                         let doc_norm = f32::from_le_bytes(
                             rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                                 .try_into()
-                                .unwrap(),
+                                .expect("live_codes norm field is always 4 bytes"),
                         );
                         let mut v = quantizer.dequantize(
                             &idx,
@@ -1620,12 +1645,12 @@ impl TurboQuantEngine {
                                 let gamma = f32::from_le_bytes(
                                     rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                         .try_into()
-                                        .unwrap(),
+                                        .expect("live_codes gamma field is always 4 bytes"),
                                 );
                                 let doc_norm = f32::from_le_bytes(
                                     rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                                         .try_into()
-                                        .unwrap(),
+                                        .expect("live_codes norm field is always 4 bytes"),
                                 );
                                 // Vectors stored unit-normalized; scale back to recover <q, doc>.
                                 let score = quantizer.score_ip_encoded(
@@ -1654,7 +1679,7 @@ impl TurboQuantEngine {
                                 let gamma = f32::from_le_bytes(
                                     rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                         .try_into()
-                                        .unwrap(),
+                                        .expect("live_codes gamma field is always 4 bytes"),
                                 );
                                 // Vectors stored unit-normalized; ip estimates <query, unit_doc>.
                                 // cosine(query, doc) = <query, unit_doc> / ||query||
@@ -1685,12 +1710,12 @@ impl TurboQuantEngine {
                                 let gamma = f32::from_le_bytes(
                                     rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                                         .try_into()
-                                        .unwrap(),
+                                        .expect("live_codes gamma field is always 4 bytes"),
                                 );
                                 let doc_norm = f32::from_le_bytes(
                                     rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                                         .try_into()
-                                        .unwrap(),
+                                        .expect("live_codes norm field is always 4 bytes"),
                                 );
                                 // Dequantize returns unit vector; scale back to original norm.
                                 let mut v = quantizer.dequantize(
@@ -2112,6 +2137,7 @@ impl TurboQuantEngine {
             metadata_bytes_estimate: self.metadata.approx_bytes(),
             ann_slot_count: self.index_ids.len(),
             graph_nodes: self.graph.node_count(),
+            delta_size: self.delta_slots.len(),
         }
     }
 
@@ -2150,12 +2176,12 @@ impl TurboQuantEngine {
         let gamma = f32::from_le_bytes(
             rec[mse_len + qjl_len..mse_len + qjl_len + 4]
                 .try_into()
-                .unwrap(),
+                .expect("live_codes gamma field is always 4 bytes"),
         );
         let norm = f32::from_le_bytes(
             rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
                 .try_into()
-                .unwrap(),
+                .expect("live_codes norm field is always 4 bytes"),
         );
         (indices, qjl, gamma, norm)
     }
@@ -2169,13 +2195,17 @@ impl TurboQuantEngine {
         match self.manifest.rerank_precision {
             RerankPrecision::F16 => {
                 for i in 0..self.d {
-                    let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2].try_into().unwrap();
+                    let bytes: [u8; 2] = rec[i * 2..(i + 1) * 2]
+                        .try_into()
+                        .expect("vraw f16 record has 2 bytes per element");
                     out[i] = half::f16::from_le_bytes(bytes).to_f64();
                 }
             }
             RerankPrecision::F32 | RerankPrecision::Disabled => {
                 for i in 0..self.d {
-                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4].try_into().unwrap();
+                    let bytes: [u8; 4] = rec[i * 4..(i + 1) * 4]
+                        .try_into()
+                        .expect("vraw f32 record has 4 bytes per element");
                     out[i] = f32::from_le_bytes(bytes) as f64;
                 }
             }
@@ -2351,6 +2381,7 @@ impl TurboQuantEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !force
             && !self.index_ids_dirty
+            && !self.delta_slots_dirty
             && self.pending_manifest_updates < MANIFEST_SAVE_INTERVAL_OPS
         {
             return Ok(());
@@ -2360,6 +2391,18 @@ impl TurboQuantEngine {
             self.backend
                 .write(INDEX_IDS_FILE, &serialize_index_ids(&self.index_ids)?)?;
             self.index_ids_dirty = false;
+        }
+        if self.delta_slots_dirty {
+            let delta_bytes = serialize_index_ids(&self.delta_slots)?;
+            // Write to local_dir directly so load_delta_slots (which checks
+            // local_dir first) always sees fresh data, even when the backend
+            // is S3 whose local cache root may differ from local_dir.
+            std::fs::write(
+                Path::new(&self.local_dir).join(DELTA_IDS_FILE),
+                &delta_bytes,
+            )?;
+            self.backend.write(DELTA_IDS_FILE, &delta_bytes)?;
+            self.delta_slots_dirty = false;
         }
         self.save_manifest()?;
         self.pending_manifest_updates = 0;
@@ -2451,10 +2494,19 @@ impl TurboQuantEngine {
                 entry.gamma,
                 stored_norm,
             )?;
+            // Track new slot in delta overlay (same as batch path).
+            // index_ids and delta_slots are both kept sorted; use binary_search
+            // for O(log n) membership test instead of O(n) Vec::contains.
+            if !self.index_ids.is_empty() && self.index_ids.binary_search(&slot).is_err() {
+                if let Err(pos) = self.delta_slots.binary_search(&slot) {
+                    self.delta_slots.insert(pos, slot);
+                    self.delta_slots_dirty = true;
+                }
+            }
             self.live_save_raw_vector(slot, raw_for_rerank);
             self.metadata.put(slot, &meta)?;
         }
-        self.invalidate_index_state()?;
+        // Inserts do NOT invalidate the HNSW index — new slots go to delta_slots.
         self.manifest.vector_count = self.live_active_count() as u64;
         self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold {
@@ -2468,23 +2520,47 @@ impl TurboQuantEngine {
         items: Vec<BatchWriteItem>,
         mode: BatchWriteMode,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Build indexed_set once for the whole batch — index_ids never changes
+        // during ingest. Using a HashSet for O(1) per-item lookup.
+        let indexed_set: std::collections::HashSet<u32> = if self.index_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            self.index_ids.iter().copied().collect()
+        };
         for chunk in items.chunks(5000) {
             let mut wal_entries = Vec::with_capacity(chunk.len());
             let mut metadata_entries: Vec<(u32, VectorMetadata)> = Vec::with_capacity(chunk.len());
             // Normalize each vector to unit sphere before quantization so the
             // Lloyd-Max codebook (fitted to Beta-distribution unit-sphere coords) is valid.
             // Compute (unit_vec, norm) once to avoid a second O(d) pass per vector.
-            let unit_vecs_and_norms: Vec<(Vec<f32>, f32)> = chunk
-                .iter()
-                .map(|item| {
-                    let n = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    if n > 1e-10 {
-                        (item.vector.iter().map(|&x| x / n).collect(), n)
-                    } else {
-                        (item.vector.clone(), n)
-                    }
-                })
-                .collect();
+            // Use Rayon for large chunks; sequential for small ones to avoid
+            // thread park/unpark overhead (same threshold as quantize_batch).
+            const NORM_PAR_THRESHOLD: usize = 512;
+            let unit_vecs_and_norms: Vec<(Vec<f32>, f32)> = if chunk.len() > NORM_PAR_THRESHOLD {
+                chunk
+                    .par_iter()
+                    .map(|item| {
+                        let n = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        if n > 1e-10 {
+                            (item.vector.iter().map(|&x| x / n).collect(), n)
+                        } else {
+                            (item.vector.clone(), n)
+                        }
+                    })
+                    .collect()
+            } else {
+                chunk
+                    .iter()
+                    .map(|item| {
+                        let n = item.vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        if n > 1e-10 {
+                            (item.vector.iter().map(|&x| x / n).collect(), n)
+                        } else {
+                            (item.vector.clone(), n)
+                        }
+                    })
+                    .collect()
+            };
             let vec_refs: Vec<&[f32]> = unit_vecs_and_norms
                 .iter()
                 .map(|(v, _)| v.as_slice())
@@ -2538,9 +2614,25 @@ impl TurboQuantEngine {
             }
             self.wal.append_batch(&wal_entries, false)?;
             self.metadata.put_many(&metadata_entries)?;
+            // Track newly allocated slots in the delta overlay so ANN search finds
+            // them without a rebuild. indexed_set is built once before the chunk
+            // loop. delta_slots is kept sorted; binary_search gives O(log n).
+            if !indexed_set.is_empty() {
+                for (slot, _) in &metadata_entries {
+                    if !indexed_set.contains(slot) {
+                        if let Err(pos) = self.delta_slots.binary_search(slot) {
+                            self.delta_slots.insert(pos, *slot);
+                            self.delta_slots_dirty = true;
+                        }
+                    }
+                }
+            }
             self.wal_buffer.extend(wal_entries);
         }
-        self.invalidate_index_state()?;
+        // Inserts do NOT invalidate the HNSW index.  New slots are tracked in
+        // delta_slots (above); ANN search unions HNSW results with a brute-force
+        // pass over the delta.  The index is only invalidated on deletes or
+        // on explicit rebuild via create_index().
         self.manifest.vector_count = self.live_active_count() as u64;
         self.maybe_persist_state(false)?;
         if self.wal_buffer.len() >= self.wal_flush_threshold {
@@ -2630,5 +2722,22 @@ fn load_index_ids(local_dir: &str) -> Result<Vec<u32>, Box<dyn std::error::Error
     }
     Ok(Vec::new())
 }
+
+fn load_delta_slots(
+    local_dir: &str,
+    backend: &Arc<StorageBackend>,
+) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    let local = format!("{}/{}", local_dir, DELTA_IDS_FILE);
+    if Path::new(&local).exists() {
+        return Ok(serde_json::from_slice(&std::fs::read(&local)?)?);
+    }
+    // Fall back to backend (e.g. S3 restore on a fresh machine).
+    if let Ok(bytes) = backend.read(DELTA_IDS_FILE) {
+        std::fs::write(&local, &bytes)?;
+        return Ok(serde_json::from_slice(&bytes)?);
+    }
+    Ok(Vec::new())
+}
+
 #[cfg(test)]
 mod tests;

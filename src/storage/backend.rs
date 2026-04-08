@@ -32,6 +32,12 @@ pub trait StorageProvider: Send + Sync {
 
     /// Get file size.
     fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Rename (move) a file within the same storage root.
+    /// For local storage this is atomic. For S3 it is best-effort: the new key
+    /// is written before the old key is deleted, so a crash between those two
+    /// operations leaves both keys present (safe to retry).
+    fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Local filesystem storage provider.
@@ -125,6 +131,11 @@ impl StorageProvider for LocalProvider {
     fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let full = self.root.join(path);
         Ok(fs::metadata(full)?.len())
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        fs::rename(self.root.join(from), self.root.join(to))?;
+        Ok(())
     }
 }
 
@@ -290,6 +301,23 @@ impl StorageProvider for S3Provider {
         let meta = self.rt.block_on(self.store.head(&key))?;
         Ok(meta.size as u64)
     }
+
+    fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Crash-safe order for S3: server-side copy new key first (no RAM spike),
+        // delete old key second, then rename local cache. A crash between copy
+        // and delete leaves both keys present but no data is lost (safe to retry).
+        let from_cached = self.cached(from);
+        let to_cached = self.cached(to);
+        if let Some(parent) = to_cached.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let from_key = self.s3_key(from);
+        let to_key = self.s3_key(to);
+        self.rt.block_on(self.store.copy(&from_key, &to_key))?;
+        self.rt.block_on(self.store.delete(&from_key))?;
+        fs::rename(&from_cached, &to_cached)?;
+        Ok(())
+    }
 }
 
 /// A unified storage backend wrapper.
@@ -382,6 +410,14 @@ impl StorageBackend {
 
     pub fn size(&self, path: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         self.provider.size(path)
+    }
+
+    pub fn rename(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.provider.rename(from, to)
     }
 }
 
