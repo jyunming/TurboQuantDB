@@ -2393,11 +2393,15 @@ impl TurboQuantEngine {
             self.index_ids_dirty = false;
         }
         if self.delta_slots_dirty {
-            // Single write path via backend (mirrors index_ids_dirty handling).
-            // For LocalProvider this writes to local_dir; for S3Provider this
-            // writes to local cache and uploads to S3.
-            self.backend
-                .write(DELTA_IDS_FILE, &serialize_index_ids(&self.delta_slots)?)?;
+            let delta_bytes = serialize_index_ids(&self.delta_slots)?;
+            // Write to local_dir directly so load_delta_slots (which checks
+            // local_dir first) always sees fresh data, even when the backend
+            // is S3 whose local cache root may differ from local_dir.
+            std::fs::write(
+                Path::new(&self.local_dir).join(DELTA_IDS_FILE),
+                &delta_bytes,
+            )?;
+            self.backend.write(DELTA_IDS_FILE, &delta_bytes)?;
             self.delta_slots_dirty = false;
         }
         self.save_manifest()?;
@@ -2491,9 +2495,11 @@ impl TurboQuantEngine {
                 stored_norm,
             )?;
             // Track new slot in delta overlay (same as batch path).
-            if !self.index_ids.is_empty() {
-                if !self.index_ids.contains(&slot) && !self.delta_slots.contains(&slot) {
-                    self.delta_slots.push(slot);
+            // index_ids and delta_slots are both kept sorted; use binary_search
+            // for O(log n) membership test instead of O(n) Vec::contains.
+            if !self.index_ids.is_empty() && self.index_ids.binary_search(&slot).is_err() {
+                if let Err(pos) = self.delta_slots.binary_search(&slot) {
+                    self.delta_slots.insert(pos, slot);
                     self.delta_slots_dirty = true;
                 }
             }
@@ -2514,6 +2520,13 @@ impl TurboQuantEngine {
         items: Vec<BatchWriteItem>,
         mode: BatchWriteMode,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Build indexed_set once for the whole batch — index_ids never changes
+        // during ingest. Using a HashSet for O(1) per-item lookup.
+        let indexed_set: std::collections::HashSet<u32> = if self.index_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            self.index_ids.iter().copied().collect()
+        };
         for chunk in items.chunks(5000) {
             let mut wal_entries = Vec::with_capacity(chunk.len());
             let mut metadata_entries: Vec<(u32, VectorMetadata)> = Vec::with_capacity(chunk.len());
@@ -2601,16 +2614,16 @@ impl TurboQuantEngine {
             }
             self.wal.append_batch(&wal_entries, false)?;
             self.metadata.put_many(&metadata_entries)?;
-            // If an index exists, track newly allocated slots in the delta overlay so
-            // ANN search finds them without a rebuild.  Build the indexed set once per
-            // chunk (not per item) to keep this O(chunk + indexed) instead of O(chunk × indexed).
-            if !self.index_ids.is_empty() {
-                let indexed_set: std::collections::HashSet<u32> =
-                    self.index_ids.iter().copied().collect();
+            // Track newly allocated slots in the delta overlay so ANN search finds
+            // them without a rebuild. indexed_set is built once before the chunk
+            // loop. delta_slots is kept sorted; binary_search gives O(log n).
+            if !indexed_set.is_empty() {
                 for (slot, _) in &metadata_entries {
-                    if !indexed_set.contains(slot) && !self.delta_slots.contains(slot) {
-                        self.delta_slots.push(*slot);
-                        self.delta_slots_dirty = true;
+                    if !indexed_set.contains(slot) {
+                        if let Err(pos) = self.delta_slots.binary_search(slot) {
+                            self.delta_slots.insert(pos, *slot);
+                            self.delta_slots_dirty = true;
+                        }
                     }
                 }
             }

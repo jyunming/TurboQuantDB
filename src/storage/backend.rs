@@ -303,19 +303,17 @@ impl StorageProvider for S3Provider {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Crash-safe order for S3: upload new key first, delete old key second,
-        // then rename the local cache. A crash between S3 put and S3 delete
-        // leaves both keys present but no data is lost (safe to retry).
+        // Crash-safe order for S3: server-side copy new key first (no RAM spike),
+        // delete old key second, then rename local cache. A crash between copy
+        // and delete leaves both keys present but no data is lost (safe to retry).
         let from_cached = self.cached(from);
         let to_cached = self.cached(to);
         if let Some(parent) = to_cached.parent() {
             fs::create_dir_all(parent)?;
         }
-        let data = fs::read(&from_cached)?;
-        let to_key = self.s3_key(to);
-        let payload = object_store::PutPayload::from(data);
-        self.rt.block_on(self.store.put(&to_key, payload))?;
         let from_key = self.s3_key(from);
+        let to_key = self.s3_key(to);
+        self.rt.block_on(self.store.copy(&from_key, &to_key))?;
         self.rt.block_on(self.store.delete(&from_key))?;
         fs::rename(&from_cached, &to_cached)?;
         Ok(())

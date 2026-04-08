@@ -121,6 +121,7 @@ jobs:
     needs: [linux, windows, macos, sdist]
     permissions:
       contents: write
+      id-token: write   # required for PyPI Trusted Publisher (OIDC)
     steps:
       - uses: actions/checkout@v4
         with:
