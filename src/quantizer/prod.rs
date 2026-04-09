@@ -52,6 +52,23 @@ impl ProdQuantizer {
         }
     }
 
+    /// Exact-paper mode: QR-decomposed orthogonal rotation (MSE) + dense N(0,1) Gaussian
+    /// projection (QJL), as specified in arXiv:2504.19874.
+    /// O(d²) quantize/score time and O(d²) storage vs O(d log d) / O(d) for SRHT.
+    pub fn new_exact(d: usize, b: usize, seed: u64) -> Self {
+        assert!(b >= 2, "ProdQuantizer requires at least b=2");
+        let mse_quantizer = MseQuantizer::new_exact(d, b - 1, seed);
+        let qjl_quantizer = QjlQuantizer::new_exact(d, seed ^ 0xdeadbeef);
+        Self {
+            d,
+            n: d, // no padding in exact mode
+            b,
+            mse_quantizer,
+            qjl_quantizer,
+            fast_mode: false,
+        }
+    }
+
     /// Fast-path: skips the QJL residual quantization step. Ingest is ~30% faster;
     /// approximate scores omit the residual correction (slightly lower recall).
     pub fn new_srht(d: usize, b: usize, seed: u64) -> Self {
