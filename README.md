@@ -34,32 +34,17 @@ TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two qu
 - **`fast_mode=True` (default)** — All `b` bits go to the MSE codebook. No QJL residual is stored or scored. This is the recommended mode for RAG and ANN search: it matches the bit allocation in the paper's Figure 5 and achieves the paper's recall numbers.
 - **`fast_mode=False`** — Splits the budget: `b-1` bits to MSE and 1 bit to a QJL Johnson-Lindenstrauss residual sketch. The QJL gives an *unbiased inner-product estimator*, useful for LLM KV-cache attention scoring where absolute inner-product accuracy matters more than ranking order. For RAG/ANN (where only rank order matters), it reduces recall by taking budget away from MSE.
 
-If you do not set `quantizer_type`, you are using the default SRHT family.
+If you do not set `quantizer_type`, you get the default `"dense"` mode.
 
 ---
 
 ## Installation
 
-### Prerequisites
-
-- [Rust](https://rustup.rs/) stable toolchain
-- Python 3.10+
-- C++ compiler: Visual Studio Build Tools (Windows) · `xcode-select --install` (macOS) · `build-essential` (Linux)
-
-### Build from source
-
-```bash
-python -m venv venv
-source venv/bin/activate        # Windows: .\venv\Scripts\activate
-pip install maturin
-maturin develop --release
-```
-
-### Install pre-built wheel
-
 ```bash
 pip install tqdb
 ```
+
+Building from source (Rust toolchain required): see [`DEVELOPMENT.md`](DEVELOPMENT.md).
 
 ---
 
@@ -431,40 +416,7 @@ The brute-force search path (`_use_ann=False`, the default) matches the paper's 
 
 ## Server Mode
 
-> **Status: experimental.** The server crate compiles and the core endpoints work, but it has not been hardened for production use. The embedded library (`tqdb` Python package, `from tqdb import Database`) is the primary supported interface.
-
-An optional Axum-based HTTP server is available in `server/` for multi-tenant deployments. It adds API key authentication, quota enforcement, and async job management (compaction, index building, snapshots).
-
-```bash
-cd server && cargo build --release
-TQ_SERVER_ADDR=0.0.0.0:8080 TQ_LOCAL_ROOT=./data ./target/release/tqdb-server
-```
-
-See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/server/README.md) for the full endpoint reference. Key env vars:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TQ_SERVER_ADDR` | `127.0.0.1:8080` | Bind address |
-| `TQ_LOCAL_ROOT` | `./data` | Storage root |
-| `TQ_JOB_WORKERS` | `2` | Async job thread count |
-
----
-
-## Performance Roadmap
-
-The current implementation uses SIMD-accelerated scoring (AVX2) for the brute-force search inner loop, the MSE centroid scan,
-and the QJL bit-unpack inner product. The FWHT transform (legacy SRHT path) also has an AVX2 fast path.
-
-**GPU acceleration** — batch ingest would benefit from cuBLAS GEMM (~3–5× for
-large batches on high-end cards). The ANN search path is memory-bound, not
-compute-bound, so GPU benefit there is minimal; the bottleneck is random cache
-misses during HNSW graph traversal rather than floating-point throughput.
-
-**AVX-512 codebook scan** — on modern Intel CPUs the MSE centroid lookup can be
-vectorised 2× wider with AVX-512, potentially halving scoring latency per batch.
-
-**Persistent HNSW** — incremental graph updates (no full rebuild after each ingest
-batch) would allow streaming use cases without periodic `create_index()` calls.
+An optional Axum HTTP server in `server/` adds multi-tenancy, RBAC, and async jobs. See [`server/README.md`](https://github.com/jyunming/TurboQuantDB/blob/main/server/README.md) for setup and endpoint reference.
 
 ---
 

@@ -79,7 +79,7 @@ TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two qu
 
 ## Recommended Presets
 
-Unless stated otherwise, the presets below use the default `fast_mode=True` (all bits → MSE, paper-aligned) and `quantizer_type=None/"srht"` path.
+Unless stated otherwise, the presets below use the default `fast_mode=True` (all bits → MSE, paper-aligned) and `quantizer_type=None/"dense"` path.
 
 ### High Quality — float16 rerank, highest recall
 
@@ -100,14 +100,14 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 # 96.2% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~14ms p50 (ANN) / ~48ms (brute+dequant)
 ```
 
-### Paper-faithful exact mode — research / comparison
+### Paper-faithful dense mode — research / comparison
 
 ```python
 db = Database.open(path, dimension=DIM, bits=4, rerank=True, quantizer_type="dense")
-results = db.search(query, top_k=10, _use_ann=False)
+results = db.search(query, top_k=10)
 ```
 
-Use this when you want the QR + Gaussian path from the paper. Expect slower ingest and larger transform state at high dimensions.
+This is the default. Use `quantizer_type="srht"` if you need faster ingest at high d and can accept the small recall trade-off.
 
 ### Fast Build — ingest speed is priority
 
@@ -118,7 +118,7 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 # ~96% Recall@10 at 100k×1536  |  108 MB disk  |  8ms p50
 ```
 
-*Benchmarked at 100,000 vectors, dim=1536, DBpedia OpenAI3 embeddings, brute-force ground truth. Unless a preset explicitly sets `quantizer_type="dense"`, these figures refer to the default SRHT family.*
+*Benchmarked at 100,000 vectors, dim=1536, DBpedia OpenAI3 embeddings, brute-force ground truth. Default mode is `quantizer_type="dense"` (Haar-uniform QR). Use `quantizer_type="srht"` for streaming/frequent-ingest workloads.*
 
 ---
 
@@ -219,7 +219,7 @@ results = db.search(
     query,                       # np.ndarray (float32) or list[float]
     top_k=10,                    # int
     filter=None,                 # dict | None  (see Metadata Filtering below)
-    _use_ann=False,              # bool — engage HNSW index (requires create_index() first)
+    _use_ann=None,               # None=auto, True=force ANN, False=force brute-force
     ann_search_list_size=None,   # int | None — HNSW ef_search (default: max_degree × 2)
     include=None,                # list[str] | None — fields to return; default all
                                  #   valid values: "id", "score", "metadata", "document"
@@ -227,7 +227,7 @@ results = db.search(
 # Returns list of dicts: {"id": str, "score": float, "metadata": dict, "document": str | None}
 ```
 
-The default (`_use_ann=False`) always uses exhaustive brute-force scoring — highest recall, linear scan time. Pair brute-force with `quantizer_type="dense"` when you want the closest paper-faithful path in this repo; leave `quantizer_type` unset to use the default SRHT family. Pass `_use_ann=True` to use the HNSW graph index for sub-linear approximate search (requires `create_index()` to have been called first; lower recall than brute-force).
+With `_use_ann=None` (default), the planner auto-selects: ANN if an index exists, N ≥ 10k, and delta < 20% of N; otherwise brute-force. Pass `_use_ann=True` to force ANN (requires `create_index()` first) or `_use_ann=False` to force brute-force.
 
 `ann_search_list_size` trades recall for latency — higher values find better results but take longer. Values between 64 and 256 cover the practical range.
 
@@ -240,7 +240,7 @@ all_results = db.query(
     query_embeddings,            # np.ndarray shape (N, D), float32 or float64
     n_results=10,                # int — results per query
     where_filter=None,           # dict | None
-    _use_ann=False,              # bool — engage HNSW index (same semantics as search())
+    _use_ann=None,               # None=auto, True=force ANN, False=force brute-force (same semantics as search())
     ann_search_list_size=None,
 )
 # Returns list[list[dict]] — one inner list per query vector
