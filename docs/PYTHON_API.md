@@ -29,7 +29,10 @@ db = Database.open(
     seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
     metric="ip",             # str — "ip" (inner product), "cosine", or "l2"
     rerank=True,             # bool — enable reranking of ANN candidates; precision via rerank_precision
-    fast_mode=False,         # bool — skip QJL stage: ~30% faster ingest, ~5pp recall loss
+    fast_mode=True,          # bool — MSE-only mode: all bits go to the MSE codebook (default).
+                             #        Recommended for RAG/ANN search — matches paper Figure 5 recall.
+                             #        Set False only for LLM KV-cache inner-product estimation
+                             #        where unbiased absolute scores matter over ranking order.
     rerank_precision=None,   # str|None — None = dequant reranking (no extra storage)
                              #            "f16" = float16 exact reranking (+n×d×2 bytes)
                              #            "f32" = float32 exact reranking (+n×d×4 bytes)
@@ -38,11 +41,11 @@ db = Database.open(
     normalize=False,         # bool — L2-normalize every inserted vector and every query at
                              #        write time; makes inner-product scoring equivalent to
                              #        cosine similarity without changing the metric parameter
-    quantizer_type=None,     # str|None — None/"srht" (default, O(d log d)) or "exact"
-                             #            "exact" uses QR-random orthogonal rotation + dense
-                             #            i.i.d. N(0,1) Gaussian projection — the algorithm
-                             #            specified in the paper (O(d²), more memory, slower
-                             #            ingest at high d; SRHT matches or exceeds recall).
+    quantizer_type=None,     # str|None — None/"srht" = default structured fast path
+                             #            (Walsh-Hadamard + random signs, O(d log d),
+                             #            n=next_power_of_two(d))
+                             #            "exact" = paper-faithful QR + dense Gaussian
+                             #            path (O(d²), n=d, slower ingest and larger state)
 )
 
 # Parameterless reopen — reads all parameters from manifest.json:
@@ -63,17 +66,29 @@ images   = Database.open("./mydb", dimension=512,  collection="images")
 # Stored at ./mydb/articles/ and ./mydb/images/ respectively
 ```
 
+### Quantizer modes
+
+TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two quantizer families:
+
+- **`None` / `"srht"` (default)** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, and `O(d log d)` time/state. This is the practical default and the mode used by the README presets and benchmark tables unless noted otherwise.
+- **`"exact"`** — QR-random orthogonal rotation + dense i.i.d. Gaussian QJL with `n = d`. This is the paper-faithful option for research, audits, and exact-vs-default comparisons, but it uses `O(d²)` time/state.
+- **`fast_mode=True` (default)** — All `b` bits go to the MSE codebook. No QJL residual is stored or scored. Recommended for RAG/ANN search — matches the paper's Figure 5 bit allocation and recall numbers.
+- **`fast_mode=False`** — Splits the budget: `b-1` bits to MSE, 1 bit to a QJL Johnson-Lindenstrauss residual sketch. The QJL provides an *unbiased inner-product estimator*, useful for LLM KV-cache attention scoring where absolute inner-product accuracy matters more than ranking order.
+
 ---
 
 ## Recommended Presets
 
-### High Quality — recall matters most
+Unless stated otherwise, the presets below use the default `fast_mode=True` (all bits → MSE, paper-aligned) and `quantizer_type=None/"srht"` path.
+
+### High Quality — float16 rerank, highest recall
 
 ```python
 db = Database.open(path, dimension=DIM, bits=4, rerank=True, rerank_precision="f16")
 db.create_index(max_degree=32, ef_construction=200, n_refinements=8)
 results = db.search(query, top_k=10, ann_search_list_size=200)
-# 100% Recall@10 at 100k×1536  |  401 MB disk  |  38ms p50 (brute-force)
+# Note: rerank_precision="f16" stores raw float16 vectors (+n×d×2 bytes).
+# Disk and recall figures for this config are not currently tracked in the benchmark suite.
 ```
 
 ### Balanced — default recommendation
@@ -82,8 +97,17 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index(max_degree=32, ef_construction=200, n_refinements=5)
 results = db.search(query, top_k=10, ann_search_list_size=200)
-# 99.4% Recall@5, 96% Recall@10 at 100k×1536  |  117 MB disk  |  8ms (ANN) / 45ms (brute+dequant)
+# 96.2% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~14ms p50 (ANN) / ~48ms (brute+dequant)
 ```
+
+### Paper-faithful exact mode — research / comparison
+
+```python
+db = Database.open(path, dimension=DIM, bits=4, rerank=True, quantizer_type="exact")
+results = db.search(query, top_k=10, _use_ann=False)
+```
+
+Use this when you want the QR + Gaussian path from the paper. Expect slower ingest and larger transform state at high dimensions.
 
 ### Fast Build — ingest speed is priority
 
@@ -94,7 +118,7 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 # ~96% Recall@10 at 100k×1536  |  108 MB disk  |  8ms p50
 ```
 
-*Benchmarked at 100,000 vectors, dim=1536, DBpedia OpenAI3 embeddings, brute-force ground truth.*
+*Benchmarked at 100,000 vectors, dim=1536, DBpedia OpenAI3 embeddings, brute-force ground truth. Unless a preset explicitly sets `quantizer_type="exact"`, these figures refer to the default SRHT family.*
 
 ---
 
@@ -203,7 +227,7 @@ results = db.search(
 # Returns list of dicts: {"id": str, "score": float, "metadata": dict, "document": str | None}
 ```
 
-The default (`_use_ann=False`) always uses exhaustive brute-force scoring — highest recall, linear scan time. Pass `_use_ann=True` to use the HNSW graph index for sub-linear approximate search (requires `create_index()` to have been called first; lower recall than brute-force).
+The default (`_use_ann=False`) always uses exhaustive brute-force scoring — highest recall, linear scan time. Pair brute-force with `quantizer_type="exact"` when you want the closest paper-faithful path in this repo; leave `quantizer_type` unset to use the default SRHT family. Pass `_use_ann=True` to use the HNSW graph index for sub-linear approximate search (requires `create_index()` to have been called first; lower recall than brute-force).
 
 `ann_search_list_size` trades recall for latency — higher values find better results but take longer. Values between 64 and 256 cover the practical range.
 

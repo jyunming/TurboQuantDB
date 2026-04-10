@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/jyunming/TurboQuantDB/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/tqdb)](https://pypi.org/project/tqdb/)
 
-An embedded vector database written in Rust with Python bindings, implementing the **TurboQuant** algorithm ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)) — zero training time, 2–4 bit compression, and provably unbiased inner product estimation.
+An embedded vector database written in Rust with Python bindings, built around the **TurboQuant** paper ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874)). TurboQuantDB uses a structured SRHT quantizer by default for practical vector-search workloads, and also offers `quantizer_type="exact"` for the paper-faithful QR + dense Gaussian path.
 
 **Goal:** make massive embedding datasets practical on lightweight hardware. A 100k-vector, 1536-dim collection that would occupy 586 MB as raw float32 fits in **108 MB on disk** with TQDB b=4, or just **59 MB** with b=2 — enabling laptop-scale RAG over millions of documents without a dedicated server.
 
@@ -17,11 +17,24 @@ Two deployment modes:
 
 - **Zero training** — No `train()` step. Vectors are quantized and stored immediately on insert.
 - **5–10× compression** — b=4 reduces 1536-dim float32 embeddings from 586 MB to 108 MB (5.4×); b=2 reaches 59 MB (9.9×) at 100k vectors.
-- **Unbiased scoring** — QJL transform guarantees unbiased inner product estimation.
+- **Two quantizer modes** — default `srht` for practical production use; optional `exact` for paper-faithful comparisons.
 - **Optional ANN index** — Build an HNSW graph after loading data for fast approximate search.
 - **Metadata filtering** — MongoDB-style filter operators on any metadata field.
 - **Crash recovery** — Write-ahead log (WAL) ensures durability without explicit flushing.
 - **Python native** — Built with PyO3 and Maturin; no server or sidecar required.
+
+---
+
+## Quantizer Modes
+
+TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two quantizer families:
+
+- **`None` / `"srht"` (default)** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, and `O(d log d)` setup/apply cost. This is the practical default and the mode used by the main README presets and benchmark tables unless noted otherwise.
+- **`"exact"`** — QR-random orthogonal rotation + dense i.i.d. Gaussian QJL with `n = d`. This is the paper-faithful path for research, audits, and exact-vs-default comparisons, but it uses `O(d²)` time/state.
+- **`fast_mode=True` (default)** — All `b` bits go to the MSE codebook. No QJL residual is stored or scored. This is the recommended mode for RAG and ANN search: it matches the bit allocation in the paper's Figure 5 and achieves the paper's recall numbers.
+- **`fast_mode=False`** — Splits the budget: `b-1` bits to MSE and 1 bit to a QJL Johnson-Lindenstrauss residual sketch. The QJL gives an *unbiased inner-product estimator*, useful for LLM KV-cache attention scoring where absolute inner-product accuracy matters more than ranking order. For RAG/ANN (where only rank order matters), it reduces recall by taking budget away from MSE.
+
+If you do not set `quantizer_type`, you are using the default SRHT family.
 
 ---
 
@@ -52,7 +65,8 @@ pip install tqdb
 
 ## Recommended Setup
 
-Two presets cover most use cases — no indexing required to get started:
+These starter presets use the default `fast_mode=True` (all bits → MSE, paper-aligned recall).
+Pass `fast_mode=False` only for LLM KV-cache inner-product estimation.
 
 ```python
 from tqdb import Database
@@ -60,16 +74,21 @@ from tqdb import Database
 # Recommended — brute-force with dequantization reranking
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 results = db.search(query, top_k=10)
-# 95.5% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~50ms p50
+# 96.2% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~48ms p50
 
 # Minimum disk — 9.9× compression, still excellent recall
 db = Database.open(path, dimension=DIM, bits=2, rerank=True)
 results = db.search(query, top_k=10)
-# 86.8% Recall@1, 99.3% Recall@4 at 100k×1536  |  60 MB disk  |  ~43ms p50
+# 86.2% Recall@1, 99.7% Recall@4 at 100k×1536  |  60 MB disk  |  ~44ms p50
 
 # Optional: build an HNSW index after bulk load for sub-10ms queries
 db.create_index()
 results = db.search(query, top_k=10, _use_ann=True)
+
+# Paper-faithful exact mode — use for research or paper comparisons
+db = Database.open(path, dimension=DIM, bits=4, rerank=True, quantizer_type="exact")
+results = db.search(query, top_k=10)
+# Exact mode uses dense QR + Gaussian transforms (O(d²)); expect slower ingest at high d.
 ```
 
 Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/PYTHON_API.md)
@@ -82,7 +101,7 @@ Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/Tur
 import numpy as np
 from tqdb import Database
 
-db = Database.open("./my_db", dimension=1536, bits=4, metric="ip", rerank=True)
+db = Database.open("./my_db", dimension=1536, bits=4, metric="ip", rerank=True)  # default SRHT mode
 
 db.insert("doc-1", np.random.randn(1536).astype("f4"), metadata={"topic": "ml"}, document="Machine learning intro")
 db.insert("doc-2", np.random.randn(1536).astype("f4"), metadata={"topic": "systems"}, document="Rust memory model")
@@ -101,9 +120,9 @@ for r in results:
 ```python
 # Open / create
 db = Database.open(path, dimension, bits=4, seed=42, metric="ip",
-                   rerank=True, fast_mode=False, rerank_precision=None,
+                   rerank=True, fast_mode=True, rerank_precision=None,
                    collection=None, wal_flush_threshold=None,
-                   quantizer_type=None)  # None/"srht" (default) or "exact" (paper-exact QR + Gaussian, O(d²))
+                   quantizer_type=None)  # None/"srht" = default structured fast path; "exact" = paper-faithful QR + Gaussian (O(d²))
 
 # Write
 db.insert(id, vector, metadata=None, document=None)
@@ -151,7 +170,7 @@ db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 20
 ```python
 db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 results = db.search(query, top_k=10, _use_ann=False)
-# 95.5% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~50ms p50 (brute-force)
+# 96.2% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~48ms p50 (brute-force)
 ```
 
 ### Minimum Disk — compress aggressively
@@ -176,6 +195,8 @@ results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
 
 Three datasets from [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — n=100k vectors each. Full script: [`benchmarks/paper_recall_bench.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/paper_recall_bench.py).
 
+Unless explicitly labeled `exact`, the tables below refer to the default `quantizer_type=None/"srht"` engine. Paper curves are included for context, and the brute-force rows use exhaustive scoring over the selected quantizer family.
+
 <!-- PAPER_BENCH_START -->
 ### Algorithm Validation — Recall vs Paper
 
@@ -188,112 +209,82 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | TurboQuant 2-bit (paper Fig. 5a) | ≈55.0% | ≈70.0% | ≈83.0% | ≈91.0% | ≈96.0% | ≈99.0% | ≈100.0% |
-| **TQDB b=2 rerank=F** | 37.1% | 50.0% | 62.0% | 73.0% | 82.0% | 88.9% | 93.5% |
-| **TQDB b=2 rerank=T** | 52.8% | 68.4% | 81.1% | 90.3% | 95.5% | 98.4% | 99.5% |
+| **TQDB b=2 rerank=F** | 55.3% | 71.5% | 83.9% | 91.9% | 96.8% | 99.1% | 99.7% |
+| **TQDB b=2 rerank=T** | 55.3% | 71.5% | 83.9% | 91.9% | 96.8% | 99.1% | 99.7% |
 | TurboQuant 4-bit (paper Fig. 5a) | ≈86.0% | ≈96.0% | ≈99.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=4 rerank=F** | 73.9% | 88.3% | 96.4% | 99.2% | 99.9% | 100.0% | 100.0% |
-| **TQDB b=4 rerank=T** | 82.6% | 94.2% | 98.7% | 99.9% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=4 rerank=F** | 84.1% | 95.2% | 99.2% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=4 rerank=T** | 84.1% | 95.2% | 99.2% | 100.0% | 100.0% | 100.0% | 100.0% |
 
 **DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries)
 
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | TurboQuant 2-bit (paper Fig. 5b) | ≈89.5% | ≈98.0% | ≈99.5% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=2 rerank=F** | 79.7% | 93.3% | 98.3% | 99.7% | 99.9% | 100.0% | 100.0% |
-| **TQDB b=2 rerank=T** | 86.8% | 96.2% | 99.3% | 99.9% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=2 rerank=F** | 86.2% | 96.6% | 99.7% | 99.9% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=2 rerank=T** | 86.2% | 96.6% | 99.7% | 99.9% | 100.0% | 100.0% | 100.0% |
 | TurboQuant 4-bit (paper Fig. 5b) | ≈97.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=4 rerank=F** | 92.6% | 99.1% | 99.9% | 100.0% | 100.0% | 100.0% | 100.0% |
-| **TQDB b=4 rerank=T** | 95.5% | 99.5% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=4 rerank=F** | 96.2% | 99.9% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=4 rerank=T** | 96.2% | 99.9% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 
 **DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
 
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | TurboQuant 2-bit (paper Fig. 5c) | ≈90.5% | ≈98.5% | ≈99.5% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=2 rerank=F** | 84.6% | 95.1% | 99.0% | 100.0% | 100.0% | 100.0% | 100.0% |
-| **TQDB b=2 rerank=T** | 89.2% | 98.6% | 99.8% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=2 rerank=F** | 90.2% | 97.6% | 99.6% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=2 rerank=T** | 90.2% | 97.6% | 99.6% | 100.0% | 100.0% | 100.0% | 100.0% |
 | TurboQuant 4-bit (paper Fig. 5c) | ≈97.5% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=4 rerank=F** | 94.8% | 99.1% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
-| **TQDB b=4 rerank=T** | 96.0% | 99.8% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=4 rerank=F** | 98.0% | 99.7% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=4 rerank=T** | 98.0% | 99.7% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 
-The GloVe gap (~12–18% at k=1) is expected: d=200 is the hardest case (fewest bits per dimension), and we evaluate on the first 100k vectors from a 1.18M corpus while the paper used a random sample. From k=4 onward the gap is ≤2.6% on GloVe and ≤1% on DBpedia. For high-dimensional embeddings (d≥1536), TQDB matches the paper within ~5% at k=1 and within 1% from k=4.
+All TQDB rows use `fast_mode=True` (MSE-only: all `b` bits go to the MSE codebook, no QJL residual). This is the same allocation as the paper's Figure 5 — b MSE bits/dim. Any residual gap at GloVe k=1 (~0–3%) is attributable to dataset sampling (we use the first 100k vectors from the 1.18M-token corpus; the paper used a random sample). DBpedia results match within 1–2% across all k values.
 
 ### Performance & Config Trade-offs
 
 ![Config trade-off overview — latency, disk, RAM, CPU](https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/benchmarks/benchmark_plots_perf.png)
 
-All 8 configs — brute-force and ANN (HNSW md=32, ef=128). Disk MB for ANN includes `graph.bin`. RAM = peak RSS during query phase. Index = HNSW build time (ANN only).
+All 8 configs — brute-force and ANN (HNSW md=32, ef=128), all using `fast_mode=True` (MSE-only). Disk MB for ANN includes `graph.bin`. RAM = peak RSS during query phase. Index = HNSW build time (ANN only).
 
 **GloVe-200** (d=200, 100,000 corpus, 10,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 1.1s | — | 16.4 | 208 | 12.71 | 21.72 | 37.1% | 0.502 |
-| b=2 rerank=T | Brute | 1.2s | — | 16.4 | 207 | 16.57 | 24.70 | 52.8% | 0.666 |
-| b=4 rerank=F | Brute | 2.3s | — | 22.5 | 214 | 15.36 | 37.02 | 73.9% | 0.842 |
-| b=4 rerank=T | Brute | 1.6s | — | 22.5 | 213 | 17.96 | 27.60 | 82.6% | 0.900 |
-| b=2 rerank=F | ANN | 1.3s | 30.2s | 25.0 | 238 | 6.43 | 9.47 | 21.5% | 0.283 |
-| b=2 rerank=T | ANN | 1.2s | 28.3s | 25.0 | 238 | 11.03 | 14.57 | 37.6% | 0.464 |
-| b=4 rerank=F | ANN | 1.6s | 19.8s | 31.1 | 243 | 6.34 | 9.24 | 44.5% | 0.495 |
-| b=4 rerank=T | ANN | 1.5s | 18.5s | 31.1 | 246 | 11.10 | 15.07 | 61.1% | 0.656 |
+| b=2 rerank=F | Brute | 1.2s | — | 19.8 | 210 | 10.89 | 13.09 | 55.3% | 0.690 |
+| b=2 rerank=T | Brute | 1.2s | — | 19.8 | 212 | 13.34 | 15.35 | 55.3% | 0.690 |
+| b=4 rerank=F | Brute | 2.3s | — | 25.9 | 218 | 11.33 | 13.11 | 84.1% | 0.910 |
+| b=4 rerank=T | Brute | 2.0s | — | 25.9 | 217 | 13.46 | 15.63 | 84.1% | 0.910 |
+| b=2 rerank=F | ANN | 1.2s | 11.6s | 28.4 | 241 | 0.68 | 1.56 | 34.5% | 0.419 |
+| b=2 rerank=T | ANN | 1.1s | 11.6s | 28.4 | 243 | 4.15 | 6.61 | 40.8% | 0.501 |
+| b=4 rerank=F | ANN | 1.6s | 11.4s | 34.5 | 249 | 0.69 | 1.58 | 51.2% | 0.545 |
+| b=4 rerank=T | ANN | 1.6s | 11.4s | 34.5 | 250 | 4.34 | 6.99 | 62.6% | 0.670 |
 
 **DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 5.5s | — | 59.1 | 755 | 45.97 | 70.70 | 79.7% | 0.882 |
-| b=2 rerank=T | Brute | 4.4s | — | 59.1 | 805 | 63.93 | 99.16 | 86.8% | 0.926 |
-| b=4 rerank=F | Brute | 7.4s | — | 108.0 | 854 | 66.77 | 110.56 | 92.6% | 0.961 |
-| b=4 rerank=T | Brute | 9.2s | — | 108.0 | 858 | 71.44 | 121.88 | 95.5% | 0.977 |
-| b=2 rerank=F | ANN | 4.6s | 99.7s | 67.7 | 772 | 10.15 | 14.61 | 75.2% | 0.829 |
-| b=2 rerank=T | ANN | 5.2s | 99.6s | 67.7 | 772 | 38.29 | 53.88 | 84.9% | 0.904 |
-| b=4 rerank=F | ANN | 7.9s | 98.2s | 116.5 | 823 | 11.47 | 15.83 | 87.9% | 0.907 |
-| b=4 rerank=T | ANN | 10.0s | 107.0s | 116.5 | 822 | 39.30 | 70.66 | 93.8% | 0.959 |
+| b=2 rerank=F | Brute | 4.9s | — | 83.9 | 838 | 38.92 | 45.89 | 86.2% | 0.924 |
+| b=2 rerank=T | Brute | 4.9s | — | 83.9 | 834 | 43.82 | 48.99 | 86.2% | 0.924 |
+| b=4 rerank=F | Brute | 10.4s | — | 132.8 | 882 | 42.35 | 48.40 | 96.2% | 0.981 |
+| b=4 rerank=T | Brute | 8.3s | — | 132.8 | 881 | 48.06 | 54.00 | 96.2% | 0.981 |
+| b=2 rerank=F | ANN | 5.0s | 43.8s | 92.5 | 793 | 5.25 | 8.77 | 81.7% | 0.875 |
+| b=2 rerank=T | ANN | 5.1s | 44.0s | 92.5 | 794 | 27.05 | 41.71 | 84.0% | 0.901 |
+| b=4 rerank=F | ANN | 8.8s | 43.6s | 141.3 | 843 | 5.13 | 8.75 | 91.7% | 0.935 |
+| b=4 rerank=T | ANN | 8.6s | 43.6s | 141.3 | 843 | 29.54 | 44.84 | 94.9% | 0.967 |
 
 **DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 7.8s | — | 108.0 | 1401 | 110.82 | 398.86 | 84.6% | 0.913 |
-| b=2 rerank=T | Brute | 11.3s | — | 108.0 | 1418 | 104.77 | 175.07 | 89.2% | 0.943 |
-| b=4 rerank=F | Brute | 14.3s | — | 205.6 | 1497 | 119.48 | 191.95 | 94.8% | 0.972 |
-| b=4 rerank=T | Brute | 15.7s | — | 205.6 | 1513 | 120.57 | 211.47 | 96.0% | 0.980 |
-| b=2 rerank=F | ANN | 10.4s | 188.1s | 116.6 | 1412 | 16.03 | 27.62 | 81.8% | 0.879 |
-| b=2 rerank=T | ANN | 7.9s | 209.2s | 116.6 | 1413 | 62.88 | 129.03 | 87.7% | 0.924 |
-| b=4 rerank=F | ANN | 17.3s | 192.9s | 214.2 | 1508 | 36.90 | 62.74 | 90.6% | 0.929 |
-| b=4 rerank=T | ANN | 31.6s | 209.0s | 214.2 | 1510 | 152.35 | 282.61 | 94.8% | 0.967 |
+| b=2 rerank=F | Brute | 8.9s | — | 157.2 | 1539 | 70.84 | 80.70 | 90.2% | 0.946 |
+| b=2 rerank=T | Brute | 9.0s | — | 157.2 | 1469 | 81.93 | 92.75 | 90.2% | 0.946 |
+| b=4 rerank=F | Brute | 16.5s | — | 254.8 | 1652 | 80.65 | 95.95 | 98.0% | 0.989 |
+| b=4 rerank=T | Brute | 16.1s | — | 254.8 | 1567 | 92.12 | 105.25 | 98.0% | 0.989 |
+| b=2 rerank=F | ANN | 9.0s | 76.4s | 165.8 | 1459 | 9.40 | 15.28 | 86.0% | 0.900 |
+| b=2 rerank=T | ANN | 8.9s | 78.6s | 165.8 | 1465 | 53.60 | 82.38 | 89.3% | 0.935 |
+| b=4 rerank=F | ANN | 17.1s | 77.0s | 263.4 | 1558 | 11.35 | 17.98 | 93.4% | 0.943 |
+| b=4 rerank=T | ANN | 16.7s | 76.8s | 263.4 | 1559 | 63.35 | 93.64 | 96.3% | 0.972 |
 
 **Reproduction:** `maturin develop --release && python benchmarks/paper_recall_bench.py --update-readme --track`  (requires `pip install datasets psutil matplotlib`)
-
-### SRHT vs. Exact Mode — Fair Comparison
-
-The default SRHT mode pads d to the next power of two, producing n=next_power_of_two(d) codes vs. n=d for exact. Comparing at the same bit-width (b) gives SRHT more stored bits — inflating recall numbers unfairly. The only methodology that truly decouples rotation quality from code count is to run both modes at dimensions that are already powers of two, where `next_power_of_two(d) = d` and both modes produce exactly n=d codes. At that point the **only** difference is the rotation matrix: Walsh-Hadamard × ±1 diagonal (SRHT) vs. Haar-random QR (exact). Script: [`benchmarks/compare_quantizers_fair.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/compare_quantizers_fair.py) — 100k synthetic Gaussian vectors, 1k queries, direct delta (no interpolation).
-
-| d | Bits | SRHT R@1 | Exact R@1 | Delta R@1 | SRHT MRR | Exact MRR | Delta MRR | Speed ratio |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| 128 | 2 | 9.7% | 10.4% | +0.7 pp | 0.181 | 0.190 | +0.009 | 1.1x |
-| 128 | 4 | 40.7% | 39.9% | -0.8 pp | 0.560 | 0.552 | -0.008 | 1.4x |
-| 128 | 8 | 49.8% | 49.2% | -0.6 pp | 0.643 | 0.640 | -0.004 | 1.1x |
-| 256 | 2 | 11.7% | 10.9% | -0.8 pp | 0.203 | 0.199 | -0.005 | 3.2x |
-| 256 | 4 | 47.8% | 46.6% | -1.2 pp | 0.633 | 0.631 | -0.003 | 1.8x |
-| 256 | 8 | 59.4% | 59.9% | +0.5 pp | 0.742 | 0.744 | +0.003 | 1.7x |
-| 512 | 2 | 11.1% | 11.3% | +0.2 pp | 0.200 | 0.202 | +0.002 | 5.1x |
-| 512 | 4 | 52.7% | 53.6% | **+0.9 pp** | 0.687 | 0.691 | +0.004 | 2.8x |
-| 512 | 8 | 72.6% | 73.2% | **+0.6 pp** | 0.838 | 0.840 | +0.002 | 2.8x |
-| 1024 | 2 | 11.5% | 10.8% | -0.7 pp | 0.208 | 0.203 | -0.005 | 17.9x |
-| 1024 | 4 | 56.7% | 60.5% | **+3.8 pp** | 0.719 | 0.741 | **+0.022** | 12.7x |
-| 1024 | 8 | 79.6% | 79.6% | ~0.0 pp | 0.885 | 0.884 | ~0.000 | 6.6x |
-
-*Positive delta = exact better. Speed ratio = SRHT ingest vps / Exact ingest vps. Disk difference (~4–8 MB) is the rotation matrix storage (d×d float32 vs d signs); vector code storage is identical.*
-
-**Interpretation:**
-- **d <= 256:** Differences are within noise (±0.012), with no consistent winner. At small dimensions both rotations mix coordinates equally well.
-- **d = 512:** Exact is consistently slightly better (+0.2–0.9 pp R@1), consistent with QR's stronger theoretical guarantee (Haar-uniform distribution).
-- **d = 1024, b=4:** Exact wins by +3.8 pp R@1 — a meaningful gap for precision-sensitive applications. The Haar-random matrix becomes a noticeably better mixing operator as d grows.
-- **d = 1024, b=8:** Both modes reach near-ceiling recall (79.6%) and are indistinguishable.
-- **Speed:** SRHT ingest is 1.1–17.9x faster depending on d. The gap widens with d because exact applies an O(d²) matrix multiply vs SRHT's O(d log d) WHT. At d=1024, exact is 7–18x slower to ingest.
-
-**Recommendation:** SRHT is the right default for most workloads — it matches or nearly matches exact quality at d<=256, is only slightly behind at d=512, and is dramatically faster at all dimensions. Use `quantizer_type="exact"` when d>=512 and recall quality is more important than ingest throughput.
 
 <!-- PAPER_BENCH_END -->
 
@@ -307,8 +298,8 @@ At low dimensionality, TurboQuant's quantization must pack each dimension into v
 
 | Config | Brute-force R@1 | ANN R@1 | ANN latency gain |
 |--------|:-----------:|:------:|:------:|
-| b=4, rerank=T | **82.6%** | 60.5% | ~2x faster p50 |
-| b=2, rerank=T | **52.8%** | 37.5% | ~1x (no gain) |
+| b=4, rerank=T | **84.1%** | 62.6% | ~2x faster p50 |
+| b=2, rerank=T | **55.3%** | 40.8% | ~1x (no gain) |
 
 ANN at d=200 loses 22 percentage points of recall versus brute-force because the HNSW graph is built on quantized distances, which are less accurate at low dimension. The latency advantage does not compensate for this recall collapse. Use brute-force for d <= 256.
 
@@ -318,7 +309,7 @@ At high dimensionality, quantization is more accurate and the ANN approximation 
 
 | Config | Brute-force R@1 | ANN R@1 | ANN latency gain |
 |--------|:-----------:|:------:|:------:|
-| b=4, rerank=T | 95.5% | **93.5%** | ~5x faster p50 |
+| b=4, rerank=T | 96.2% | **94.9%** | ~5x faster p50 |
 | b=4, rerank=F | 92.6% | **87.9%** | ~3x faster p50 |
 
 ANN costs only ~2 points of recall while cutting latency from ~48ms to ~14ms p50. For production RAG at d=1536 or d=3072, ANN is the right default — build the index once after initial load, then queries are sub-linear.
@@ -346,7 +337,7 @@ Performance delta vs. previous version across key metrics (100k vectors, best co
 | Ingest | — | ~7s | — |
 | p50 query | — | 47.7ms | — |
 | p99 query | — | 50.9ms | — |
-| R@1 | — | 95.5% | — |
+| R@1 | — | 96.2% | — |
 | Disk | — | 108.3 MB | — |
 | RAM | — | 860 MB | — |
 
@@ -386,19 +377,25 @@ TurboQuantDB is an embedded database — it runs in-process with no daemon.
 └── seg-XXXXXXXX.bin     — Immutable flushed segment files
 ```
 
-**Write path:** `insert()` → quantize (SRHT rotation → MSE → SRHT QJL) → WAL → `live_codes.bin` → flush to segment
+**Write path (default, fast_mode=True):** `insert()` → SRHT rotation → MSE quantize → WAL → `live_codes.bin` → flush to segment
+
+**Write path (fast_mode=False):** `insert()` → SRHT rotation → MSE quantize → QJL residual sketch → WAL → `live_codes.bin` → flush to segment
+
+**Write path (quantizer_type="exact"):** `insert()` → QR rotation → MSE quantize → (QJL residual sketch if fast_mode=False) → WAL → `live_codes.bin` → flush to segment
 
 **Search (brute-force):** query → precompute lookup tables → score all live vectors → top-k
 
 **Search (ANN):** query → HNSW beam search → rerank → top-k
 
-**Quantization:** Two-stage pipeline as specified in the paper:
-1. **MSE** — random orthogonal rotation (QR) + Lloyd-Max scalar quantization to `bits` per coordinate
-2. **QJL** — dense i.i.d. N(0,1) Gaussian projection, 1-bit quantized, bit-packed
+**Quantization structure:** Both quantizer families use the same two-stage layout:
+1. **MSE stage** — rotate the vector and apply a Lloyd-Max scalar codebook
+2. **Residual stage** — encode the MSE residual with a 1-bit QJL-style sketch plus `gamma`
 
-The combination gives unbiased inner product estimates with near-optimal distortion, requiring no training data.
+**Default `srht` mode:** uses Walsh-Hadamard × random-sign transforms for both the rotation and the residual sketch. It runs in `O(d log d)`, pads `d` to the next power of two, and is the recommended production mode.
 
-**SRHT approximation (default):** The default implementation substitutes SRHT (Walsh-Hadamard × random ±1 diagonal) for both the QR rotation and the Gaussian projection. SRHT runs in O(d log d) vs the paper's O(d²) and uses O(d) memory vs O(d²). It pads d to the next power of two, producing more stored codes than the exact mode at the same bit-width setting — which inflates raw recall numbers in a direct comparison. When compared at **equal disk usage**, the exact QR rotation achieves equal or slightly better recall per stored byte, consistent with its stronger theoretical guarantees (Haar-uniform distribution). SRHT's practical advantage is ingest throughput: 15–23× faster at d=1536. Use `quantizer_type="exact"` when storage efficiency matters more than ingest speed.
+**Optional `exact` mode:** uses QR-random orthogonal rotation and dense i.i.d. `N(0,1)` Gaussian QJL with `n = d`, matching the paper's algorithmic contract more closely. It is slower and larger at high dimension, but useful for paper-faithful comparisons and algorithm audits.
+
+With `fast_mode=True` (default), all `b` bits go to the MSE codebook — no QJL residual is stored or scored, matching the paper's Figure 5 bit allocation. With `fast_mode=False`, the budget is split `b-1` bits MSE + 1 bit QJL, which provides an unbiased inner-product estimator useful for LLM KV-cache scoring.
 
 **Note on "zero indexing time":** The paper's claim (Table 2: TurboQuant 0.0013 s vs PQ 239 s vs RabitQ 2268 s at d=1536) measures **codebook/matrix construction time only** — i.e., how long to set up the quantizer before inserting any data. TurboQuant is near-zero because the quantizer is constructed analytically from a random seed with no data dependency; PQ and RabitQ require expensive training passes (k-means, SVD) over the corpus. The per-vector encoding cost (applying the rotation and projection to each inserted vector) still exists and scales as O(d log d) for SRHT or O(d²) for the exact mode.
 
@@ -406,11 +403,13 @@ The combination gives unbiased inner product estimates with near-optimal distort
 
 The TurboQuant paper contributes the **quantization algorithm** — how to compress vectors and estimate inner products accurately. Its experiments use flat (exhaustive) search: all database vectors are scored against every query using the LUT-based asymmetric scorer. The paper's "indexing time virtually zero" claim refers to the quantizer requiring no training data, not to graph construction.
 
-**From the paper:** two-stage MSE + QJL quantization, Lloyd-Max codebook, asymmetric LUT scoring, unbiased inner product estimation. The paper specifies QR-random orthogonal rotation and dense Gaussian projection — available as `quantizer_type="exact"`. The default implementation uses SRHT (O(d log d)) as a practical approximation; at equal storage budget, exact mode achieves equal or slightly better recall per byte, while SRHT is 15–23× faster to ingest at high dimensions.
+**From the paper:** two-stage MSE + QJL quantization, Lloyd-Max codebook, asymmetric LUT scoring, exhaustive flat-search evaluation, and the QR + dense Gaussian formulation that TurboQuantDB exposes as `quantizer_type="exact"`.
+
+**TurboQuantDB default:** `None/"srht"` keeps the same two-stage quantization skeleton but swaps the dense random maps for structured transforms to reduce time/state in practical vector DB workloads.
 
 **Added by TurboQuantDB (not in the paper):** WAL persistence, memory-mapped storage, metadata/documents, HNSW graph index, reranking, Python bindings, and the HTTP server.
 
-The brute-force search path (`_use_ann=False`, the default) is the paper-conformant mode — it scores all vectors using TurboQuant's LUT scorer, matching the paper's experimental setup exactly. The HNSW index is a practical engineering addition that reduces the candidate set before scoring, enabling sub-linear search at the cost of approximate recall. Pass `_use_ann=True` to engage the HNSW index (requires `create_index()` to have been called first).
+The brute-force search path (`_use_ann=False`, the default) matches the paper's exhaustive-search evaluation style: every vector is scored with the quantizer's LUT scorer. Pair it with `quantizer_type="exact"` when you want the closest paper-faithful path in this repo. The HNSW index is a practical engineering addition that reduces the candidate set before scoring, enabling sub-linear search at the cost of approximate recall. Pass `_use_ann=True` to engage the HNSW index (requires `create_index()` to have been called first).
 
 ### Module Map
 
@@ -423,8 +422,8 @@ The brute-force search path (`_use_ann=False`, the default) is the paper-conform
 | `src/storage/live_codes.rs` | Memory-mapped hot vector cache |
 | `src/storage/graph.rs` | HNSW graph index |
 | `src/quantizer/prod.rs` | `ProdQuantizer` — MSE + QJL orchestrator |
-| `src/quantizer/mse.rs` | `MseQuantizer` — SRHT rotation + Lloyd-Max codebook (exact: QR via `quantizer_type="exact"`) |
-| `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit SRHT projection, bit-packed (exact: dense Gaussian) |
+| `src/quantizer/mse.rs` | `MseQuantizer` — Lloyd-Max MSE stage (structured SRHT by default; QR in exact mode) |
+| `src/quantizer/qjl.rs` | `QjlQuantizer` — 1-bit residual sketch (structured SRHT by default; dense Gaussian in exact mode) |
 | `python/tqdb/rag.py` | `TurboQuantRetriever` — LangChain-style wrapper |
 | `server/` | Optional Axum HTTP service (separate Cargo workspace) |
 

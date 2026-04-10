@@ -8,6 +8,10 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ## [Unreleased]
 
+### Documentation
+
+- Clarified that current user-facing docs distinguish the default structured `None/"srht"` quantizer family from the optional paper-faithful `quantizer_type="exact"` QR + dense Gaussian path.
+
 ---
 
 ## [0.4.0] — 2026-04-08
@@ -157,7 +161,7 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 
 ### Features (algorithm)
 
-- **feat(quantizer)**: switch to paper-conformant QR rotation and Gaussian QJL projection
+- **feat(quantizer)**: switch quantizer internals to the paper-faithful QR rotation + Gaussian QJL formulation (the current docs refer to this formulation as the `exact` path)
 - **feat(storage)**: de-duplicate codes and persist id pool
 - **feat(storage)**: dequantization-based reranking — no `live_vectors.bin` overhead by default
 
