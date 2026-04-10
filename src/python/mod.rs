@@ -161,6 +161,17 @@ impl Database {
             }
         };
 
+        if bits < 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "bits must be >= 2, got {}",
+                bits
+            )));
+        }
+        if dimension == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "dimension must be > 0",
+            ));
+        }
         let engine = TurboQuantEngine::open_with_options(
             &engine_path,
             &engine_path,
@@ -199,6 +210,7 @@ impl Database {
                 .as_array()
                 .to_owned()
         };
+        check_finite(&vec.view(), "vector")?;
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
@@ -251,6 +263,11 @@ impl Database {
                     )));
                 }
             }
+            if matrix.iter().any(|&x| !x.is_finite()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "vectors contain non-finite values (NaN or Inf)",
+                ));
+            }
             let metas = parse_metadata_rows(metadatas, ids.len())?;
             let docs = parse_document_rows(documents, ids.len())?;
 
@@ -292,6 +309,11 @@ impl Database {
                         matrix.ncols()
                     )));
                 }
+            }
+            if matrix.iter().any(|&x| !x.is_finite()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "vectors contain non-finite values (NaN or Inf)",
+                ));
             }
             let metas = parse_metadata_rows(metadatas, ids.len())?;
             let docs = parse_document_rows(documents, ids.len())?;
@@ -504,12 +526,19 @@ impl Database {
         &self,
         py: Python<'_>,
         query: PyObject,
-        top_k: usize,
+        top_k: i64,
         filter: Option<&Bound<'_, PyDict>>,
         _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
         include: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
+        if top_k <= 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "top_k must be a positive integer, got {}",
+                top_k
+            )));
+        }
+        let top_k = top_k as usize;
         let q = if let Ok(v) = query.extract::<PyReadonlyArray1<f32>>(py) {
             v.as_array().mapv(|x| x as f64)
         } else {
@@ -518,6 +547,7 @@ impl Database {
                 .as_array()
                 .to_owned()
         };
+        check_finite(&q.view(), "query vector")?;
         let parsed_filter = parse_pydict(filter)?;
         let filter_ref = if parsed_filter.is_empty() {
             None
@@ -740,24 +770,41 @@ impl Database {
         &self,
         py: Python<'_>,
         query_embeddings: PyObject,
-        n_results: usize,
+        n_results: i64,
         where_filter: Option<&Bound<'_, PyDict>>,
         _use_ann: Option<bool>,
         ann_search_list_size: Option<usize>,
     ) -> PyResult<PyObject> {
+        if n_results <= 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "n_results must be a positive integer, got {}",
+                n_results
+            )));
+        }
+        let n_results = n_results as usize;
         let queries: Vec<ndarray::Array1<f64>> =
             if let Ok(m) = query_embeddings.extract::<PyReadonlyArray2<f32>>(py) {
-                m.as_array()
+                let rows: Vec<_> = m
+                    .as_array()
                     .rows()
                     .into_iter()
                     .map(|r| r.mapv(|x| x as f64))
-                    .collect()
+                    .collect();
+                for (i, row) in rows.iter().enumerate() {
+                    check_finite(&row.view(), &format!("query_embeddings row {}", i))?;
+                }
+                rows
             } else if let Ok(m) = query_embeddings.extract::<PyReadonlyArray2<f64>>(py) {
-                m.as_array()
+                let rows: Vec<_> = m
+                    .as_array()
                     .rows()
                     .into_iter()
                     .map(|r| r.to_owned())
-                    .collect()
+                    .collect();
+                for (i, row) in rows.iter().enumerate() {
+                    check_finite(&row.view(), &format!("query_embeddings row {}", i))?;
+                }
+                rows
             } else {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "query_embeddings must be a 2-D numpy array (float32 or float64)",
@@ -824,9 +871,25 @@ impl Database {
         &self,
         py: Python<'_>,
         where_filter: Option<&Bound<'_, PyDict>>,
-        limit: Option<usize>,
-        offset: usize,
+        limit: Option<i64>,
+        offset: i64,
     ) -> PyResult<Vec<String>> {
+        if offset < 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "offset must be >= 0, got {}",
+                offset
+            )));
+        }
+        if let Some(lim) = limit {
+            if lim < 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "limit must be >= 0, got {}",
+                    lim
+                )));
+            }
+        }
+        let offset = offset as usize;
+        let limit = limit.map(|l| l as usize);
         let parsed_filter = parse_pydict(where_filter)?;
         let filter_ref = if parsed_filter.is_empty() {
             None
@@ -1029,6 +1092,16 @@ fn parse_document_rows(
 
 fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+}
+
+fn check_finite(vec: &ndarray::ArrayView1<f64>, label: &str) -> PyResult<()> {
+    if vec.iter().any(|&x| !x.is_finite()) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{} contains non-finite values (NaN or Inf)",
+            label
+        )));
+    }
+    Ok(())
 }
 
 fn parse_include_set(
