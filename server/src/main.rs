@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 use tqdb::storage::engine::{BatchWriteItem, DistanceMetric, GetResult, TurboQuantEngine};
 
@@ -2667,6 +2667,12 @@ mod tests {
     use axum::http::Request;
     use tower::util::ServiceExt;
 
+    fn mk_test_metrics_handle() -> PrometheusHandle {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle()
+    }
+
     fn mk_state_with_jobs(max_concurrent_jobs: Option<usize>, jobs: Vec<JobRecord>) -> AppState {
         let mut tenant_quotas = HashMap::new();
         tenant_quotas.insert(
@@ -2707,6 +2713,8 @@ mod tests {
                 job_store_path: "".to_string(),
             },
             job_worker_concurrency: 1,
+            metrics_handle: mk_test_metrics_handle(),
+            last_gauge_collect: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2885,6 +2893,8 @@ mod tests {
                     .to_string(),
             },
             job_worker_concurrency: 1,
+            metrics_handle: mk_test_metrics_handle(),
+            last_gauge_collect: Arc::new(Mutex::new(None)),
         }
     }
 

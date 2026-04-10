@@ -91,6 +91,21 @@ impl Database {
     ) -> PyResult<Self> {
         let engine_path = match collection {
             Some(col) if !col.is_empty() => {
+                // Reject path traversal: collection must not contain separators or ..
+                let col_path = std::path::Path::new(col);
+                if col_path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                }) || col.contains('/')
+                    || col.contains('\\')
+                {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid collection name {:?}: must be a single path component with no separators",
+                        col
+                    )));
+                }
                 let p = std::path::Path::new(&path).join(col);
                 p.to_string_lossy().into_owned()
             }
@@ -187,6 +202,13 @@ impl Database {
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
+            if vec.len() != engine.d {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "vector dimension mismatch: expected {}, got {}",
+                    engine.d,
+                    vec.len()
+                )));
+            }
             engine
                 .insert_with_document(id, &vec, props, document)
                 .map_err(to_py_runtime)
@@ -213,7 +235,21 @@ impl Database {
         if let Ok(v32) = vectors.extract::<PyReadonlyArray2<f32>>(py) {
             let matrix = v32.as_array();
             if ids.len() != matrix.nrows() {
-                return Err(pyo3::exceptions::PyValueError::new_err("mismatch"));
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "ids length ({}) does not match number of vectors ({})",
+                    ids.len(),
+                    matrix.nrows()
+                )));
+            }
+            {
+                let engine = self.read_engine()?;
+                if !matrix.is_empty() && matrix.ncols() != engine.d {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "vector dimension mismatch: expected {}, got {}",
+                        engine.d,
+                        matrix.ncols()
+                    )));
+                }
             }
             let metas = parse_metadata_rows(metadatas, ids.len())?;
             let docs = parse_document_rows(documents, ids.len())?;
@@ -241,7 +277,21 @@ impl Database {
             let v64 = vectors.extract::<PyReadonlyArray2<f64>>(py)?;
             let matrix = v64.as_array();
             if ids.len() != matrix.nrows() {
-                return Err(pyo3::exceptions::PyValueError::new_err("mismatch"));
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "ids length ({}) does not match number of vectors ({})",
+                    ids.len(),
+                    matrix.nrows()
+                )));
+            }
+            {
+                let engine = self.read_engine()?;
+                if !matrix.is_empty() && matrix.ncols() != engine.d {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "vector dimension mismatch: expected {}, got {}",
+                        engine.d,
+                        matrix.ncols()
+                    )));
+                }
             }
             let metas = parse_metadata_rows(metadatas, ids.len())?;
             let docs = parse_document_rows(documents, ids.len())?;
@@ -475,10 +525,17 @@ impl Database {
             Some(&parsed_filter)
         };
 
-        let inc = parse_include_set(include, &["id", "score", "metadata", "document"]);
+        let inc = parse_include_set(include, &["id", "score", "metadata", "document"])?;
 
         let results = py.allow_threads(|| {
             let engine = self.read_engine()?;
+            if q.len() != engine.d {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "query dimension mismatch: expected {}, got {}",
+                    engine.d,
+                    q.len()
+                )));
+            }
             let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
             engine
                 .search_with_filter_and_ann(&q, top_k, filter_ref, ann_search_list_size, use_ann)
@@ -977,12 +1034,19 @@ fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
 fn parse_include_set(
     include: Option<Vec<String>>,
     defaults: &[&str],
-) -> std::collections::HashSet<String> {
-    include
-        .unwrap_or_else(|| defaults.iter().map(|s| s.to_string()).collect())
-        .into_iter()
-        .map(|s| s.to_ascii_lowercase())
-        .collect()
+) -> PyResult<std::collections::HashSet<String>> {
+    let items = include.unwrap_or_else(|| defaults.iter().map(|s| s.to_string()).collect());
+    let valid: std::collections::HashSet<&str> = defaults.iter().copied().collect();
+    for item in &items {
+        if !valid.contains(item.to_ascii_lowercase().as_str()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid include field {:?}; valid values are: {}",
+                item,
+                defaults.join(", ")
+            )));
+        }
+    }
+    Ok(items.into_iter().map(|s| s.to_ascii_lowercase()).collect())
 }
 
 pub fn register(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
