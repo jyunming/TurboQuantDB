@@ -425,6 +425,10 @@ impl Database {
     ) -> PyResult<usize> {
         let has_filter = where_filter.is_some();
         let parsed_filter = parse_pydict(where_filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        }
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
             let mut deleted = if !ids.is_empty() {
@@ -460,6 +464,10 @@ impl Database {
     #[pyo3(signature = (filter=None))]
     fn count(&self, py: Python<'_>, filter: Option<&Bound<'_, PyDict>>) -> PyResult<usize> {
         let parsed_filter = parse_pydict(filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        }
         let filter_ref = if parsed_filter.is_empty() {
             None
         } else {
@@ -549,6 +557,10 @@ impl Database {
         };
         check_finite(&q.view(), "query vector")?;
         let parsed_filter = parse_pydict(filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        }
         let filter_ref = if parsed_filter.is_empty() {
             None
         } else {
@@ -812,6 +824,10 @@ impl Database {
             };
 
         let parsed_filter = parse_pydict(where_filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        }
         let filter_ref = if parsed_filter.is_empty() {
             None
         } else {
@@ -891,6 +907,10 @@ impl Database {
         let offset = offset as usize;
         let limit = limit.map(|l| l as usize);
         let parsed_filter = parse_pydict(where_filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+        }
         let filter_ref = if parsed_filter.is_empty() {
             None
         } else {

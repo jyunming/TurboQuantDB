@@ -17,7 +17,7 @@ use super::segment::{SegmentManager, SegmentRecord};
 use super::wal::{Wal, WalEntry};
 use crate::quantizer::CodeIndex;
 use crate::quantizer::prod::ProdQuantizer;
-mod filter;
+pub(crate) mod filter;
 use filter::{
     extract_indexable_eq, extract_range_condition, get_nested_field, metadata_matches_filter,
     score_vectors_with_metric,

@@ -151,6 +151,53 @@ pub(crate) fn apply_comparison_op(field: Option<&JsonValue>, op: &str, op_val: &
     }
 }
 
+const KNOWN_COMPARISON_OPS: &[&str] = &[
+    "$eq",
+    "$ne",
+    "$gt",
+    "$gte",
+    "$lt",
+    "$lte",
+    "$in",
+    "$nin",
+    "$exists",
+    "$contains",
+];
+
+/// Recursively validate that all operator keys in `filter` are known.
+/// Returns `Err(message)` on the first unknown operator encountered.
+pub(crate) fn validate_filter_operators(filter: &HashMap<String, JsonValue>) -> Result<(), String> {
+    for (k, v) in filter {
+        match k.as_str() {
+            "$and" | "$or" => {
+                if let JsonValue::Array(conditions) = v {
+                    for cond in conditions {
+                        if let JsonValue::Object(map) = cond {
+                            let hm: HashMap<String, JsonValue> =
+                                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                            validate_filter_operators(&hm)?;
+                        }
+                    }
+                }
+            }
+            k if k.starts_with('$') => {
+                return Err(format!("unknown top-level filter operator '{k}'"));
+            }
+            _ => {
+                // field key — value may be an operator map
+                if let JsonValue::Object(op_map) = v {
+                    for op in op_map.keys() {
+                        if !KNOWN_COMPARISON_OPS.contains(&op.as_str()) {
+                            return Err(format!("unknown filter operator '{op}' on field '{k}'"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Extract a single-field numeric range condition that can use the range_index.
 ///
 /// Returns `(field, lo, hi)` where each bound is `(ord_key, inclusive)`.
