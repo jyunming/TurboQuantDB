@@ -64,6 +64,8 @@ BENCHMARK_ENGINE_MAP.md
 CLAUDE.md
 GEMINI.md
 AGENTS.md
+.mcp.json
+.pre-commit-config.yaml
 docs/PYTHON_MIGRATION.md
 docs/ROADMAP_BACKLOG.md
 docs/COMPETITOR_SIGNAL_TRACKING.md

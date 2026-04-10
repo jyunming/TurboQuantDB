@@ -29,6 +29,21 @@ if [ -z "$NON_DOC" ] && [ -n "$STAGED" ]; then
     exit 0
 fi
 
+# ── 0b. Version sync — pyproject.toml is the single source of truth ───────────
+# Read the version from pyproject.toml and auto-update Cargo.toml if they differ.
+PY_VER=$(grep '^version = ' pyproject.toml 2>/dev/null | head -1 | sed 's/^version = "//;s/"$//')
+CARGO_VER=$(grep '^version = ' Cargo.toml 2>/dev/null | head -1 | sed 's/^version = "//;s/"$//')
+if [ -n "$PY_VER" ] && [ "$PY_VER" != "$CARGO_VER" ]; then
+    warn "version mismatch — syncing Cargo.toml ($CARGO_VER → $PY_VER)"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        sed -i '' "s/^version = \"${CARGO_VER}\"/version = \"${PY_VER}\"/" Cargo.toml
+    else
+        sed -i "s/^version = \"${CARGO_VER}\"/version = \"${PY_VER}\"/" Cargo.toml
+    fi
+    git add Cargo.toml
+    pass "Cargo.toml synced to $PY_VER"
+fi
+
 # ── 1. Formatting ──────────────────────────────────────────────────────────────
 echo -n "[pre-commit] cargo fmt check ... "
 if ! cargo fmt --all -- --check 2>/dev/null; then
