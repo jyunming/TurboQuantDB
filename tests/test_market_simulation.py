@@ -298,3 +298,72 @@ def test_server_restart_roundtrip_write_then_read():
                 proc2.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc2.kill()
+
+
+@pytest.mark.slow
+def test_server_concurrent_distinct_collection_create_has_no_500_and_no_loss():
+    exe = _server_exe()
+    if not exe.exists():
+        pytest.skip(f"server binary missing: {exe}")
+
+    with tempfile.TemporaryDirectory() as td:
+        local_root = Path(td) / "data"
+        local_root.mkdir(parents=True, exist_ok=True)
+        port = _find_free_port()
+        env = os.environ.copy()
+        env["TQ_LOCAL_ROOT"] = str(local_root)
+        env["TQ_SERVER_ADDR"] = f"127.0.0.1:{port}"
+        headers = {"Authorization": "ApiKey dev-key"}
+
+        proc = subprocess.Popen(
+            [str(exe)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        try:
+            ready = False
+            for _ in range(80):
+                st, _ = _http_json("GET", f"http://127.0.0.1:{port}/healthz")
+                if st == 200:
+                    ready = True
+                    break
+                time.sleep(0.2)
+            assert ready
+
+            statuses: list[int] = []
+            lock = threading.Lock()
+
+            def _worker(i: int):
+                st, _ = _http_json(
+                    "POST",
+                    f"http://127.0.0.1:{port}/v1/tenants/dev/databases/db/collections",
+                    {"name": f"sim_{i}", "dimension": 8, "bits": 4, "metric": "ip"},
+                    headers,
+                )
+                with lock:
+                    statuses.append(st)
+
+            threads = [threading.Thread(target=_worker, args=(i,)) for i in range(50)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert 500 not in statuses, statuses
+            assert all(s == 201 for s in statuses), statuses
+
+            st, body = _http_json(
+                "GET",
+                f"http://127.0.0.1:{port}/v1/tenants/dev/databases/db/collections",
+                None,
+                headers,
+            )
+            assert st == 200, body
+            payload = json.loads(body)
+            names = {c["name"] for c in payload.get("collections", [])}
+            expected = {f"sim_{i}" for i in range(50)}
+            assert expected <= names, (len(expected - names), sorted(list(expected - names))[:5])
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()

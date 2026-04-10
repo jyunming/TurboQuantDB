@@ -115,6 +115,30 @@ class TestValidationStrictness:
         with pytest.raises(Exception):
             db.delete_batch(where_filter={"year": {"$unknown": 1}})
 
+    def test_search_negative_topk_is_validation_error(self, tmp_path):
+        db = Database.open(str(tmp_path / "db"), dimension=8, bits=4, metric="ip")
+        db.insert("x", np.ones(8, dtype=np.float32))
+        with pytest.raises(ValueError):
+            db.search(np.ones(8, dtype=np.float32), top_k=-1)
+
+    def test_query_negative_n_results_is_validation_error(self, tmp_path):
+        db = Database.open(str(tmp_path / "db"), dimension=8, bits=4, metric="ip")
+        db.insert("x", np.ones(8, dtype=np.float32))
+        with pytest.raises(ValueError):
+            db.query(np.ones((1, 8), dtype=np.float32), n_results=-1)
+
+    def test_list_ids_negative_offset_is_validation_error(self, tmp_path):
+        db = Database.open(str(tmp_path / "db"), dimension=8, bits=4, metric="ip")
+        db.insert("x", np.ones(8, dtype=np.float32))
+        with pytest.raises(ValueError):
+            db.list_ids(offset=-1)
+
+    def test_list_ids_negative_limit_is_validation_error(self, tmp_path):
+        db = Database.open(str(tmp_path / "db"), dimension=8, bits=4, metric="ip")
+        db.insert("x", np.ones(8, dtype=np.float32))
+        with pytest.raises(ValueError):
+            db.list_ids(limit=-1)
+
 
 class TestPathSafety:
     def test_collection_disallows_path_traversal(self, tmp_path):
