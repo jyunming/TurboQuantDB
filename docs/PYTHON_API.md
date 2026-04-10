@@ -107,7 +107,7 @@ db = Database.open(path, dimension=DIM, bits=4, rerank=True, quantizer_type="den
 results = db.search(query, top_k=10)
 ```
 
-This is the default. Use `quantizer_type="srht"` if you need faster ingest at high d and can accept the small recall trade-off.
+`quantizer_type="dense"` is the default. Use `quantizer_type="srht"` if you need faster O(d log d) ingest at high d and can accept a small recall trade-off.
 
 ### Fast Build — ingest speed is priority
 

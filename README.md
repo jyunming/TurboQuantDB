@@ -86,7 +86,7 @@ Full parameter reference: [`docs/PYTHON_API.md`](https://github.com/jyunming/Tur
 import numpy as np
 from tqdb import Database
 
-db = Database.open("./my_db", dimension=1536, bits=4, metric="ip", rerank=True)  # default SRHT mode
+db = Database.open("./my_db", dimension=1536, bits=4, metric="ip", rerank=True)  # default dense mode (Haar QR)
 
 db.insert("doc-1", np.random.randn(1536).astype("f4"), metadata={"topic": "ml"}, document="Machine learning intro")
 db.insert("doc-2", np.random.randn(1536).astype("f4"), metadata={"topic": "systems"}, document="Rust memory model")
@@ -107,7 +107,7 @@ for r in results:
 db = Database.open(path, dimension, bits=4, seed=42, metric="ip",
                    rerank=True, fast_mode=True, rerank_precision=None,
                    collection=None, wal_flush_threshold=None,
-                   quantizer_type=None)  # None/"srht" = default structured fast path; "dense" = paper-faithful QR + Gaussian (O(d²))
+                   quantizer_type=None)  # None/"dense" = default (Haar QR + Gaussian, paper-faithful); "srht" = fast O(d log d) ingest
 
 # Write
 db.insert(id, vector, metadata=None, document=None)
@@ -144,34 +144,6 @@ db.create_index(max_degree=32, ef_construction=200, n_refinements=5,
 # $eq $ne $gt $gte $lt $lte $in $nin $exists $and $or
 db.search(query, top_k=5, filter={"year": {"$gte": 2023}})
 db.search(query, top_k=5, filter={"$and": [{"topic": "ml"}, {"year": {"$gte": 2023}}]})
-```
-
----
-
-## Recommended Presets
-
-### Recommended — brute-force + reranking
-
-```python
-db = Database.open(path, dimension=DIM, bits=4, rerank=True)
-results = db.search(query, top_k=10, _use_ann=False)
-# 96.2% Recall@1, 100% Recall@4 at 100k×1536  |  108 MB disk  |  ~48ms p50 (brute-force)
-```
-
-### Minimum Disk — compress aggressively
-
-```python
-db = Database.open(path, dimension=DIM, bits=2, rerank=True)
-results = db.search(query, top_k=10, _use_ann=False)
-# 86.8% Recall@1, 99.3% Recall@4 at 100k×1536  |  60 MB disk (9.9× smaller)  |  ~43ms p50
-```
-
-### Optional — ANN index for lower latency
-
-```python
-# Build once after inserting data; recall scales with ann_search_list_size
-db.create_index()
-results = db.search(query, top_k=10, _use_ann=True, ann_search_list_size=200)
 ```
 
 ---
@@ -309,27 +281,6 @@ ANN costs only ~2 points of recall while cutting latency from ~48ms to ~14ms p50
 
 ---
 
-## Release Comparison
-
-Performance delta vs. previous version across key metrics (100k vectors, best config per mode).
-
-### v0.4.0 vs v0.3.0 (2026-04-08)
-
-**DBpedia d=1536, brute-force b=4 rerank=T**
-
-| Metric | v0.3.0 | v0.4.0 | Delta |
-|--------|--------|--------|-------|
-| Ingest | — | ~7s | — |
-| p50 query | — | 47.7ms | — |
-| p99 query | — | 50.9ms | — |
-| R@1 | — | 96.2% | — |
-| Disk | — | 108.3 MB | — |
-| RAM | — | 860 MB | — |
-
-> v0.3.0 benchmark data was not tracked. Tracking started at v0.4.0 via `benchmarks/perf_history.json`. From v0.5.0 onward, each release row will include a delta column against the prior release.
-
----
-
 ## RAG Integration
 
 ```python
@@ -362,11 +313,11 @@ TurboQuantDB is an embedded database — it runs in-process with no daemon.
 └── seg-XXXXXXXX.bin     — Immutable flushed segment files
 ```
 
-**Write path (default, fast_mode=True):** `insert()` → SRHT rotation → MSE quantize → WAL → `live_codes.bin` → flush to segment
+**Write path (default `dense`, fast_mode=True):** `insert()` → QR rotation → MSE quantize → WAL → `live_codes.bin` → flush to segment
 
-**Write path (fast_mode=False):** `insert()` → SRHT rotation → MSE quantize → QJL residual sketch → WAL → `live_codes.bin` → flush to segment
+**Write path (`dense`, fast_mode=False):** `insert()` → QR rotation → MSE quantize → QJL residual sketch → WAL → `live_codes.bin` → flush to segment
 
-**Write path (quantizer_type="dense"):** `insert()` → QR rotation → MSE quantize → (QJL residual sketch if fast_mode=False) → WAL → `live_codes.bin` → flush to segment
+**Write path (`srht`, fast_mode=True):** `insert()` → Walsh-Hadamard rotation → MSE quantize → WAL → `live_codes.bin` → flush to segment
 
 **Search (brute-force):** query → precompute lookup tables → score all live vectors → top-k
 
@@ -376,9 +327,9 @@ TurboQuantDB is an embedded database — it runs in-process with no daemon.
 1. **MSE stage** — rotate the vector and apply a Lloyd-Max scalar codebook
 2. **Residual stage** — encode the MSE residual with a 1-bit QJL-style sketch plus `gamma`
 
-**Default `srht` mode:** uses Walsh-Hadamard × random-sign transforms for both the rotation and the residual sketch. It runs in `O(d log d)`, pads `d` to the next power of two, and is the recommended production mode.
+**Default `"dense"` mode (`quantizer_type=None/"dense"`):** uses QR-random orthogonal rotation and dense i.i.d. `N(0,1)` Gaussian QJL with `n = d`, matching the paper's algorithmic contract. O(d²) ingest. Best recall; recommended for correctness-critical and paper-comparison workloads.
 
-**Optional `"dense"` mode:** uses QR-random orthogonal rotation and dense i.i.d. `N(0,1)` Gaussian QJL with `n = d`, matching the paper's algorithmic contract more closely. It is slower and larger at high dimension, but useful for paper-faithful comparisons and algorithm audits.
+**Optional `"srht"` mode:** uses Walsh-Hadamard × random-sign transforms for both the rotation and the residual sketch. O(d log d) ingest, pads `d` to the next power of two. Use for streaming or frequent-ingest workloads at high d where ingest speed matters more than last-percent recall.
 
 With `fast_mode=True` (default), all `b` bits go to the MSE codebook — no QJL residual is stored or scored, matching the paper's Figure 5 bit allocation. With `fast_mode=False`, the budget is split `b-1` bits MSE + 1 bit QJL, which provides an unbiased inner-product estimator useful for LLM KV-cache scoring.
 
@@ -390,7 +341,7 @@ The TurboQuant paper contributes the **quantization algorithm** — how to compr
 
 **From the paper:** two-stage MSE + QJL quantization, Lloyd-Max codebook, asymmetric LUT scoring, exhaustive flat-search evaluation, and the QR + dense Gaussian formulation that TurboQuantDB exposes as `quantizer_type="dense"`.
 
-**TurboQuantDB default:** `None/"srht"` keeps the same two-stage quantization skeleton but swaps the dense random maps for structured transforms to reduce time/state in practical vector DB workloads.
+**TurboQuantDB default:** `None/"dense"` uses the same two-stage quantization as the paper — QR rotation + dense Gaussian QJL. `"srht"` swaps the dense random maps for structured Walsh-Hadamard transforms to reduce ingest cost at high d.
 
 **Added by TurboQuantDB (not in the paper):** WAL persistence, memory-mapped storage, metadata/documents, HNSW graph index, reranking, Python bindings, and the HTTP server.
 
