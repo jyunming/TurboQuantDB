@@ -106,9 +106,9 @@ impl MseQuantizer {
         }
     }
 
-    /// Exact-paper mode: QR-decomposed random orthogonal rotation (Haar measure).
+    /// Dense mode: Haar-uniform QR rotation (Haar measure on O(d)).
     /// Uses a full d×d matrix instead of SRHT. O(d²) apply time, O(d²) storage.
-    pub fn new_exact(d: usize, b: usize, seed: u64) -> Self {
+    pub fn new_dense(d: usize, b: usize, seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let rotation_matrix = Some(random_orthogonal(d, &mut rng));
         let centroids: Vec<f32> = lloyd_max(b, d, 20_000)

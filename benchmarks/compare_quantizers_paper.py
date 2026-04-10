@@ -199,13 +199,13 @@ def main() -> None:
 
         for bits in args.bits:
             print(f"\n  [{ds_name}  bits={bits}]", flush=True)
-            skip_exact = (D >= 3072)
+            skip_dense = (D >= 3072)
 
             srht_res = None
-            exact_res = None
+            dense_res = None
 
-            for qt in ["srht", "exact"]:
-                if qt == "exact" and skip_exact:
+            for qt in ["srht", "dense"]:
+                if qt == "dense" and skip_dense:
                     print(f"    exact: skipped (D={D} — O(d^2)={D*D:,} ops/vec is prohibitive)")
                     continue
                 print(f"    {qt}: running ...", flush=True)
@@ -213,16 +213,16 @@ def main() -> None:
                 if qt == "srht":
                     srht_res = res
                 else:
-                    exact_res = res
+                    dense_res = res
                 print(f"    {qt}: done  (ingest {res['ingest_vps']:,.0f} vps,"
                       f"  p50 {res['p50_ms']:.2f} ms,"
                       f"  recall@1 {res['recalls'].get(1, 0):.3f})")
 
             key = f"b{bits}"
-            all_results[ds_name][key] = {"srht": srht_res, "exact": exact_res}
+            all_results[ds_name][key] = {"srht": srht_res, "dense": dense_res}
 
-            if srht_res and exact_res:
-                print_comparison(ds_name, bits, srht_res, exact_res)
+            if srht_res and dense_res:
+                print_comparison(ds_name, bits, srht_res, dense_res)
             elif srht_res:
                 print_srht_only(ds_name, bits, srht_res)
 
@@ -240,7 +240,7 @@ def main() -> None:
             rc["recalls"] = {str(k): v for k, v in r["recalls"].items()}
             return rc
         serializable = {
-            ds: {b: {"srht": _jsonify(v["srht"]), "exact": _jsonify(v["exact"])}
+            ds: {b: {"srht": _jsonify(v["srht"]), "dense": _jsonify(v["dense"])}
                  for b, v in bits_data.items()}
             for ds, bits_data in all_results.items()
         }

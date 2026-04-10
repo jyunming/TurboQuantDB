@@ -1,9 +1,9 @@
 """
-SRHT vs. Exact-Paper Quantizer Comparison
-==========================================
+SRHT vs. Dense Quantizer Comparison
+=====================================
 Compares recall@k, query latency, and ingest throughput for:
-  - "srht"  : SRHT rotation (H·D) + SRHT projection — O(d log d), what the code actually uses
-  - "exact" : QR-random orthogonal + dense Gaussian — O(d²), what the paper specifies
+  - "srht"  : SRHT rotation (H·D) + SRHT projection — O(d log d), structured fast path
+  - "dense" : Haar-uniform QR rotation + dense Gaussian — O(d²), paper-faithful path
 
 Usage:
     python benchmarks/compare_quantizers.py
@@ -76,7 +76,7 @@ def ground_truth_topk(corpus: np.ndarray, queries: np.ndarray, k: int) -> list[l
 
 
 print("=" * 72)
-print(f"{'Dataset':<16} {'Metric':<22} {'SRHT':>10} {'Exact':>10} {'Delta':>10}")
+print(f"{'Dataset':<16} {'Metric':<22} {'SRHT':>10} {'Dense':>10} {'Delta':>10}")
 print("=" * 72)
 
 for name, D, N, Q, bits in DATASETS:
@@ -88,7 +88,7 @@ for name, D, N, Q, bits in DATASETS:
     gt = ground_truth_topk(corpus, queries, max(TOP_KS))
 
     results = {}
-    for qt in ["srht", "exact"]:
+    for qt in ["srht", "dense"]:
         print(f"  running {qt:5s} on {name} (D={D}, N={N})...", flush=True)
         results[qt] = run_variant(qt, D, N, corpus, queries, ids, bits)
 
@@ -96,13 +96,13 @@ for name, D, N, Q, bits in DATASETS:
 
     def row(label, key):
         s = results["srht"][key]
-        e = results["exact"][key]
+        e = results["dense"][key]
         pct = (e - s) / (s + 1e-12) * 100
         arrow = "+" if pct > 1 else ("-" if pct < -1 else "~")
         print(f"  {label:<22} {s:>10.4f} {e:>10.4f} {pct:>+8.1f}% {arrow}")
 
     for k in TOP_KS:
-        for qt in ["srht", "exact"]:
+        for qt in ["srht", "dense"]:
             results[qt][f"recall@{k}"] = compute_recall(results[qt]["hit_ids"], gt, k)
         row(f"recall@{k}", f"recall@{k}")
 

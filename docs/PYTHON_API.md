@@ -41,11 +41,11 @@ db = Database.open(
     normalize=False,         # bool — L2-normalize every inserted vector and every query at
                              #        write time; makes inner-product scoring equivalent to
                              #        cosine similarity without changing the metric parameter
-    quantizer_type=None,     # str|None — None/"srht" = default structured fast path
-                             #            (Walsh-Hadamard + random signs, O(d log d),
-                             #            n=next_power_of_two(d))
-                             #            "exact" = paper-faithful QR + dense Gaussian
-                             #            path (O(d²), n=d, slower ingest and larger state)
+    quantizer_type=None,     # str|None — None/"dense" = default Haar-uniform QR path
+                             #            (O(d²) ingest, n=d, best recall)
+                             #            "exact" is a legacy alias for "dense"
+                             #            "srht" = structured fast path (O(d log d),
+                             #            n=next_power_of_two(d), faster ingest)
 )
 
 # Parameterless reopen — reads all parameters from manifest.json:
@@ -70,8 +70,8 @@ images   = Database.open("./mydb", dimension=512,  collection="images")
 
 TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two quantizer families:
 
-- **`None` / `"srht"` (default)** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, and `O(d log d)` time/state. This is the practical default and the mode used by the README presets and benchmark tables unless noted otherwise.
-- **`"exact"`** — QR-random orthogonal rotation + dense i.i.d. Gaussian QJL with `n = d`. This is the paper-faithful option for research, audits, and exact-vs-default comparisons, but it uses `O(d²)` time/state.
+- **`None` / `"dense"` (default)** — Haar-uniform QR rotation + dense i.i.d. Gaussian QJL with `n = d`. Best recall; O(d²) ingest cost. `"exact"` is a legacy alias.
+- **`"srht"`** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, O(d log d) ingest. Use for streaming or frequent-ingest workloads at high d.
 - **`fast_mode=True` (default)** — All `b` bits go to the MSE codebook. No QJL residual is stored or scored. Recommended for RAG/ANN search — matches the paper's Figure 5 bit allocation and recall numbers.
 - **`fast_mode=False`** — Splits the budget: `b-1` bits to MSE, 1 bit to a QJL Johnson-Lindenstrauss residual sketch. The QJL provides an *unbiased inner-product estimator*, useful for LLM KV-cache attention scoring where absolute inner-product accuracy matters more than ranking order.
 
@@ -103,7 +103,7 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 ### Paper-faithful exact mode — research / comparison
 
 ```python
-db = Database.open(path, dimension=DIM, bits=4, rerank=True, quantizer_type="exact")
+db = Database.open(path, dimension=DIM, bits=4, rerank=True, quantizer_type="dense")
 results = db.search(query, top_k=10, _use_ann=False)
 ```
 
@@ -118,7 +118,7 @@ results = db.search(query, top_k=10, ann_search_list_size=200)
 # ~96% Recall@10 at 100k×1536  |  108 MB disk  |  8ms p50
 ```
 
-*Benchmarked at 100,000 vectors, dim=1536, DBpedia OpenAI3 embeddings, brute-force ground truth. Unless a preset explicitly sets `quantizer_type="exact"`, these figures refer to the default SRHT family.*
+*Benchmarked at 100,000 vectors, dim=1536, DBpedia OpenAI3 embeddings, brute-force ground truth. Unless a preset explicitly sets `quantizer_type="dense"`, these figures refer to the default SRHT family.*
 
 ---
 
@@ -227,7 +227,7 @@ results = db.search(
 # Returns list of dicts: {"id": str, "score": float, "metadata": dict, "document": str | None}
 ```
 
-The default (`_use_ann=False`) always uses exhaustive brute-force scoring — highest recall, linear scan time. Pair brute-force with `quantizer_type="exact"` when you want the closest paper-faithful path in this repo; leave `quantizer_type` unset to use the default SRHT family. Pass `_use_ann=True` to use the HNSW graph index for sub-linear approximate search (requires `create_index()` to have been called first; lower recall than brute-force).
+The default (`_use_ann=False`) always uses exhaustive brute-force scoring — highest recall, linear scan time. Pair brute-force with `quantizer_type="dense"` when you want the closest paper-faithful path in this repo; leave `quantizer_type` unset to use the default SRHT family. Pass `_use_ann=True` to use the HNSW graph index for sub-linear approximate search (requires `create_index()` to have been called first; lower recall than brute-force).
 
 `ann_search_list_size` trades recall for latency — higher values find better results but take longer. Values between 64 and 256 cover the practical range.
 

@@ -105,7 +105,8 @@ pub struct Manifest {
     /// repeating the normalisation themselves.
     #[serde(default)]
     pub normalize: bool,
-    /// Which quantizer variant is in use: `"srht"` (default) or `"exact"` (paper-exact).
+    /// Which quantizer variant is in use: `"dense"` (default, Haar-uniform QR) or `"srht"` (structured fast path).
+    /// `"exact"` is accepted as a backward-compatible alias for `"dense"`.
     /// Persisted so reopened DBs load the correct `quantizer.bin`.
     #[serde(default)]
     pub quantizer_type: String,
@@ -383,11 +384,12 @@ impl TurboQuantEngine {
             let q = load_quantizer_state(local_dir, &backend)?;
             (m, q)
         } else {
-            let qt = quantizer_type.as_deref().unwrap_or("srht");
-            let q = if qt == "exact" && fast_mode {
-                ProdQuantizer::new_exact_fast(d, b, seed)
-            } else if qt == "exact" {
-                ProdQuantizer::new_exact(d, b, seed)
+            let qt = quantizer_type.as_deref().unwrap_or("dense");
+            let is_dense = qt == "dense" || qt == "exact"; // "exact" is a legacy alias
+            let q = if is_dense && fast_mode {
+                ProdQuantizer::new_dense_fast(d, b, seed)
+            } else if is_dense {
+                ProdQuantizer::new_dense(d, b, seed)
             } else if fast_mode {
                 ProdQuantizer::new_srht(d, b, seed)
             } else {

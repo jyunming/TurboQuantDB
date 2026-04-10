@@ -54,6 +54,14 @@ impl Database {
     ///         query vector internally so that IP scoring equals cosine similarity.  Callers
     ///         that already emit unit vectors can set this to avoid repeating the normalisation
     ///         themselves.  Default ``False``.
+    ///     quantizer_type: Which quantizer rotation to use:
+    ///         - ``None`` / ``"dense"`` (default): Haar-uniform QR rotation + dense Gaussian
+    ///           projection. n=d (no padding). Best recall; O(d²) ingest cost.
+    ///           ``"exact"`` is accepted as a legacy alias.
+    ///         - ``"srht"``: structured Walsh-Hadamard rotation. n=next_power_of_two(d).
+    ///           O(d log d) ingest; ~25% more subspaces scored at search time.
+    ///           Use for streaming or frequent-ingest workloads at high d.
+    ///         See `docs/QUANTIZER_MODES.md` for a full CPU/RAM/disk/recall comparison.
     ///
     /// Returns:
     ///     An open :class:`Database` instance.

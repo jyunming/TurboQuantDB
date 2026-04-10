@@ -120,7 +120,7 @@ def run_one(qt: str, corpus: np.ndarray, queries: np.ndarray,
 
 
 def print_dim_results(d: int, bits_list: list[int],
-                      srht_rows: list[dict], exact_rows: list[dict]) -> None:
+                      srht_rows: list[dict], dense_rows: list[dict]) -> None:
     W = 84
     print(f"\n{'=' * W}")
     print(f"  d={d}  (n=d={d} for both modes — no SRHT padding)")
@@ -130,7 +130,7 @@ def print_dim_results(d: int, bits_list: list[int],
     print(f"  {'-'*76}")
 
     srht_by_b  = {r["bits"]: r for r in srht_rows}
-    exact_by_b = {r["bits"]: r for r in exact_rows}
+    exact_by_b = {r["bits"]: r for r in dense_rows}
 
     for b in sorted(bits_list):
         for qt, tbl in [("SRHT", srht_by_b), ("Exact", exact_by_b)]:
@@ -184,7 +184,7 @@ def main() -> None:
     print("  Since d is a power of two, SRHT uses n=d (no padding) and exact uses n=d.")
     print("  Both modes produce identical code counts, disk usage, and codebooks.")
     print("  The ONLY difference is the rotation matrix: SRHT (Walsh-Hadamard × +-1 diag)")
-    print("  vs. Exact (Haar-random QR via modified Gram-Schmidt).")
+    print("  vs. Exact (Haar-uniform QR via modified Gram-Schmidt).")
     print("  Any recall difference is attributable solely to the rotation quality.")
 
     rng = np.random.default_rng(SEED)
@@ -195,28 +195,28 @@ def main() -> None:
         corpus, queries, true_top1 = make_dataset(d, rng)
 
         srht_rows:  list[dict] = []
-        exact_rows: list[dict] = []
+        dense_rows: list[dict] = []
 
         for bits in args.bits:
-            for qt, rows in [("srht", srht_rows), ("exact", exact_rows)]:
+            for qt, rows in [("srht", srht_rows), ("dense", dense_rows)]:
                 print(f"  {qt:>5} b={bits} ...", end="", flush=True)
                 res = run_one(qt, corpus, queries, true_top1, bits)
                 rows.append(res)
                 print(f"  R@1={res['r1']:.3f}  disk={res['disk_mb']:.2f} MB"
                       f"  ingest={res['ingest_vps']:,.0f} vps", flush=True)
 
-        print_dim_results(d, args.bits, srht_rows, exact_rows)
-        all_results[str(d)] = {"srht": srht_rows, "exact": exact_rows}
+        print_dim_results(d, args.bits, srht_rows, dense_rows)
+        all_results[str(d)] = {"srht": srht_rows, "dense": dense_rows}
 
     print(f"\n{'=' * 84}")
     print("Summary")
     print(f"{'=' * 84}")
     print("""
   Positive D = exact better, Negative D = SRHT better, ~0 = indistinguishable.
-  Speed ratio = SRHT ingest vps / Exact ingest vps.
+  Speed ratio = SRHT ingest vps / Dense ingest vps.
 
   Since code counts are identical, this comparison directly measures whether
-  the Walsh-Hadamard rotation (SRHT) is as effective as Haar-random QR as a
+  the Walsh-Hadamard rotation (SRHT) is as effective as Haar-uniform QR as a
   mixing operator prior to scalar quantization.
 """)
 
@@ -227,7 +227,7 @@ def main() -> None:
             return [{k: float(v) if isinstance(v, (float, np.floating)) else v
                      for k, v in r.items()} for r in rows]
 
-        out = {d: {"srht": _ser(v["srht"]), "exact": _ser(v["exact"])}
+        out = {d: {"srht": _ser(v["srht"]), "dense": _ser(v["dense"])}
                for d, v in all_results.items()}
         Path(args.save_json).write_text(json.dumps(out, indent=2), encoding="utf-8")
         print(f"  Results saved to {args.save_json}", flush=True)

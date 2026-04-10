@@ -28,15 +28,15 @@
     },
     "avg_latency_ms": {
       "higher_is_better": false,
-      "best": 1.3284330017631873
+      "best": 1.2884269992355257
     },
     "p50_latency_ms": {
       "higher_is_better": false,
-      "best": 1.3316999975359067
+      "best": 1.2888999917777255
     },
     "p95_latency_ms": {
       "higher_is_better": false,
-      "best": 1.4096250204602256
+      "best": 1.3773400089121424
     },
     "disk_bytes": {
       "higher_is_better": false,

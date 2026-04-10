@@ -52,13 +52,13 @@ impl ProdQuantizer {
         }
     }
 
-    /// Exact-paper mode: QR-decomposed orthogonal rotation (MSE) + dense N(0,1) Gaussian
-    /// projection (QJL), as specified in arXiv:2504.19874.
+    /// Dense mode: Haar-uniform QR rotation (MSE) + dense N(0,1) Gaussian projection (QJL),
+    /// as specified in arXiv:2504.19874. No padding: n=d.
     /// O(d²) quantize/score time and O(d²) storage vs O(d log d) / O(d) for SRHT.
-    pub fn new_exact(d: usize, b: usize, seed: u64) -> Self {
+    pub fn new_dense(d: usize, b: usize, seed: u64) -> Self {
         assert!(b >= 2, "ProdQuantizer requires at least b=2");
-        let mse_quantizer = MseQuantizer::new_exact(d, b - 1, seed);
-        let qjl_quantizer = QjlQuantizer::new_exact(d, seed ^ 0xdeadbeef);
+        let mse_quantizer = MseQuantizer::new_dense(d, b - 1, seed);
+        let qjl_quantizer = QjlQuantizer::new_dense(d, seed ^ 0xdeadbeef);
         Self {
             d,
             n: d, // no padding in exact mode
@@ -69,12 +69,12 @@ impl ProdQuantizer {
         }
     }
 
-    /// Exact-mode fast-path: dense Gaussian QR rotation + all b bits to MSE (no QJL).
+    /// Dense fast-path: Haar-uniform QR rotation + all b bits to MSE (no QJL).
     /// Best recall of all modes; O(d²) ingest cost.
-    pub fn new_exact_fast(d: usize, b: usize, seed: u64) -> Self {
+    pub fn new_dense_fast(d: usize, b: usize, seed: u64) -> Self {
         assert!(b >= 2, "ProdQuantizer requires at least b=2");
-        let mse_quantizer = MseQuantizer::new_exact(d, b, seed);
-        let qjl_quantizer = QjlQuantizer::new_exact(d, seed ^ 0xdeadbeef);
+        let mse_quantizer = MseQuantizer::new_dense(d, b, seed);
+        let qjl_quantizer = QjlQuantizer::new_dense(d, seed ^ 0xdeadbeef);
         Self {
             d,
             n: d,
@@ -752,8 +752,8 @@ mod tests {
         ProdQuantizer::new(d, 4, 42)
     }
 
-    fn make_exact_pq(d: usize) -> ProdQuantizer {
-        ProdQuantizer::new_exact(d, 4, 42)
+    fn make_dense_pq(d: usize) -> ProdQuantizer {
+        ProdQuantizer::new_dense(d, 4, 42)
     }
 
     #[test]
@@ -1009,7 +1009,7 @@ mod tests {
     #[test]
     fn exact_mode_scores_match_dequantized_inner_product() {
         let d = 32;
-        let pq = make_exact_pq(d);
+        let pq = make_dense_pq(d);
         let x: Vec<f32> = (0..d)
             .map(|i| ((i as f32 * 0.17).sin() + 0.25).cos())
             .collect();
