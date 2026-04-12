@@ -5,6 +5,10 @@ on:
     branches: [main, master, develop]
   pull_request:
 
+env:
+  # Opt into Node.js 24 runner for all GitHub Actions (suppresses Node 20 EOL warnings).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   rust-test:
     name: Rust tests (${{ matrix.os }})
@@ -19,6 +23,11 @@ jobs:
 
       - name: cargo test --lib
         run: cargo test -q --lib
+
+      - name: cargo check (warnings as errors)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: cargo check -q
 
   python-smoke:
     name: Python smoke test

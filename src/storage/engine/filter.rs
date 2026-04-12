@@ -365,58 +365,62 @@ unsafe fn score_vectors_avx2(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
     let chunks = n / 4;
     let rem_start = chunks * 4;
 
-    match metric {
-        DistanceMetric::Ip => {
-            let mut acc = _mm256_setzero_pd();
-            for i in 0..chunks {
-                let av = _mm256_loadu_pd(a_ptr.add(i * 4));
-                let bv = _mm256_loadu_pd(b_ptr.add(i * 4));
-                acc = _mm256_fmadd_pd(av, bv, acc);
+    // SAFETY: `#[target_feature]` guarantees AVX2+FMA are available;
+    // `a_ptr`/`b_ptr` are valid for `n` elements (derived from slice data).
+    unsafe {
+        match metric {
+            DistanceMetric::Ip => {
+                let mut acc = _mm256_setzero_pd();
+                for i in 0..chunks {
+                    let av = _mm256_loadu_pd(a_ptr.add(i * 4));
+                    let bv = _mm256_loadu_pd(b_ptr.add(i * 4));
+                    acc = _mm256_fmadd_pd(av, bv, acc);
+                }
+                let mut dot = hsum_pd(acc);
+                for i in rem_start..n {
+                    dot += *a_ptr.add(i) * *b_ptr.add(i);
+                }
+                dot
             }
-            let mut dot = hsum_pd(acc);
-            for i in rem_start..n {
-                dot += *a_ptr.add(i) * *b_ptr.add(i);
+            DistanceMetric::Cosine => {
+                let mut dot_acc = _mm256_setzero_pd();
+                let mut an_acc = _mm256_setzero_pd();
+                let mut bn_acc = _mm256_setzero_pd();
+                for i in 0..chunks {
+                    let av = _mm256_loadu_pd(a_ptr.add(i * 4));
+                    let bv = _mm256_loadu_pd(b_ptr.add(i * 4));
+                    dot_acc = _mm256_fmadd_pd(av, bv, dot_acc);
+                    an_acc = _mm256_fmadd_pd(av, av, an_acc);
+                    bn_acc = _mm256_fmadd_pd(bv, bv, bn_acc);
+                }
+                let mut dot = hsum_pd(dot_acc);
+                let mut an2 = hsum_pd(an_acc);
+                let mut bn2 = hsum_pd(bn_acc);
+                for i in rem_start..n {
+                    let av = *a_ptr.add(i);
+                    let bv = *b_ptr.add(i);
+                    dot += av * bv;
+                    an2 += av * av;
+                    bn2 += bv * bv;
+                }
+                let denom = an2.sqrt() * bn2.sqrt();
+                if denom == 0.0 { 0.0 } else { dot / denom }
             }
-            dot
-        }
-        DistanceMetric::Cosine => {
-            let mut dot_acc = _mm256_setzero_pd();
-            let mut an_acc = _mm256_setzero_pd();
-            let mut bn_acc = _mm256_setzero_pd();
-            for i in 0..chunks {
-                let av = _mm256_loadu_pd(a_ptr.add(i * 4));
-                let bv = _mm256_loadu_pd(b_ptr.add(i * 4));
-                dot_acc = _mm256_fmadd_pd(av, bv, dot_acc);
-                an_acc = _mm256_fmadd_pd(av, av, an_acc);
-                bn_acc = _mm256_fmadd_pd(bv, bv, bn_acc);
+            DistanceMetric::L2 => {
+                let mut acc = _mm256_setzero_pd();
+                for i in 0..chunks {
+                    let av = _mm256_loadu_pd(a_ptr.add(i * 4));
+                    let bv = _mm256_loadu_pd(b_ptr.add(i * 4));
+                    let diff = _mm256_sub_pd(av, bv);
+                    acc = _mm256_fmadd_pd(diff, diff, acc);
+                }
+                let mut dist2 = hsum_pd(acc);
+                for i in rem_start..n {
+                    let d = *a_ptr.add(i) - *b_ptr.add(i);
+                    dist2 += d * d;
+                }
+                -dist2.sqrt()
             }
-            let mut dot = hsum_pd(dot_acc);
-            let mut an2 = hsum_pd(an_acc);
-            let mut bn2 = hsum_pd(bn_acc);
-            for i in rem_start..n {
-                let av = *a_ptr.add(i);
-                let bv = *b_ptr.add(i);
-                dot += av * bv;
-                an2 += av * av;
-                bn2 += bv * bv;
-            }
-            let denom = an2.sqrt() * bn2.sqrt();
-            if denom == 0.0 { 0.0 } else { dot / denom }
-        }
-        DistanceMetric::L2 => {
-            let mut acc = _mm256_setzero_pd();
-            for i in 0..chunks {
-                let av = _mm256_loadu_pd(a_ptr.add(i * 4));
-                let bv = _mm256_loadu_pd(b_ptr.add(i * 4));
-                let diff = _mm256_sub_pd(av, bv);
-                acc = _mm256_fmadd_pd(diff, diff, acc);
-            }
-            let mut dist2 = hsum_pd(acc);
-            for i in rem_start..n {
-                let d = *a_ptr.add(i) - *b_ptr.add(i);
-                dist2 += d * d;
-            }
-            -dist2.sqrt()
         }
     }
 }
@@ -426,9 +430,135 @@ unsafe fn score_vectors_avx2(metric: &DistanceMetric, a: &Array1<f64>, b: &Array
 #[inline]
 unsafe fn hsum_pd(v: std::arch::x86_64::__m256d) -> f64 {
     use std::arch::x86_64::*;
+    // SAFETY: `#[target_feature]` guarantees AVX2 is available.
+    // These intrinsics are pure register operations (no raw pointer access)
+    // and are safe to call once the feature is guaranteed by the attribute.
     let lo = _mm256_castpd256_pd128(v);
     let hi = _mm256_extractf128_pd(v, 1);
     let sum128 = _mm_add_pd(lo, hi);
     let hi64 = _mm_unpackhi_pd(sum128, sum128);
     _mm_cvtsd_f64(_mm_add_sd(sum128, hi64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array1;
+
+    fn vec(data: &[f64]) -> Array1<f64> {
+        Array1::from_vec(data.to_vec())
+    }
+
+    // ── score_vectors_with_metric — scalar path (short vectors < 4 elements) ──
+
+    #[test]
+    fn ip_unit_vector() {
+        let a = vec(&[1.0, 0.0, 0.0]);
+        let b = vec(&[1.0, 0.0, 0.0]);
+        assert!((score_vectors_with_metric(&DistanceMetric::Ip, &a, &b) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cosine_orthogonal_is_zero() {
+        let a = vec(&[1.0, 0.0]);
+        let b = vec(&[0.0, 1.0]);
+        assert!(score_vectors_with_metric(&DistanceMetric::Cosine, &a, &b).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cosine_parallel_is_one() {
+        let a = vec(&[3.0, 4.0]);
+        let b = vec(&[6.0, 8.0]);
+        assert!((score_vectors_with_metric(&DistanceMetric::Cosine, &a, &b) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn l2_identical_vectors_is_zero() {
+        let a = vec(&[1.0, 2.0, 3.0]);
+        let b = vec(&[1.0, 2.0, 3.0]);
+        let s = score_vectors_with_metric(&DistanceMetric::L2, &a, &b);
+        assert!(s.abs() < 1e-10, "identical → L2=0, got {s}");
+    }
+
+    #[test]
+    fn l2_known_distance() {
+        // distance([0,0,0], [1,1,1]) = sqrt(3), negated → -sqrt(3)
+        let a = vec(&[0.0, 0.0, 0.0]);
+        let b = vec(&[1.0, 1.0, 1.0]);
+        let expected = -(3.0f64.sqrt());
+        let s = score_vectors_with_metric(&DistanceMetric::L2, &a, &b);
+        assert!((s - expected).abs() < 1e-10, "expected {expected}, got {s}");
+    }
+
+    // ── score_vectors_with_metric — long vectors exercise AVX2 + scalar tail ──
+    // dim=128: 32 SIMD chunks (4-wide) with no remainder
+    // dim=131: 32 SIMD chunks + 3-element tail
+
+    #[test]
+    fn ip_long_vector_no_tail() {
+        let n = 128;
+        let a = Array1::from_vec((0..n).map(|i| i as f64).collect());
+        let b = Array1::ones(n);
+        let expected: f64 = (0..n as i64).map(|i| i as f64).sum();
+        let s = score_vectors_with_metric(&DistanceMetric::Ip, &a, &b);
+        assert!((s - expected).abs() < 1e-6, "expected {expected}, got {s}");
+    }
+
+    #[test]
+    fn ip_long_vector_with_tail() {
+        let n = 131usize;
+        let a = Array1::ones(n);
+        let b = Array1::ones(n);
+        let expected = n as f64;
+        let s = score_vectors_with_metric(&DistanceMetric::Ip, &a, &b);
+        assert!((s - expected).abs() < 1e-6, "expected {expected}, got {s}");
+    }
+
+    #[test]
+    fn l2_long_vector_known_distance() {
+        let n = 128usize;
+        let a = Array1::zeros(n);
+        let b = Array1::ones(n);
+        let expected = -(n as f64).sqrt();
+        let s = score_vectors_with_metric(&DistanceMetric::L2, &a, &b);
+        assert!((s - expected).abs() < 1e-10, "expected {expected}, got {s}");
+    }
+
+    #[test]
+    fn cosine_long_parallel_vectors() {
+        let n = 128usize;
+        let a = Array1::ones(n);
+        let b = Array1::from_elem(n, 2.0);
+        let s = score_vectors_with_metric(&DistanceMetric::Cosine, &a, &b);
+        assert!((s - 1.0).abs() < 1e-10, "parallel → cosine=1, got {s}");
+    }
+
+    #[test]
+    fn cosine_long_with_tail() {
+        let n = 131usize;
+        let a = Array1::ones(n);
+        let b = Array1::from_elem(n, 3.0);
+        let s = score_vectors_with_metric(&DistanceMetric::Cosine, &a, &b);
+        assert!((s - 1.0).abs() < 1e-10, "parallel → cosine=1, got {s}");
+    }
+
+    // ── Zero-vector edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn cosine_zero_vector_returns_zero() {
+        let a = Array1::zeros(128usize);
+        let b = Array1::ones(128usize);
+        let s = score_vectors_with_metric(&DistanceMetric::Cosine, &a, &b);
+        assert_eq!(s, 0.0, "zero vector → cosine=0");
+    }
+
+    #[test]
+    fn l2_long_with_tail() {
+        let n = 131usize;
+        let a = Array1::zeros(n);
+        let b = Array1::ones(n);
+        let expected = -(n as f64).sqrt();
+        let s = score_vectors_with_metric(&DistanceMetric::L2, &a, &b);
+        assert!((s - expected).abs() < 1e-10, "expected {expected}, got {s}");
+    }
 }

@@ -3,6 +3,9 @@ name = "tqdb"
 version = "0.5.1"
 edition = "2024"
 license = "Apache-2.0"
+description = "Embedded vector database with zero-training-time two-stage quantization (TurboQuant)"
+repository = "https://github.com/jyunming/TurboQuantDB"
+homepage = "https://github.com/jyunming/TurboQuantDB"
 
 [lib]
 name = "tqdb"

@@ -9,6 +9,10 @@ permissions:
   contents: write
   id-token: write   # required for PyPI Trusted Publisher (OIDC)
 
+env:
+  # Opt into Node.js 24 runner for all GitHub Actions (suppresses Node 20 EOL warnings).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   # ── Linux (manylinux) ───────────────────────────────────────────────────────
   # manylinux containers ship CPython 3.10–3.13; no setup-python needed.
@@ -87,14 +91,26 @@ jobs:
           path: dist
 
   # ── macOS ────────────────────────────────────────────────────────────────────
-  # setup-python only accepts a single version; use a matrix to install each.
+  # `macos-latest` is ARM64 (M-series).  We need an Intel (x86_64) runner
+  # for x86_64 targets so setup-python installs an x86_64 Python framework —
+  # otherwise the linker can't find x86_64 Python C API symbols when
+  # cross-compiling from ARM64.
+  #
+  # Matrix trick: declare `runner` per target via `include:` so each row
+  # automatically gets the correct runner.
   macos:
     name: macOS wheels (${{ matrix.target }}, Python ${{ matrix.python-version }})
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         target: [x86_64, aarch64]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - target: x86_64
+            runner: macos-13       # last Intel runner; installs x86_64 Python
+          - target: aarch64
+            runner: macos-latest   # ARM64 (M-series)
     steps:
       - uses: actions/checkout@v4
 
