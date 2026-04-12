@@ -101,21 +101,32 @@ These two parameters work together and must be understood as a pair:
 
 See [`docs/CONFIGURATION.md`](CONFIGURATION.md) for a full decision guide with storage estimates and scenario presets.
 
-### Default — best recall (recommended)
+### Default — minimum disk, fastest ingest
 
 ```python
 db = Database.open(path, dimension=DIM, bits=4)
-# rerank=False, fast_mode=True (defaults) — MSE codes only; minimum disk, fastest ingest
+# rerank=False, fast_mode=True (library defaults) — MSE codes only; minimum disk
 results = db.search(query, top_k=10)
-# GloVe-200 (d=200):     R@1 ≈ 0.72  |  ~22 MB disk
-# arXiv-768 (d=768):     R@1 ≈ 0.92  |  ~48 MB disk
+# GloVe-200 (d=200):     R@1 ≈ 0.82  |  ~22 MB disk
+# arXiv-768 (d=768):     R@1 ≈ 0.70  |  ~48 MB disk
 # DBpedia-1536 (d=1536): R@1 ≈ 0.92  |  ~108 MB disk
+```
+
+### Best recall — enable INT8 rerank
+
+```python
+db = Database.open(path, dimension=DIM, bits=4, rerank=True)
+# INT8 raw-vector reranking (default precision); +5–25 pp R@1 vs no-rerank
+results = db.search(query, top_k=10)
+# GloVe-200 (d=200):     R@1 ≈ 1.00  |  ~30 MB disk
+# arXiv-768 (d=768):     R@1 ≈ 0.98  |  ~116 MB disk
+# DBpedia-1536 (d=1536): R@1 ≈ 0.95  |  ~231 MB disk
 ```
 
 ### Best recall, high-d (d ≥ 1536)
 
 ```python
-db = Database.open(path, dimension=1536, bits=4, fast_mode=False)
+db = Database.open(path, dimension=1536, bits=4, rerank=True, fast_mode=False)
 # QJL residuals provide +3–8 pp R@1 vs fast_mode=True at d≥1536
 results = db.search(query, top_k=10)
 ```
@@ -123,8 +134,8 @@ results = db.search(query, top_k=10)
 ### Minimum disk — compressed codes only
 
 ```python
-db = Database.open(path, dimension=DIM, bits=4, rerank=False)
-# No raw vectors stored; ~4–7× less disk than rerank=True
+db = Database.open(path, dimension=DIM, bits=4)   # rerank=False is the default
+# No raw vectors stored; same as Default preset above
 ```
 
 ### Low latency at scale — HNSW index

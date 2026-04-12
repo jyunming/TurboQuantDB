@@ -50,21 +50,21 @@ The **[interactive Config Advisor](https://jyunming.github.io/TurboQuantDB/advis
 ```python
 from tqdb import Database
 
-# Best recall, any dimension — brute-force (default)
-db = Database.open(path, dimension=DIM, bits=4)           # rerank=True, f16 storage by default
+# Best recall, any dimension — brute-force
+db = Database.open(path, dimension=DIM, bits=4, rerank=True)   # INT8 rerank storage
 results = db.search(query, top_k=10)
-# GloVe-200:  R@1 ≈ 1.00  |  54 MB disk
-# arXiv-768:  R@1 ≈ 0.99  |  200 MB disk
-# DBpedia-1536: R@1 ≈ 0.95  |  396 MB disk
+# GloVe-200 (d=200):     R@1 ≈ 1.00  |  ~30 MB disk
+# arXiv-768 (d=768):     R@1 ≈ 0.98  |  ~116 MB disk
+# DBpedia-1536 (d=1536): R@1 ≈ 0.95  |  ~231 MB disk
 
 # Best recall, high-d (d ≥ 1536) — also enable QJL residuals
-db = Database.open(path, dimension=1536, bits=4, fast_mode=False)
+db = Database.open(path, dimension=1536, bits=4, rerank=True, fast_mode=False)
 
-# Minimum disk — compressed codes only
-db = Database.open(path, dimension=DIM, bits=4, rerank=False)
+# Minimum disk — MSE codes only (library default, no extra vector storage)
+db = Database.open(path, dimension=DIM, bits=4)
 
 # Low latency at N ≥ 100k — HNSW index
-db = Database.open(path, dimension=DIM, bits=4)
+db = Database.open(path, dimension=DIM, bits=4, rerank=True)
 db.create_index()
 results = db.search(query, top_k=10, _use_ann=True)       # p50 < 10ms
 
