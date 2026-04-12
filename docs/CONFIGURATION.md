@@ -15,7 +15,7 @@ db = Database.open(
     bits=4,                 # 2 or 4 — compression bits per subspace
     rerank=True,            # store raw vectors for second-pass rescoring
     rerank_precision=None,  # None (→ "int8"), "int8"/"i8", "int4"/"i4", "f16", "f32", "disabled"
-    fast_mode=True,         # True = MSE-only; False = MSE + QJL residual
+    fast_mode=False,        # False (default) = MSE + QJL residual; True = MSE-only (faster ingest, lower disk)
     quantizer_type=None,    # None/"dense" (Haar QR) or "srht" (Hadamard)
     metric="ip",            # "ip" (inner product) or "l2" (Euclidean)
     seed=42,
@@ -46,15 +46,15 @@ Controls the number of bits per codebook subspace (Lloyd-Max quantization).
 
 ---
 
-### `fast_mode` — True (MSE-only) or False (MSE + QJL)
+### `fast_mode` — False (default, MSE+QJL) or True (MSE-only)
 
 Controls whether 1-bit QJL residual codes are stored alongside the MSE codes.
 
 | fast_mode | Ingest cost | Disk overhead | Recall effect |
 |-----------|-------------|---------------|---------------|
-| True      | baseline    | 0             | baseline      |
-| False     | +20–40%     | +4–8 MB/100k vectors | d < 512: **−2 to −8 pp R@1** (noise) |
+| False **(default)** | +20–40% | +4–8 MB/100k vectors | d < 512: **−2 to −8 pp R@1** (noise) |
 |           |             |               | d ≥ 1536: **+5–10 pp R@1** (signal accumulates) |
+| True      | baseline    | 0             | baseline (all bits to MSE codebook) |
 
 **Rule:**
 - `d < 512` → `fast_mode=True` always. QJL projections at low d are too noisy and hurt recall.
@@ -161,8 +161,9 @@ db = Database.open(path, dimension=768,
 
 ```python
 db = Database.open(path, dimension=DIM,
-    bits=4, rerank=True, fast_mode=True)
-# Good recall at all dimensions; fast_mode=False gains only at d≥1536
+    bits=4, rerank=True)
+# fast_mode=False (default) — MSE+QJL; good at d≥1536, neutral at d<512
+# For d<512, set fast_mode=True to avoid QJL noise and save ~4–8 MB/100k
 ```
 
 ### Preset 4 — Minimum disk

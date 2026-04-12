@@ -82,8 +82,8 @@ These two parameters work together and must be understood as a pair:
 
 | `fast_mode` | `rerank` | Storage | Recall impact |
 |-------------|----------|---------|---------------|
-| `True` (default) | `True` (default) | MSE codes + INT8 raw vectors | **Best at d < 1536** — recommended default |
-| `False` | `True` | MSE+QJL codes + INT8 raw vectors | **Best at d ≥ 1536** — QJL adds +3–8 pp vs fast_mode=True |
+| `False` (default) | `True` (default) | MSE+QJL codes + INT8 raw vectors | **Best at d ≥ 1536** — QJL residual adds signal at high-d |
+| `True` | `True` | MSE codes + INT8 raw vectors | **Best at d < 1536** — QJL is noisy at low-d; saves ~4–8 MB/100k |
 | `True` | `False` | MSE codes only | Paper Figure 5 baseline; minimum disk |
 | `False` | `False` | MSE+QJL codes only | Modest recall gain over fast_mode=True at d ≥ 1536 |
 
@@ -101,7 +101,7 @@ See [`docs/CONFIGURATION.md`](CONFIGURATION.md) for a full decision guide with s
 
 ```python
 db = Database.open(path, dimension=DIM, bits=4)
-# rerank=True → INT8 raw vectors stored (default); fast_mode=True (MSE-only)
+# rerank=True → INT8 raw vectors stored (default); fast_mode=False (MSE+QJL, default)
 results = db.search(query, top_k=10)
 # GloVe-200 (d=200):     R@1 ≈ 1.00  |  ~20 MB disk
 # arXiv-768 (d=768):     R@1 ≈ 0.99  |  ~74 MB disk
