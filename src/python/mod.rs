@@ -35,15 +35,16 @@ impl Database {
     ///     seed: Random seed for the quantizer. Must match on reopen. Default ``42``.
     ///     metric: Distance metric — ``"ip"`` (inner product), ``"cosine"``,
     ///             or ``"l2"`` (Euclidean). Fixed at creation. Default ``"ip"``.
-    ///     rerank: Enable reranking of HNSW candidates. Default ``True``.
-    ///     fast_mode: When ``True``, all ``bits`` go to the MSE codebook and the QJL
-    ///                residual is not stored. When ``False`` (default), the QJL residual
-    ///                is stored and used during dequantization reranking, giving significantly
-    ///                higher recall (e.g. +9–15 pp R@1 on GloVe-200 b=4). Set ``True`` only
-    ///                to match paper Figure 5 recall curves (MSE-only bit allocation) or for
-    ///                ~30% faster ingest when recall is not critical. Default ``False``.
+    ///     rerank: Enable raw-vector reranking. Default ``False``.
+    ///     fast_mode: When ``True`` (default), all ``bits`` go to the MSE codebook; the QJL
+    ///                residual is not stored (minimum disk, fastest ingest). When ``False``,
+    ///                the QJL residual is stored and used during reranking, giving +5–15 pp
+    ///                R@1 at d ≥ 1536. For d < 512, QJL projections are too noisy and reduce
+    ///                recall, so keep ``fast_mode=True`` for low-dimensional workloads.
     ///     rerank_precision: Raw-vector reranking precision:
-    ///         - ``None`` (default): ``"f32"`` when ``rerank=True``, disabled otherwise.
+    ///         - ``None`` (default): ``"int8"`` when ``rerank=True``, disabled otherwise.
+    ///         - ``"int8"``: store raw vectors as per-vector-scaled INT8 (~75% less disk than f32).
+    ///         - ``"int4"``: store raw vectors as INT4 (~87.5% less disk than f32, minor recall drop).
     ///         - ``"f16"``: store raw vectors as float16 (+n×d×2 bytes), exact reranking.
     ///         - ``"f32"``: store raw vectors as float32 (+n×d×4 bytes), maximum precision.
     ///         - ``"disabled"`` / ``"dequant"``: no extra storage; reranking uses dequantization

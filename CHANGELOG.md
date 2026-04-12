@@ -11,13 +11,13 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 ### Added
 
 - **`rerank_factor` at search time** — `db.search()` and `db.query()` now accept a `rerank_factor` parameter (integer multiplier). Controls how many over-sampled candidates are re-scored when `rerank=True`. Defaults: 10× for brute-force, 20× for ANN. Follows the industry pattern of Qdrant's `oversampling` and LanceDB's `refine_factor`.
-- **`rerank_precision` defaults to `"f16"`** — When `rerank=True` and no explicit `rerank_precision` is provided, raw vectors are now stored as float16 (half of float32 disk usage) for exact re-scoring. Previously defaulted to dequantization-only, which produced zero recall improvement for the inner-product metric.
+- **`rerank_precision` defaults to `"int8"`** — When `rerank=True` and no explicit `rerank_precision` is provided, raw vectors are stored as per-vector-scaled INT8 (~75% less disk than f32, same R@1 as f16 for inner-product search). Previously defaulted to dequantization-only, which produced zero recall improvement for the inner-product metric. Use `rerank_precision="f16"` for exact rescoring without quantization.
 - **`docs/CONFIGURATION.md`** — new comprehensive configuration guide covering all parameter dimensions (`bits`, `fast_mode`, `rerank`, `rerank_factor`, `quantizer_type`, ANN vs brute-force), recommended presets for 6 common scenarios, storage estimation formulas, and a decision flowchart.
 - **`benchmarks/full_config_bench.py`** — exhaustive 32-config × 4-dataset benchmark script. Runs all combinations of bits × rerank × ann × fast_mode × quantizer_type across GloVe-200, arXiv-768, DBpedia-1536, and DBpedia-3072. Generates recall curves, trade-off scatter plots, and a data-driven guidance report (`benchmarks/_full_config_report.md`, gitignored).
 
 ### Fixed
 
-- **Rerank no-op bug** — `rerank=True` with `rerank_precision=None` previously resolved to `Disabled` (dequantization-only). For the IP metric, dequantized scores are mathematically identical to the LUT scores, so rerank had zero effect. Now defaults to `F16` exact re-scoring, giving +5–25 pp R@1 depending on dataset and bits.
+- **Rerank no-op bug** — `rerank=True` with `rerank_precision=None` previously resolved to `Disabled` (dequantization-only). For the IP metric, dequantized scores are mathematically identical to the LUT scores, so rerank had zero effect. Now defaults to `INT8` exact re-scoring, giving +5–25 pp R@1 depending on dataset and bits.
 - **`release.yml` update-docs job** — replaced branch+PR dance with a direct `git push origin HEAD:main`. GitHub Actions cannot create pull requests in this repository (`Allow GitHub Actions to create and approve pull requests` is off), causing the previous job to fail on every release.
 
 ---
@@ -27,7 +27,7 @@ Format: `[version] — type(scope): summary`. Commits use [Conventional Commits]
 ### Added
 
 - **`quantizer_type="dense"` is now the default** — the Haar-uniform QR + dense Gaussian quantizer (paper-faithful) replaced `"srht"` as the default. `"srht"` remains available for streaming/high-d ingest workloads. `"exact"` is accepted as a backward-compatible alias for `"dense"`.
-- **`fast_mode=False` is now the default** — QJL residual is stored and used during `rerank=True` dequantization, giving +9–15 pp R@1 over `fast_mode=True` at d ≥ 1536. Set `fast_mode=True, rerank=False` for d < 512 (QJL projections are too noisy at low d and reduce recall below the MSE-only baseline) or to reproduce paper Figure 5 recall numbers.
+- **`fast_mode=True` is the default** — MSE-only quantization (fastest ingest, minimum disk). Pass `fast_mode=False` to enable QJL residuals for +5–15 pp R@1 at d ≥ 1536; at d < 512 the QJL projections are too noisy and reduce recall below the MSE-only baseline, so `fast_mode=True` is recommended for low-d workloads regardless.
 - **Auto query planner** — `_use_ann` now accepts `None` (the new default). When `None`, the engine automatically selects HNSW search when an index exists, N ≥ 10,000, and the unindexed delta is ≤ 20% of the corpus. Pass `True`/`False` to force a mode.
 - **Range index for numeric metadata** — `$gt`/`$gte`/`$lt`/`$lte` filters now use a per-field BTreeMap index (IEEE-754 ordered keys) instead of a full scan, updated incrementally on insert/delete.
 - **Equality index for metadata** — `$eq` filters resolved via an in-memory inverted index (O(1) candidate lookup), removing the need to scan all vectors on selective equality filters.
