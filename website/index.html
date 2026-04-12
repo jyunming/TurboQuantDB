@@ -32,7 +32,7 @@
         </div>
     </nav>
 
-    <header class="hero">
+    <header class="hero snap-section">
         <div class="hero-content fade-in-up">
             <div class="badge" id="version-badge">Loading...</div>
             <h1 class="hero-title">Massive embedding datasets.<br>Lightweight hardware.</h1>
@@ -63,27 +63,27 @@
             </div>
 
             <div class="features-grid">
-                <div class="feature-card glass-panel fade-in-up" style="animation-delay: 0.05s">
+                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.05s">
                     <div class="feature-card-header"><div class="feature-icon">⚡</div><h3>Zero Training</h3></div>
                     <p>Quantize and search from the first insert. No offline phase, no index rebuild.</p>
                 </div>
-                <div class="feature-card glass-panel fade-in-up" style="animation-delay: 0.1s">
+                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.1s">
                     <div class="feature-card-header"><div class="feature-icon">🗜️</div><h3>10× Smaller on Disk</h3></div>
                     <p>Store 1M 1536-dim embeddings in ~600 MB instead of 6 GB with 2-bit compression.</p>
                 </div>
-                <div class="feature-card glass-panel fade-in-up" style="animation-delay: 0.15s">
+                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.15s">
                     <div class="feature-card-header"><div class="feature-icon">🎯</div><h3>Accurate Results</h3></div>
                     <p>Random rotation + residual sketch keep inner product rankings unbiased after compression.</p>
                 </div>
-                <div class="feature-card glass-panel fade-in-up" style="animation-delay: 0.2s">
+                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.2s">
                     <div class="feature-card-header"><div class="feature-icon">🔍</div><h3>Metadata Filtering</h3></div>
                     <p>MongoDB-style filters — <code>$eq</code>, <code>$gt</code>, <code>$in</code>, <code>$contains</code> — applied at query time.</p>
                 </div>
-                <div class="feature-card glass-panel fade-in-up" style="animation-delay: 0.25s">
+                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.25s">
                     <div class="feature-card-header"><div class="feature-icon">🔌</div><h3>Drop-in Compatible</h3></div>
                     <p>Swap ChromaDB or LanceDB with zero code changes. First-class LangChain support.</p>
                 </div>
-                <div class="feature-card glass-panel fade-in-up" style="animation-delay: 0.3s">
+                <div class="feature-card glass-panel fade-in-up" style="transition-delay: 0.3s">
                     <div class="feature-card-header"><div class="feature-icon">🏎️</div><h3>Sub-ms ANN Search</h3></div>
                     <p>HNSW + AVX2/SIMD. In-process — no network hops, no serialization overhead.</p>
                 </div>
@@ -131,40 +131,42 @@ for r in results:
         </div>
     </section>
 
-    <!-- ── Config Advisor CTA ───────────────────────────────────────────── -->
-    <div class="advisor-banner fade-in-up">
-        <div class="advisor-banner-inner">
-            <div class="advisor-banner-text">
-                <h3>Not sure which config fits your use case?</h3>
-                <p>Pick your dimension and priorities — get a recommendation from data across 9 public datasets.</p>
-            </div>
-            <a href="advisor.html" class="btn btn-primary btn-lg">Open Config Advisor →</a>
-        </div>
-    </div>
-
-    <section id="ecosystem" class="section bg-darker">
-        <div class="section-header fade-in-up">
-            <h2>Developer Ecosystem</h2>
-            <p>Embedded library, HTTP server, or drop-in replacement — pick your integration style.</p>
-        </div>
-
-        <div class="ecosystem-grid">
-            <!-- Featured: Server Mode -->
-            <div class="eco-featured fade-in-up">
-                <div class="eco-featured-text">
-                    <div class="eco-featured-badge">🚀 Production-ready</div>
-                    <h3>Server Mode</h3>
-                    <p>Spin up a full HTTP service with multi-tenancy, RBAC, per-tenant quotas, and Prometheus metrics. Designed for teams that need centralized vector search without the overhead of a heavyweight database.</p>
-                    <div class="eco-featured-pills">
-                        <span class="eco-pill">multi-tenant</span>
-                        <span class="eco-pill">RBAC</span>
-                        <span class="eco-pill">Prometheus</span>
-                        <span class="eco-pill">async jobs</span>
+    <!-- ── Ecosystem + CTA (snap section 4) ─────────────────────────────── -->
+    <section id="ecosystem" class="snap-section bg-darker">
+        <div class="section">
+            <!-- Config Advisor CTA strip -->
+            <div class="advisor-banner fade-in-up">
+                <div class="advisor-banner-inner">
+                    <div class="advisor-banner-text">
+                        <h3>Not sure which config fits your use case?</h3>
+                        <p>Pick your dimension and priorities — get a recommendation from data across 9 public datasets.</p>
                     </div>
+                    <a href="advisor.html" class="btn btn-primary btn-lg">Open Config Advisor →</a>
                 </div>
-                <div class="eco-featured-code">
-                    <div class="code-header">server startup</div>
-                    <pre><code># Start the server
+            </div>
+
+            <div class="section-header fade-in-up" style="transition-delay:0.1s">
+                <h2>Developer Ecosystem</h2>
+                <p>Embedded library, HTTP server, or drop-in replacement — pick your integration style.</p>
+            </div>
+
+            <div class="ecosystem-grid">
+                <!-- Featured: Server Mode -->
+                <div class="eco-featured fade-in-up" style="transition-delay:0.15s">
+                    <div class="eco-featured-text">
+                        <div class="eco-featured-badge">🚀 Production-ready</div>
+                        <h3>Server Mode</h3>
+                        <p>Spin up a full HTTP service with multi-tenancy, RBAC, per-tenant quotas, and Prometheus metrics. Designed for teams that need centralized vector search without the overhead of a heavyweight database.</p>
+                        <div class="eco-featured-pills">
+                            <span class="eco-pill">multi-tenant</span>
+                            <span class="eco-pill">RBAC</span>
+                            <span class="eco-pill">Prometheus</span>
+                            <span class="eco-pill">async jobs</span>
+                        </div>
+                    </div>
+                    <div class="eco-featured-code">
+                        <div class="code-header">server startup</div>
+                        <pre><code># Start the server
 tqdb-server --port 8080 \
   --data-dir ./data
 
@@ -175,31 +177,32 @@ curl -X POST localhost:8080/collections \
 # Insert vectors
 curl -X POST localhost:8080/collections/docs/upsert \
   -d '{"id":"a1","vector":[...]}'</code></pre>
+                    </div>
                 </div>
-            </div>
 
-            <!-- Three integration cards -->
-            <div class="eco-integrations">
-                <div class="eco-card fade-in-up" style="animation-delay:0.1s">
-                    <div class="eco-icon-wrap green">🦜</div>
-                    <h3>LangChain RAG</h3>
-                    <p>Drop-in <code>TurboQuantRetriever</code> for any LangChain pipeline. Zero boilerplate.</p>
-                    <div class="eco-import">from tqdb import TurboQuantRetriever</div>
-                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/rag.py" class="eco-link">View source →</a>
-                </div>
-                <div class="eco-card fade-in-up" style="animation-delay:0.2s">
-                    <div class="eco-icon-wrap blue">🔄</div>
-                    <h3>ChromaDB Drop-in</h3>
-                    <p>Replace ChromaDB with zero code changes using the <code>chroma_compat</code> shim.</p>
-                    <div class="eco-import">from tqdb import chroma_compat as chromadb</div>
-                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/chroma_compat.py" class="eco-link">View source →</a>
-                </div>
-                <div class="eco-card fade-in-up" style="animation-delay:0.3s">
-                    <div class="eco-icon-wrap purple">⚙️</div>
-                    <h3>LanceDB Compatible</h3>
-                    <p>Use as a backend replacement for LanceDB with native PyArrow table ingestion.</p>
-                    <div class="eco-import">from tqdb import lancedb_compat as lancedb</div>
-                    <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/lancedb_compat.py" class="eco-link">View source →</a>
+                <!-- Three integration cards -->
+                <div class="eco-integrations">
+                    <div class="eco-card fade-in-up" style="transition-delay:0.2s">
+                        <div class="eco-icon-wrap green">🦜</div>
+                        <h3>LangChain RAG</h3>
+                        <p>Drop-in <code>TurboQuantRetriever</code> for any LangChain pipeline. Zero boilerplate.</p>
+                        <div class="eco-import">from tqdb import TurboQuantRetriever</div>
+                        <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/rag.py" class="eco-link">View source →</a>
+                    </div>
+                    <div class="eco-card fade-in-up" style="transition-delay:0.28s">
+                        <div class="eco-icon-wrap blue">🔄</div>
+                        <h3>ChromaDB Drop-in</h3>
+                        <p>Replace ChromaDB with zero code changes using the <code>chroma_compat</code> shim.</p>
+                        <div class="eco-import">from tqdb import chroma_compat as chromadb</div>
+                        <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/chroma_compat.py" class="eco-link">View source →</a>
+                    </div>
+                    <div class="eco-card fade-in-up" style="transition-delay:0.36s">
+                        <div class="eco-icon-wrap purple">⚙️</div>
+                        <h3>LanceDB Compatible</h3>
+                        <p>Use as a backend replacement for LanceDB with native PyArrow table ingestion.</p>
+                        <div class="eco-import">from tqdb import lancedb_compat as lancedb</div>
+                        <a href="https://github.com/jyunming/TurboQuantDB/blob/main/python/tqdb/lancedb_compat.py" class="eco-link">View source →</a>
+                    </div>
                 </div>
             </div>
         </div>

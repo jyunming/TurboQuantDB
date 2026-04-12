@@ -1,7 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -186,9 +186,9 @@ impl Database {
                 bits
             )));
         }
-        if bits > 64 {
+        if bits > 8 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "bits must be <= 64; got {}",
+                "bits must be <= 8; got {} (values above 8 cause exponential codebook-generation slowdown)",
                 bits
             )));
         }
@@ -205,6 +205,13 @@ impl Database {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "dimension must be > 0",
             ));
+        }
+        if let Some(wft) = wal_flush_threshold {
+            if wft == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "wal_flush_threshold must be >= 1",
+                ));
+            }
         }
         let engine = TurboQuantEngine::open_with_options(
             &engine_path,
@@ -236,14 +243,7 @@ impl Database {
         metadata: Option<&Bound<'_, PyDict>>,
         document: Option<String>,
     ) -> PyResult<()> {
-        let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
-            v.as_array().mapv(|x| x as f64)
-        } else {
-            vector
-                .extract::<PyReadonlyArray1<f64>>(py)?
-                .as_array()
-                .to_owned()
-        };
+        let vec = extract_vec1d(py, &vector)?;
         check_finite(&vec.view(), "vector")?;
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
@@ -383,14 +383,7 @@ impl Database {
         metadata: Option<&Bound<'_, PyDict>>,
         document: Option<String>,
     ) -> PyResult<()> {
-        let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
-            v.as_array().mapv(|x| x as f64)
-        } else {
-            vector
-                .extract::<PyReadonlyArray1<f64>>(py)?
-                .as_array()
-                .to_owned()
-        };
+        let vec = extract_vec1d(py, &vector)?;
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
@@ -408,14 +401,7 @@ impl Database {
         metadata: Option<&Bound<'_, PyDict>>,
         document: Option<String>,
     ) -> PyResult<()> {
-        let vec = if let Ok(v) = vector.extract::<PyReadonlyArray1<f32>>(py) {
-            v.as_array().mapv(|x| x as f64)
-        } else {
-            vector
-                .extract::<PyReadonlyArray1<f64>>(py)?
-                .as_array()
-                .to_owned()
-        };
+        let vec = extract_vec1d(py, &vector)?;
         let props = parse_pydict(metadata)?;
         py.allow_threads(|| {
             let mut engine = self.write_engine()?;
@@ -587,15 +573,15 @@ impl Database {
                 top_k
             )));
         }
+        if let Some(rf) = rerank_factor {
+            if rf == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "rerank_factor must be >= 1",
+                ));
+            }
+        }
         let top_k = top_k as usize;
-        let q = if let Ok(v) = query.extract::<PyReadonlyArray1<f32>>(py) {
-            v.as_array().mapv(|x| x as f64)
-        } else {
-            query
-                .extract::<PyReadonlyArray1<f64>>(py)?
-                .as_array()
-                .to_owned()
-        };
+        let q = extract_vec1d(py, &query)?;
         check_finite(&q.view(), "query vector")?;
         let parsed_filter = parse_pydict(filter)?;
         if !parsed_filter.is_empty() {
@@ -725,6 +711,7 @@ impl Database {
         dict.set_item("buffered_vectors", stats.buffered_vectors)?;
         dict.set_item("dimension", stats.d)?;
         dict.set_item("bits", stats.b)?;
+        dict.set_item("metric", &stats.metric)?;
         dict.set_item("total_disk_bytes", stats.total_disk_bytes)?;
         dict.set_item("has_index", stats.has_index)?;
         dict.set_item("index_nodes", stats.index_nodes)?;
@@ -1103,6 +1090,13 @@ fn py_to_json(obj: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
             arr.push(py_to_json(&item)?);
         }
         Ok(JsonValue::Array(arr))
+    } else if let Ok(tup) = obj.downcast::<PyTuple>() {
+        // BUG-12: tuples were falling through to Null — convert same as lists
+        let mut arr = Vec::new();
+        for item in tup {
+            arr.push(py_to_json(&item)?);
+        }
+        Ok(JsonValue::Array(arr))
     } else if let Ok(dict) = obj.downcast::<PyDict>() {
         let mut map = serde_json::Map::new();
         for (k, v) in dict {
@@ -1179,6 +1173,30 @@ fn parse_document_rows(
 
 fn to_py_runtime(e: Box<dyn std::error::Error + Send + Sync>) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+}
+
+/// Extract a 1-D f64 array from a Python object — accepts float32/float64 numpy
+/// arrays and plain Python lists of numbers (BUG-8 fix).
+fn extract_vec1d(py: Python<'_>, obj: &PyObject) -> PyResult<ndarray::Array1<f64>> {
+    if let Ok(v) = obj.extract::<PyReadonlyArray1<f32>>(py) {
+        return Ok(v.as_array().mapv(|x| x as f64));
+    }
+    if let Ok(v) = obj.extract::<PyReadonlyArray1<f64>>(py) {
+        return Ok(v.as_array().to_owned());
+    }
+    // Fall back to plain Python list of numbers.
+    let bound = obj.bind(py);
+    if let Ok(list) = bound.downcast::<PyList>() {
+        let v: Result<Vec<f64>, _> = list.iter().map(|x| x.extract::<f64>()).collect();
+        return Ok(ndarray::Array1::from(v.map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "vector list elements must be numeric (int or float)",
+            )
+        })?));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "vector must be a numpy ndarray (float32 or float64) or a Python list of numbers",
+    ))
 }
 
 fn check_finite(vec: &ndarray::ArrayView1<f64>, label: &str) -> PyResult<()> {

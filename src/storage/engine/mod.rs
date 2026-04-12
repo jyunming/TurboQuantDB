@@ -91,6 +91,16 @@ impl Default for DistanceMetric {
     }
 }
 
+impl std::fmt::Display for DistanceMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip => write!(f, "ip"),
+            Self::Cosine => write!(f, "cosine"),
+            Self::L2 => write!(f, "l2"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Manifest {
     pub version: u32,
@@ -206,6 +216,7 @@ pub struct DbStats {
     pub buffered_vectors: usize,
     pub d: usize,
     pub b: usize,
+    pub metric: String,
     pub total_disk_bytes: u64,
     pub has_index: bool,
     pub index_nodes: usize,
@@ -653,25 +664,29 @@ impl TurboQuantEngine {
     ) -> Result<Vec<Option<GetResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let mut out = Vec::with_capacity(ids.len());
         let mut slots = Vec::new();
-        let mut id_to_idx = HashMap::new();
+        // Map slot → list of output positions (handles duplicate IDs).
+        let mut slot_to_indices: HashMap<u32, Vec<usize>> = HashMap::new();
 
         for (i, id) in ids.iter().enumerate() {
             if let Some(slot) = self.id_pool.get_slot(id) {
+                slot_to_indices.entry(slot).or_default().push(i);
                 slots.push(slot);
-                id_to_idx.insert(slot, i);
             }
             out.push(None);
         }
+        slots.dedup(); // unique slots for metadata fetch
 
         if !slots.is_empty() {
             let meta_map = self.metadata.get_many(&slots)?;
             for (slot, meta) in meta_map {
-                if let Some(&idx) = id_to_idx.get(&slot) {
-                    out[idx] = Some(GetResult {
-                        id: ids[idx].clone(),
-                        metadata: meta.properties,
-                        document: meta.document,
-                    });
+                if let Some(indices) = slot_to_indices.get(&slot) {
+                    for &idx in indices {
+                        out[idx] = Some(GetResult {
+                            id: ids[idx].clone(),
+                            metadata: meta.properties.clone(),
+                            document: meta.document.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -2463,6 +2478,7 @@ impl TurboQuantEngine {
             buffered_vectors: self.wal_buffer.len(),
             d: self.d,
             b: self.b,
+            metric: self.metric.to_string(),
             total_disk_bytes: self.total_disk_bytes(),
             has_index: self.can_use_ann_index(),
             index_nodes: self.index_ids.len(),
@@ -2918,6 +2934,9 @@ impl TurboQuantEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let vec_f32: Vec<f32> = vector.iter().map(|&v| v as f32).collect();
         let norm = vec_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if self.normalize && norm <= 1e-10 {
+            return Err("Cannot normalize a zero vector: L2 norm is zero".into());
+        }
         let vec_unit: Vec<f32> = if norm > 1e-10 {
             vec_f32.iter().map(|&x| x / norm).collect()
         } else {

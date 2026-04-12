@@ -1,8 +1,4 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/website/favicon.svg" width="64" height="64" alt="TurboQuantDB">
-</p>
-
-# TurboQuantDB
+# <img src="https://raw.githubusercontent.com/jyunming/TurboQuantDB/main/website/favicon.svg" width="32" height="32" alt="" style="vertical-align:middle;margin-right:6px"> TurboQuantDB
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/jyunming/TurboQuantDB/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/pypi/v/tqdb)](https://pypi.org/project/tqdb/)

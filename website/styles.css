@@ -829,16 +829,18 @@ code, pre {
     font-size: 0.9rem;
 }
 
-/* Hero snap alignment (features/quickstart snap via .snap-section) */
-.hero {
+/* Hero is also a snap section */
+.hero.snap-section {
     scroll-snap-align: start;
 }
 
-/* Animations */
+/* Animations — spring ease-out for a polished feel */
 .fade-in-up {
     opacity: 0;
-    transform: translateY(36px);
-    transition: opacity 0.7s ease-out, transform 0.7s ease-out;
+    transform: translateY(28px);
+    transition: opacity 0.65s cubic-bezier(0.22, 1, 0.36, 1),
+                transform 0.65s cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: opacity, transform;
 }
 .fade-in-up.visible {
     opacity: 1;
@@ -847,8 +849,10 @@ code, pre {
 
 .fade-in-left {
     opacity: 0;
-    transform: translateX(-40px);
-    transition: opacity 0.7s ease-out, transform 0.7s ease-out;
+    transform: translateX(-32px);
+    transition: opacity 0.65s cubic-bezier(0.22, 1, 0.36, 1),
+                transform 0.65s cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: opacity, transform;
 }
 .fade-in-left.visible {
     opacity: 1;
@@ -857,24 +861,25 @@ code, pre {
 
 .fade-in-right {
     opacity: 0;
-    transform: translateX(40px);
-    transition: opacity 0.7s ease-out, transform 0.7s ease-out;
+    transform: translateX(32px);
+    transition: opacity 0.65s cubic-bezier(0.22, 1, 0.36, 1),
+                transform 0.65s cubic-bezier(0.22, 1, 0.36, 1);
+    will-change: opacity, transform;
 }
 .fade-in-right.visible {
     opacity: 1;
     transform: translateX(0);
 }
 
-/* ── Config Advisor Banner ───────────────────────────────────────────────── */
+/* ── Config Advisor Banner (now inside .section, no outer padding needed) ── */
 .advisor-banner {
     background: linear-gradient(135deg, rgba(99,102,241,0.12) 0%, rgba(0,240,255,0.06) 100%);
-    border-top: 1px solid rgba(99,102,241,0.2);
-    border-bottom: 1px solid rgba(99,102,241,0.2);
-    padding: 3rem 5%;
+    border: 1px solid rgba(99,102,241,0.2);
+    border-radius: 12px;
+    padding: 2rem 2.5rem;
+    margin-bottom: 3rem;
 }
 .advisor-banner-inner {
-    max-width: 1200px;
-    margin: 0 auto;
     display: flex;
     align-items: center;
     justify-content: space-between;
