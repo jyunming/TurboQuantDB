@@ -104,7 +104,8 @@ db = Database.open(path, dimension, bits=4, seed=42, metric="ip",
                    rerank=True, fast_mode=False, rerank_precision=None,
                    collection=None, wal_flush_threshold=None,
                    quantizer_type=None)  # None/"dense" = default (Haar QR + Gaussian); "srht" = fast O(d log d) ingest
-# NOTE: rerank=True stores raw f16 vectors for exact second-pass rescoring.
+# NOTE: rerank=True stores raw INT8 vectors (default) for exact second-pass rescoring.
+#       Use rerank_precision="f16" for float16 or "f32" for full precision.
 #       rerank_factor (default 10× brute / 20× ANN) controls oversampling.
 
 # Write

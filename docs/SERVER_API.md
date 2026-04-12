@@ -419,7 +419,7 @@ Response `200` — job record nested under `"job"`:
 }
 ```
 
-`job_type` values: `"compact"`, `"index_build"`, `"snapshot"`
+`job_type` values: `"compact"`, `"index_build"`, `"snapshot"`, `"restore"`
 
 `status` values: `"queued"`, `"running"`, `"succeeded"`, `"failed"`, `"canceled"`
 
