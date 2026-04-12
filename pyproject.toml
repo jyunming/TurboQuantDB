@@ -30,6 +30,9 @@ classifiers = [
     "Topic :: Database",
 ]
 
+[project.scripts]
+tqdb-server = "tqdb._server_launcher:main"
+
 [project.urls]
 Homepage = "https://jyunming.github.io/TurboQuantDB"
 Repository = "https://github.com/jyunming/TurboQuantDB"
@@ -40,7 +43,7 @@ Changelog = "https://github.com/jyunming/TurboQuantDB/releases"
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
-include = ["python/tqdb/*.pyi"]
+include = ["python/tqdb/*.pyi", "python/tqdb/_bin/*"]
 
 [tool.pytest.ini_options]
 tmp_path_retention_policy = "failed"
