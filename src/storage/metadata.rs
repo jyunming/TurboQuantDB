@@ -4,6 +4,10 @@ use std::fs::File;
 use std::io::{BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
+const DOCS_RAW_MAGIC: &[u8; 4] = b"M2D1";
+const DOCS_CONTAINER_MAGIC: &[u8; 4] = b"M2DZ";
+const DOCS_CODEC_RAW: u8 = 0;
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct VectorMetadata {
     pub properties: HashMap<String, serde_json::Value>,
@@ -298,7 +302,7 @@ impl MetadataStore {
         } else {
             let docs_tmp = self.docs_path.with_extension("docs.tmp");
             let mut raw = Vec::new();
-            raw.write_all(b"M2D1")?;
+            raw.write_all(DOCS_RAW_MAGIC)?;
             raw.write_all(&(docs.len() as u64).to_le_bytes())?;
             for (slot, doc) in docs {
                 let b = doc.as_bytes();
@@ -306,8 +310,31 @@ impl MetadataStore {
                 raw.write_all(&(b.len() as u32).to_le_bytes())?;
                 raw.write_all(b)?;
             }
-            let compressed = zstd::stream::encode_all(raw.as_slice(), 3)?;
-            std::fs::write(&docs_tmp, compressed)?;
+            // Adaptive document compression:
+            // - very small payloads: store raw (avoid zstd framing overhead)
+            // - medium payloads: zstd-1 (faster)
+            // - larger payloads: zstd-3
+            // - very large payloads: zstd-6 (better footprint)
+            let raw_len = raw.len();
+            let codec = if raw_len < 8 * 1024 {
+                DOCS_CODEC_RAW
+            } else if raw_len < 256 * 1024 {
+                1
+            } else if raw_len < 2 * 1024 * 1024 {
+                3
+            } else {
+                6
+            };
+            let payload = if codec == DOCS_CODEC_RAW {
+                raw
+            } else {
+                zstd::stream::encode_all(raw.as_slice(), codec as i32)?
+            };
+            let mut out = Vec::with_capacity(payload.len() + 5);
+            out.extend_from_slice(DOCS_CONTAINER_MAGIC);
+            out.push(codec);
+            out.extend_from_slice(&payload);
+            std::fs::write(&docs_tmp, out)?;
             #[cfg(target_os = "windows")]
             let _ = std::fs::remove_file(&self.docs_path);
             std::fs::rename(docs_tmp, &self.docs_path)?;
@@ -484,18 +511,40 @@ impl MetadataStore {
     fn load_docs_from_file(
         path: &Path,
     ) -> Result<HashMap<u32, String>, Box<dyn std::error::Error + Send + Sync>> {
-        let compressed = std::fs::read(path)?;
-        let bytes = zstd::stream::decode_all(compressed.as_slice())?;
+        let encoded = std::fs::read(path)?;
+        let bytes = if encoded.starts_with(DOCS_CONTAINER_MAGIC) {
+            if encoded.len() < 5 {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("corrupt docs container in {}: too short", path.display()),
+                )));
+            }
+            let codec = encoded[4];
+            let payload = &encoded[5..];
+            match codec {
+                DOCS_CODEC_RAW => payload.to_vec(),
+                1 | 3 | 6 => zstd::stream::decode_all(payload)?,
+                _ => {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unsupported docs codec {} in {}", codec, path.display()),
+                    )));
+                }
+            }
+        } else {
+            // Backward-compatible path for legacy `docs.zst` files.
+            zstd::stream::decode_all(encoded.as_slice())?
+        };
         let mut cur = Cursor::new(bytes);
         let mut magic = [0u8; 4];
         cur.read_exact(&mut magic)?;
-        if &magic != b"M2D1" {
+        if &magic != DOCS_RAW_MAGIC {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "invalid docs magic in {}: expected {:?}, found {:?}",
                     path.display(),
-                    b"M2D1",
+                    DOCS_RAW_MAGIC,
                     magic
                 ),
             )));
@@ -671,6 +720,44 @@ mod tests {
         assert_eq!(m0.properties["field"], json!("hello"));
         let m1 = store2.get(1).unwrap().unwrap();
         assert_eq!(m1.document, Some("doc text".to_string()));
+    }
+
+    #[test]
+    fn docs_small_payload_uses_raw_codec_container() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.bin").to_str().unwrap().to_string();
+        {
+            let mut store = MetadataStore::open(&path).unwrap();
+            let with_doc = VectorMetadata {
+                properties: Default::default(),
+                document: Some("tiny doc".to_string()),
+            };
+            store.put(1, &with_doc).unwrap();
+            store.flush().unwrap();
+        }
+        let docs_path = dir.path().join("meta.docs.zst");
+        let bytes = std::fs::read(&docs_path).unwrap();
+        assert!(bytes.starts_with(DOCS_CONTAINER_MAGIC));
+        assert_eq!(bytes[4], DOCS_CODEC_RAW);
+    }
+
+    #[test]
+    fn docs_large_payload_uses_compressed_codec_container() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.bin").to_str().unwrap().to_string();
+        {
+            let mut store = MetadataStore::open(&path).unwrap();
+            let with_doc = VectorMetadata {
+                properties: Default::default(),
+                document: Some("x".repeat(512 * 1024)),
+            };
+            store.put(1, &with_doc).unwrap();
+            store.flush().unwrap();
+        }
+        let docs_path = dir.path().join("meta.docs.zst");
+        let bytes = std::fs::read(&docs_path).unwrap();
+        assert!(bytes.starts_with(DOCS_CONTAINER_MAGIC));
+        assert_ne!(bytes[4], DOCS_CODEC_RAW);
     }
 
     #[test]

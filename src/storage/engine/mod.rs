@@ -32,6 +32,8 @@ const ID_POOL_DENSE_MAGIC: &[u8; 8] = b"TQID2D1\0";
 /// Sparse format: stores bytes/offsets/lens/alive only — hashes recomputed on load.
 /// Saves 8 bytes × slot_count vs the raw bincode layout.
 const ID_POOL_SPARSE_MAGIC: &[u8; 8] = b"TQID2S1\0";
+/// Sparse+zstd format: same sparse payload, zstd-compressed on disk when beneficial.
+const ID_POOL_SPARSE_ZSTD_MAGIC: &[u8; 8] = b"TQID2Z1\0";
 /// Automatic maintenance: when segment count grows beyond this threshold,
 /// a compaction checkpoint is triggered on WAL flush.
 const AUTO_CHECKPOINT_SEGMENTS_THRESHOLD: usize = 64;
@@ -1914,9 +1916,45 @@ impl TurboQuantEngine {
         //
         // SEQ_THRESHOLD is adapted by dimension: high-D work per slot is larger so the
         // break-even point is lower. Target ~5M scoring ops as the parallel kick-in.
-        const CHUNK: usize = 1024;
         let seq_threshold = (5_000_000 / quantizer.d).clamp(1_000, SEQ_THRESHOLD);
+        // Parallel chunk size is also adapted by D to keep per-chunk work roughly stable.
+        // Low-D queries use larger chunks (less scheduler overhead), high-D uses smaller
+        // chunks (better load-balancing and cache behavior).
+        let par_chunk_max = if !self.rerank_enabled && quantizer.d >= 512 {
+            2048
+        } else {
+            4096
+        };
+        let par_chunk = (2_000_000 / quantizer.d.max(1)).clamp(128, par_chunk_max);
         let n_candidates = candidate_slots.len();
+        let merge_topk = |mut a: Vec<(u32, f64)>, mut b: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
+            if a.is_empty() {
+                if b.len() > internal_k {
+                    b.select_nth_unstable_by(internal_k, |x, y| {
+                        y.1.partial_cmp(&x.1).unwrap_or(Ordering::Equal)
+                    });
+                    b.truncate(internal_k);
+                }
+                return b;
+            }
+            if b.is_empty() {
+                if a.len() > internal_k {
+                    a.select_nth_unstable_by(internal_k, |x, y| {
+                        y.1.partial_cmp(&x.1).unwrap_or(Ordering::Equal)
+                    });
+                    a.truncate(internal_k);
+                }
+                return a;
+            }
+            a.append(&mut b);
+            if a.len() > internal_k {
+                a.select_nth_unstable_by(internal_k, |x, y| {
+                    y.1.partial_cmp(&x.1).unwrap_or(Ordering::Equal)
+                });
+                a.truncate(internal_k);
+            }
+            a
+        };
         let scored: Vec<(u32, f64)> = if n_candidates <= seq_threshold {
             // Sequential path: single idx buffer reused across all slots.
             let mut out = Vec::with_capacity(n_candidates);
@@ -1996,13 +2034,14 @@ impl TurboQuantEngine {
             }
             out
         } else {
-            // Parallel path: each 512-slot chunk reuses one CodeIndex scratch buffer.
+            // Parallel path: each chunk reuses one CodeIndex scratch buffer and keeps
+            // only local top-k before a streaming global merge.
             match metric {
                 DistanceMetric::Ip => {
                     let prep = quantizer.prepare_ip_query(query);
                     candidate_slots
-                        .par_chunks(CHUNK)
-                        .flat_map(|chunk| {
+                        .par_chunks(par_chunk)
+                        .map(|chunk| {
                             let mut idx = vec![0u16; quantizer.n];
                             let mut out = Vec::with_capacity(chunk.len());
                             for &slot in chunk {
@@ -2036,13 +2075,13 @@ impl TurboQuantEngine {
                             }
                             out
                         })
-                        .collect()
+                        .reduce(Vec::new, merge_topk)
                 }
                 DistanceMetric::Cosine => {
                     let prep = quantizer.prepare_ip_query(query);
                     candidate_slots
-                        .par_chunks(CHUNK)
-                        .flat_map(|chunk| {
+                        .par_chunks(par_chunk)
+                        .map(|chunk| {
                             let mut idx = vec![0u16; quantizer.n];
                             let mut out = Vec::with_capacity(chunk.len());
                             for &slot in chunk {
@@ -2073,13 +2112,13 @@ impl TurboQuantEngine {
                             }
                             out
                         })
-                        .collect()
+                        .reduce(Vec::new, merge_topk)
                 }
                 _ => {
                     // L2 and any future metrics: dequantize then compute distance
                     candidate_slots
-                        .par_chunks(CHUNK)
-                        .flat_map(|chunk| {
+                        .par_chunks(par_chunk)
+                        .map(|chunk| {
                             let mut idx = vec![0u16; quantizer.n];
                             let mut out = Vec::with_capacity(chunk.len());
                             for &slot in chunk {
@@ -2114,7 +2153,7 @@ impl TurboQuantEngine {
                             }
                             out
                         })
-                        .collect()
+                        .reduce(Vec::new, merge_topk)
                 }
             }
         };
@@ -3408,9 +3447,25 @@ fn save_id_pool(
             lens: pool.raw_lens().to_vec(),
             alive: pool.raw_alive().to_vec(),
         };
-        let mut out = ID_POOL_SPARSE_MAGIC.to_vec();
-        out.extend_from_slice(&bincode::serialize(&sparse)?);
-        out
+        let sparse_bytes = bincode::serialize(&sparse)?;
+        // Optional compressed sparse encoding for large ID pools.
+        // Keep legacy sparse format when compression is not worthwhile.
+        if sparse_bytes.len() >= 4 * 1024 {
+            let compressed = zstd::stream::encode_all(sparse_bytes.as_slice(), 1)?;
+            if compressed.len() + 256 < sparse_bytes.len() {
+                let mut out = ID_POOL_SPARSE_ZSTD_MAGIC.to_vec();
+                out.extend_from_slice(&compressed);
+                out
+            } else {
+                let mut out = ID_POOL_SPARSE_MAGIC.to_vec();
+                out.extend_from_slice(&sparse_bytes);
+                out
+            }
+        } else {
+            let mut out = ID_POOL_SPARSE_MAGIC.to_vec();
+            out.extend_from_slice(&sparse_bytes);
+            out
+        }
     };
     let local = format!("{}/{}", local_dir, ID_POOL_FILE);
     std::fs::write(&local, &bytes)?;
@@ -3466,6 +3521,11 @@ fn deserialize_id_pool_bytes(
     }
     if bytes.starts_with(ID_POOL_SPARSE_MAGIC) {
         let sparse: SparseIdDisk = bincode::deserialize(&bytes[ID_POOL_SPARSE_MAGIC.len()..])?;
+        return IdPool::from_sparse(sparse.bytes, sparse.offsets, sparse.lens, sparse.alive);
+    }
+    if bytes.starts_with(ID_POOL_SPARSE_ZSTD_MAGIC) {
+        let raw = zstd::stream::decode_all(&bytes[ID_POOL_SPARSE_ZSTD_MAGIC.len()..])?;
+        let sparse: SparseIdDisk = bincode::deserialize(&raw)?;
         return IdPool::from_sparse(sparse.bytes, sparse.offsets, sparse.lens, sparse.alive);
     }
     // Legacy: raw bincode with hashes included.
