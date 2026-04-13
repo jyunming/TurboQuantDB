@@ -1911,9 +1911,13 @@ impl TurboQuantEngine {
         // Scoring: sequential for small N (avoids Rayon thread park/unpark on Windows
         // where scheduler granularity dominates the actual sub-millisecond work);
         // parallel chunk-based for large N where the work outweighs the thread overhead.
+        //
+        // SEQ_THRESHOLD is adapted by dimension: high-D work per slot is larger so the
+        // break-even point is lower. Target ~5M scoring ops as the parallel kick-in.
         const CHUNK: usize = 1024;
+        let seq_threshold = (5_000_000 / quantizer.d).clamp(1_000, SEQ_THRESHOLD);
         let n_candidates = candidate_slots.len();
-        let scored: Vec<(u32, f64)> = if n_candidates <= SEQ_THRESHOLD {
+        let scored: Vec<(u32, f64)> = if n_candidates <= seq_threshold {
             // Sequential path: single idx buffer reused across all slots.
             let mut out = Vec::with_capacity(n_candidates);
             let mut idx = vec![0u16; quantizer.n];

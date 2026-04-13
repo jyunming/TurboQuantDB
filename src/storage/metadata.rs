@@ -306,7 +306,7 @@ impl MetadataStore {
                 raw.write_all(&(b.len() as u32).to_le_bytes())?;
                 raw.write_all(b)?;
             }
-            let compressed = zstd::stream::encode_all(raw.as_slice(), 9)?;
+            let compressed = zstd::stream::encode_all(raw.as_slice(), 3)?;
             std::fs::write(&docs_tmp, compressed)?;
             #[cfg(target_os = "windows")]
             let _ = std::fs::remove_file(&self.docs_path);
