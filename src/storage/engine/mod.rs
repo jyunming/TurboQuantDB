@@ -2280,6 +2280,11 @@ impl TurboQuantEngine {
         self.metadata.flush()?;
         self.persist_id_pool()?;
         self.maybe_persist_state(true)?;
+        // Segments are crash-recovery fallbacks: live_codes.bin + live_ids.bin are now
+        // the authoritative state and are fully flushed.  Delete segment files so a clean
+        // close does not leave duplicate data on disk.  On next open an empty segment list
+        // is fine — WAL replay and live_codes restore state without them.
+        self.segments.drop_all()?;
         Ok(())
     }
 
