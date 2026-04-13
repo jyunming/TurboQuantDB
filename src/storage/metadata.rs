@@ -46,6 +46,7 @@ pub(crate) fn f64_to_ord(v: f64) -> u64 {
 
 pub struct MetadataStore {
     path: PathBuf,
+    docs_path: PathBuf,
     data: HashMap<u32, VectorMetadata>,
     dirty: bool,
     /// Equality index: field -> value_key -> sorted slot list.
@@ -61,20 +62,28 @@ pub struct MetadataStore {
 impl MetadataStore {
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let path = PathBuf::from(path);
+        let docs_path = path.with_extension("docs.zst");
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let data = if path.exists() {
+        let mut data = if path.exists() {
             Self::load_from_file(&path)?
         } else {
             HashMap::new()
         };
+        if docs_path.exists() {
+            let docs = Self::load_docs_from_file(&docs_path)?;
+            for (slot, doc) in docs {
+                data.entry(slot).or_default().document = Some(doc);
+            }
+        }
         let eq_index = Self::build_eq_index(&data);
         let range_index = Self::build_range_index(&data);
         Ok(Self {
             path,
+            docs_path,
             data,
             dirty: false,
             eq_index,
@@ -125,6 +134,20 @@ impl MetadataStore {
         for slot in slots {
             if let Some(meta) = self.data.get(slot) {
                 out.insert(*slot, meta.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_many_properties(
+        &self,
+        slots: &[u32],
+    ) -> Result<HashMap<u32, HashMap<String, serde_json::Value>>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let mut out = HashMap::with_capacity(slots.len());
+        for slot in slots {
+            if let Some(meta) = self.data.get(slot) {
+                out.insert(*slot, meta.properties.clone());
             }
         }
         Ok(out)
@@ -239,14 +262,18 @@ impl MetadataStore {
 
         let tmp = self.path.with_extension("tmp");
         let mut writer = BufWriter::new(File::create(&tmp)?);
-        writer.write_all(b"M2S1")?;
+        writer.write_all(b"M2S2")?;
         writer.write_all(&(self.data.len() as u64).to_le_bytes())?;
 
+        let mut docs: Vec<(u32, String)> = Vec::new();
         for (slot, meta) in &self.data {
-            let meta_bytes = serde_json::to_vec(meta)?;
+            let props_bytes = serde_json::to_vec(&meta.properties)?;
             writer.write_all(&slot.to_le_bytes())?;
-            writer.write_all(&(meta_bytes.len() as u32).to_le_bytes())?;
-            writer.write_all(&meta_bytes)?;
+            writer.write_all(&(props_bytes.len() as u32).to_le_bytes())?;
+            writer.write_all(&props_bytes)?;
+            if let Some(doc) = &meta.document {
+                docs.push((*slot, doc.clone()));
+            }
         }
 
         writer.flush()?;
@@ -254,6 +281,27 @@ impl MetadataStore {
         #[cfg(target_os = "windows")]
         let _ = std::fs::remove_file(&self.path);
         std::fs::rename(&tmp, &self.path)?;
+
+        // Write compressed document sidecar; remove when there are no docs.
+        if docs.is_empty() {
+            let _ = std::fs::remove_file(&self.docs_path);
+        } else {
+            let docs_tmp = self.docs_path.with_extension("docs.tmp");
+            let mut raw = Vec::new();
+            raw.write_all(b"M2D1")?;
+            raw.write_all(&(docs.len() as u64).to_le_bytes())?;
+            for (slot, doc) in docs {
+                let b = doc.as_bytes();
+                raw.write_all(&slot.to_le_bytes())?;
+                raw.write_all(&(b.len() as u32).to_le_bytes())?;
+                raw.write_all(b)?;
+            }
+            let compressed = zstd::stream::encode_all(raw.as_slice(), 3)?;
+            std::fs::write(&docs_tmp, compressed)?;
+            #[cfg(target_os = "windows")]
+            let _ = std::fs::remove_file(&self.docs_path);
+            std::fs::rename(docs_tmp, &self.docs_path)?;
+        }
         self.dirty = false;
         Ok(())
     }
@@ -375,17 +423,19 @@ impl MetadataStore {
 
         let mut magic = [0u8; 4];
         cur.read_exact(&mut magic)?;
-        if &magic != b"M2S1" {
+        if &magic != b"M2S1" && &magic != b"M2S2" {
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "invalid metadata magic in {}: expected {:?}, found {:?}",
+                    "invalid metadata magic in {}: expected {:?} or {:?}, found {:?}",
                     path.display(),
                     b"M2S1",
+                    b"M2S2",
                     magic
                 ),
             )));
         }
+        let is_v2 = &magic == b"M2S2";
 
         let mut count_buf = [0u8; 8];
         cur.read_exact(&mut count_buf)?;
@@ -402,11 +452,61 @@ impl MetadataStore {
             let meta_len = u32::from_le_bytes(meta_len_buf) as usize;
             let mut meta_bytes = vec![0u8; meta_len];
             cur.read_exact(&mut meta_bytes)?;
-            let meta: VectorMetadata = serde_json::from_slice(&meta_bytes)?;
-            map.insert(slot, meta);
+            if is_v2 {
+                let props: HashMap<String, serde_json::Value> =
+                    serde_json::from_slice(&meta_bytes)?;
+                map.insert(
+                    slot,
+                    VectorMetadata {
+                        properties: props,
+                        document: None,
+                    },
+                );
+            } else {
+                let meta: VectorMetadata = serde_json::from_slice(&meta_bytes)?;
+                map.insert(slot, meta);
+            }
         }
 
         Ok(map)
+    }
+
+    fn load_docs_from_file(
+        path: &Path,
+    ) -> Result<HashMap<u32, String>, Box<dyn std::error::Error + Send + Sync>> {
+        let compressed = std::fs::read(path)?;
+        let bytes = zstd::stream::decode_all(compressed.as_slice())?;
+        let mut cur = Cursor::new(bytes);
+        let mut magic = [0u8; 4];
+        cur.read_exact(&mut magic)?;
+        if &magic != b"M2D1" {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid docs magic in {}: expected {:?}, found {:?}",
+                    path.display(),
+                    b"M2D1",
+                    magic
+                ),
+            )));
+        }
+        let mut count_buf = [0u8; 8];
+        cur.read_exact(&mut count_buf)?;
+        let count = u64::from_le_bytes(count_buf) as usize;
+        let mut docs = HashMap::with_capacity(count);
+        for _ in 0..count {
+            let mut slot_buf = [0u8; 4];
+            cur.read_exact(&mut slot_buf)?;
+            let slot = u32::from_le_bytes(slot_buf);
+            let mut len_buf = [0u8; 4];
+            cur.read_exact(&mut len_buf)?;
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut b = vec![0u8; len];
+            cur.read_exact(&mut b)?;
+            let doc = String::from_utf8(b)?;
+            docs.insert(slot, doc);
+        }
+        Ok(docs)
     }
 }
 

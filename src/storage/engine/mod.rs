@@ -3,13 +3,13 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use super::backend::StorageBackend;
 use super::compaction::Compactor;
-use super::graph::{GraphManager, OrderingWrapper, SearchCandidate};
+use super::graph::GraphManager;
 use super::id_pool::IdPool;
 use super::live_codes::LiveCodesFile;
 use super::metadata::{MetadataStore, VectorMetadata};
@@ -28,6 +28,10 @@ const INDEX_IDS_FILE: &str = "graph_ids.json";
 const DELTA_IDS_FILE: &str = "delta_ids.json";
 const ID_POOL_FILE: &str = "live_ids.bin";
 const MANIFEST_SAVE_INTERVAL_OPS: usize = 64;
+const ID_POOL_DENSE_MAGIC: &[u8; 8] = b"TQID2D1\0";
+/// Automatic maintenance: when segment count grows beyond this threshold,
+/// a compaction checkpoint is triggered on WAL flush.
+const AUTO_CHECKPOINT_SEGMENTS_THRESHOLD: usize = 64;
 
 const LIVE_GAMMA_BYTES: usize = 4;
 const LIVE_NORM_BYTES: usize = 4;
@@ -138,6 +142,29 @@ pub struct Manifest {
 
 fn default_rerank_enabled() -> bool {
     true
+}
+
+#[inline]
+fn has_meaningful_metadata(meta: &VectorMetadata) -> bool {
+    !meta.properties.is_empty() || meta.document.is_some()
+}
+
+fn intersect_sorted_slots(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    out
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -679,15 +706,14 @@ impl TurboQuantEngine {
 
         if !slots.is_empty() {
             let meta_map = self.metadata.get_many(&slots)?;
-            for (slot, meta) in meta_map {
-                if let Some(indices) = slot_to_indices.get(&slot) {
-                    for &idx in indices {
-                        out[idx] = Some(GetResult {
-                            id: ids[idx].clone(),
-                            metadata: meta.properties.clone(),
-                            document: meta.document.clone(),
-                        });
-                    }
+            for (slot, indices) in slot_to_indices {
+                let meta = meta_map.get(&slot).cloned().unwrap_or_default();
+                for idx in indices {
+                    out[idx] = Some(GetResult {
+                        id: ids[idx].clone(),
+                        metadata: meta.properties.clone(),
+                        document: meta.document.clone(),
+                    });
                 }
             }
         }
@@ -713,13 +739,13 @@ impl TurboQuantEngine {
         let cap = limit.unwrap_or(usize::MAX);
         if let Some(f) = filter {
             let slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
-            let meta_map = self.metadata.get_many(&slots)?;
+            let meta_map = self.metadata.get_many_properties(&slots)?;
+            let empty_props: HashMap<String, JsonValue> = HashMap::new();
             let ids: Vec<String> = active
                 .iter()
                 .filter(|(_, slot)| {
-                    meta_map
-                        .get(slot)
-                        .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                    let props = meta_map.get(slot).unwrap_or(&empty_props);
+                    metadata_matches_filter(props, f)
                 })
                 .map(|(id, _)| id.clone())
                 .skip(offset)
@@ -746,13 +772,12 @@ impl TurboQuantEngine {
         &self,
         field: &str,
     ) -> Result<HashMap<String, usize>, Box<dyn std::error::Error + Send + Sync>> {
-        let active = self.id_pool.iter_active();
-        let slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
-        let meta_map = self.metadata.get_many(&slots)?;
+        let slots = self.id_pool.iter_active_slots();
+        let meta_map = self.metadata.get_many_properties(&slots)?;
         let mut counts: HashMap<String, usize> = HashMap::new();
-        for (_, slot) in &active {
-            if let Some(meta) = meta_map.get(slot) {
-                if let Some(val) = get_nested_field(&meta.properties, field) {
+        for slot in &slots {
+            if let Some(props) = meta_map.get(slot) {
+                if let Some(val) = get_nested_field(props, field) {
                     let key = match val {
                         JsonValue::String(s) => s.clone(),
                         other => other.to_string(),
@@ -788,7 +813,11 @@ impl TurboQuantEngine {
             // Explicit Some replaces; None preserves existing document.
             document: document.or(existing.document),
         };
-        self.metadata.put(slot, &new_meta)?;
+        if has_meaningful_metadata(&new_meta) {
+            self.metadata.put(slot, &new_meta)?;
+        } else {
+            self.metadata.delete(slot)?;
+        }
         Ok(())
     }
 
@@ -824,24 +853,70 @@ impl TurboQuantEngine {
         use_ann_opt: Option<bool>,
         rerank_factor: Option<usize>,
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
+        self.search_batch_with_include(
+            queries,
+            top_k,
+            filter,
+            ann_search_list_size,
+            use_ann_opt,
+            rerank_factor,
+            true,
+            true,
+            true,
+        )
+    }
+
+    pub fn search_batch_with_include(
+        &self,
+        queries: &[ndarray::Array1<f64>],
+        top_k: usize,
+        filter: Option<&HashMap<String, JsonValue>>,
+        ann_search_list_size: Option<usize>,
+        use_ann_opt: Option<bool>,
+        rerank_factor: Option<usize>,
+        include_id: bool,
+        include_metadata: bool,
+        include_document: bool,
+    ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let use_ann = use_ann_opt.unwrap_or_else(|| self.auto_use_ann());
-        // Always parallelise across queries. Rayon's work-stealing handles nested
-        // parallelism (outer: queries, inner: par_chunks over vectors) without
-        // over-subscribing the thread pool. For batch calls, throughput > per-query
-        // latency, so outer parallelism is always beneficial.
-        queries
-            .par_iter()
-            .map(|q| {
-                self.search_with_filter_and_ann(
+        // For small query batches, Rayon scheduling overhead can dominate
+        // end-to-end latency. Use a sequential path to reduce p50/p99 for
+        // tiny batches (common in interactive RAG calls).
+        const PAR_BATCH_MIN_QUERIES: usize = 4;
+        if queries.len() < PAR_BATCH_MIN_QUERIES {
+            let mut out = Vec::with_capacity(queries.len());
+            for q in queries {
+                out.push(self.search_with_filter_and_ann_include(
                     q,
                     top_k,
                     filter,
                     ann_search_list_size,
                     use_ann,
                     rerank_factor,
-                )
-            })
-            .collect()
+                    include_id,
+                    include_metadata,
+                    include_document,
+                )?);
+            }
+            Ok(out)
+        } else {
+            queries
+                .par_iter()
+                .map(|q| {
+                    self.search_with_filter_and_ann_include(
+                        q,
+                        top_k,
+                        filter,
+                        ann_search_list_size,
+                        use_ann,
+                        rerank_factor,
+                        include_id,
+                        include_metadata,
+                        include_document,
+                    )
+                })
+                .collect()
+        }
     }
 
     ///
@@ -855,15 +930,14 @@ impl TurboQuantEngine {
         let Some(f) = filter else {
             return Ok(self.id_pool.active_count());
         };
-        let active = self.id_pool.iter_active();
-        let slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
-        let meta_map = self.metadata.get_many(&slots)?;
-        let count = active
+        let slots = self.id_pool.iter_active_slots();
+        let meta_map = self.metadata.get_many_properties(&slots)?;
+        let empty_props: HashMap<String, JsonValue> = HashMap::new();
+        let count = slots
             .iter()
-            .filter(|(_, slot)| {
-                meta_map
-                    .get(slot)
-                    .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+            .filter(|slot| {
+                let props = meta_map.get(slot).unwrap_or(&empty_props);
+                metadata_matches_filter(props, f)
             })
             .count();
         Ok(count)
@@ -920,13 +994,13 @@ impl TurboQuantEngine {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let active = self.id_pool.iter_active();
         let slots: Vec<u32> = active.iter().map(|(_, s)| *s).collect();
-        let meta_map = self.metadata.get_many(&slots)?;
+        let meta_map = self.metadata.get_many_properties(&slots)?;
         let ids_to_delete: Vec<String> = active
             .into_iter()
             .filter(|(_, slot)| {
                 meta_map
                     .get(slot)
-                    .is_some_and(|m| metadata_matches_filter(&m.properties, filter))
+                    .is_some_and(|props| metadata_matches_filter(props, filter))
             })
             .map(|(id, _)| id)
             .collect();
@@ -1318,7 +1392,9 @@ impl TurboQuantEngine {
         query: &Array1<f64>,
         top_k: usize,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
-        self.search_with_filter_and_ann(query, top_k, None, None, true, None)
+        self.search_with_filter_and_ann_include(
+            query, top_k, None, None, true, None, true, true, true,
+        )
     }
 
     pub fn search_with_filter(
@@ -1327,7 +1403,9 @@ impl TurboQuantEngine {
         top_k: usize,
         filter: Option<&HashMap<String, JsonValue>>,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
-        self.search_with_filter_and_ann(query, top_k, filter, None, true, None)
+        self.search_with_filter_and_ann_include(
+            query, top_k, filter, None, true, None, true, true, true,
+        )
     }
 
     pub fn search_with_filter_and_ann(
@@ -1338,6 +1416,31 @@ impl TurboQuantEngine {
         ann_search_list_size: Option<usize>,
         use_ann: bool,
         rerank_factor: Option<usize>,
+    ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        self.search_with_filter_and_ann_include(
+            query,
+            top_k,
+            filter,
+            ann_search_list_size,
+            use_ann,
+            rerank_factor,
+            true,
+            true,
+            true,
+        )
+    }
+
+    pub fn search_with_filter_and_ann_include(
+        &self,
+        query: &Array1<f64>,
+        top_k: usize,
+        filter: Option<&HashMap<String, JsonValue>>,
+        ann_search_list_size: Option<usize>,
+        use_ann: bool,
+        rerank_factor: Option<usize>,
+        include_id: bool,
+        include_metadata: bool,
+        include_document: bool,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
         if self.id_pool.active_count() == 0 || top_k == 0 {
             return Ok(Vec::new());
@@ -1381,40 +1484,37 @@ impl TurboQuantEngine {
             let active_n = self.id_pool.active_count();
             const PLANNER_SELECTIVE_THRESHOLD: usize = 20; // route to brute-force if < N/20
             let filter_slots: Option<Vec<u32>> = if let Some(f) = filter {
-                let active = self.id_pool.iter_active();
-                let active_set: std::collections::HashSet<u32> =
-                    active.iter().map(|(_, s)| *s).collect();
+                let active_slots = self.id_pool.iter_active_slots();
 
-                let matches = if let Some(indexed) = self.resolve_filter_via_index(f, &active_set) {
+                let matches = if let Some(indexed) = self.resolve_filter_via_index(f, &active_slots) {
                     let all_eq = extract_indexable_eq(f)
                         .map(|eqs| eqs.len() == f.len())
                         .unwrap_or(false);
                     if all_eq {
                         indexed
                     } else {
-                        let meta_map = self.metadata.get_many(&indexed)?;
+                        let meta_map = self.metadata.get_many_properties(&indexed)?;
+                        let empty_props: HashMap<String, JsonValue> = HashMap::new();
                         indexed
                             .into_iter()
                             .filter(|s| {
-                                meta_map
-                                    .get(s)
-                                    .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                                let props = meta_map.get(s).unwrap_or(&empty_props);
+                                metadata_matches_filter(props, f)
                             })
                             .collect()
                     }
                 } else {
                     // O(n) fallback
-                    let slots: Vec<u32> = active_set.into_iter().collect();
-                    let meta_map = self.metadata.get_many(&slots)?;
-                    let mut v: Vec<u32> = slots
+                    let slots = active_slots;
+                    let meta_map = self.metadata.get_many_properties(&slots)?;
+                    let empty_props: HashMap<String, JsonValue> = HashMap::new();
+                    let v: Vec<u32> = slots
                         .into_iter()
                         .filter(|s| {
-                            meta_map
-                                .get(s)
-                                .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                            let props = meta_map.get(s).unwrap_or(&empty_props);
+                            metadata_matches_filter(props, f)
                         })
                         .collect();
-                    v.sort_unstable();
                     v
                 };
 
@@ -1427,9 +1527,12 @@ impl TurboQuantEngine {
                     return self.exhaustive_search_simd(
                         query,
                         top_k,
-                        filter,
+                        None,
                         Some(matches),
                         rerank_factor,
+                        include_id,
+                        include_metadata,
+                        include_document,
                     );
                 }
                 Some(matches)
@@ -1529,7 +1632,12 @@ impl TurboQuantEngine {
                 .iter()
                 .map(|(n, _)| self.index_ids[*n as usize])
                 .collect();
-            let meta_map = self.metadata.get_many(&slots)?;
+            let needs_payload = include_metadata || include_document;
+            let meta_map = if needs_payload && self.metadata.len() > 0 {
+                Some(self.metadata.get_many(&slots)?)
+            } else {
+                None
+            };
             let mut out = Vec::with_capacity(ann.len());
 
             // Batch-dequantize all candidates in parallel when reranking without raw vecs.
@@ -1554,8 +1662,11 @@ impl TurboQuantEngine {
 
             for (i, (node, approx_score)) in ann.into_iter().enumerate() {
                 let slot = self.index_ids[node as usize];
-                let id = self.id_pool.get_str(slot).unwrap_or_default().to_string();
-                let meta = meta_map.get(&slot).cloned().unwrap_or_default();
+                let id = if include_id {
+                    self.id_pool.get_str(slot).unwrap_or_default().to_string()
+                } else {
+                    String::new()
+                };
 
                 let score = if self.rerank_enabled {
                     if self.live_vraw.is_some() {
@@ -1568,11 +1679,22 @@ impl TurboQuantEngine {
                     approx_score
                 };
 
+                let mut metadata = HashMap::new();
+                let mut document = None;
+                if let Some(meta) = meta_map.as_ref().and_then(|m| m.get(&slot)).cloned() {
+                    if include_metadata {
+                        metadata = meta.properties;
+                    }
+                    if include_document {
+                        document = meta.document;
+                    }
+                }
+
                 out.push(SearchResult {
                     id,
                     score,
-                    metadata: meta.properties,
-                    document: meta.document,
+                    metadata,
+                    document,
                 });
             }
             out.sort_by(|a, b| {
@@ -1595,8 +1717,16 @@ impl TurboQuantEngine {
                 .filter(|s| self.id_pool.is_slot_alive(*s))
                 .collect();
             if !delta.is_empty() {
-                let mut delta_results =
-                    self.exhaustive_search_simd(query, top_k, filter, Some(delta), rerank_factor)?;
+                let mut delta_results = self.exhaustive_search_simd(
+                    query,
+                    top_k,
+                    filter,
+                    Some(delta),
+                    rerank_factor,
+                    include_id,
+                    include_metadata,
+                    include_document,
+                )?;
                 out.append(&mut delta_results);
                 out.sort_by(|a, b| {
                     b.score
@@ -1610,7 +1740,16 @@ impl TurboQuantEngine {
         }
 
         // Exhaustive search path (SIMD Optimized)
-        self.exhaustive_search_simd(query, top_k, filter, None, rerank_factor)
+        self.exhaustive_search_simd(
+            query,
+            top_k,
+            filter,
+            None,
+            rerank_factor,
+            include_id,
+            include_metadata,
+            include_document,
+        )
     }
 
     /// Try to resolve filter candidates using the eq_index or range_index.
@@ -1624,7 +1763,7 @@ impl TurboQuantEngine {
     fn resolve_filter_via_index(
         &self,
         filter: &HashMap<String, JsonValue>,
-        active_slots: &std::collections::HashSet<u32>,
+        active_slots: &[u32],
     ) -> Option<Vec<u32>> {
         // Fast path 1: pure equality conditions → eq_index.
         if let Some(conditions) = extract_indexable_eq(filter) {
@@ -1653,23 +1792,13 @@ impl TurboQuantEngine {
                 };
                 result = Some(set);
             }
-            return result.map(|slots| {
-                slots
-                    .into_iter()
-                    .filter(|s| active_slots.contains(s))
-                    .collect()
-            });
+            return result.map(|slots| intersect_sorted_slots(&slots, active_slots));
         }
 
         // Fast path 2: single-field numeric range → range_index.
         if let Some((field, lo, hi)) = extract_range_condition(filter) {
             let slots = self.metadata.get_range_candidates(field, lo, hi)?;
-            return Some(
-                slots
-                    .into_iter()
-                    .filter(|s| active_slots.contains(s))
-                    .collect(),
-            );
+            return Some(intersect_sorted_slots(&slots, active_slots));
         }
 
         None
@@ -1686,6 +1815,9 @@ impl TurboQuantEngine {
         filter: Option<&HashMap<String, JsonValue>>,
         forced_slots: Option<Vec<u32>>,
         rerank_factor: Option<usize>,
+        include_id: bool,
+        include_metadata: bool,
+        include_document: bool,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
         let internal_k = if self.rerank_enabled {
             let factor = rerank_factor.unwrap_or(10);
@@ -1700,13 +1832,13 @@ impl TurboQuantEngine {
         let candidate_slots: Vec<u32> = match forced_slots {
             Some(slots) => {
                 if let Some(f) = filter {
-                    let meta_map = self.metadata.get_many(&slots)?;
+                    let meta_map = self.metadata.get_many_properties(&slots)?;
+                    let empty_props: HashMap<String, JsonValue> = HashMap::new();
                     slots
                         .into_iter()
                         .filter(|s| {
-                            meta_map
-                                .get(s)
-                                .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                            let props = meta_map.get(s).unwrap_or(&empty_props);
+                            metadata_matches_filter(props, f)
                         })
                         .collect()
                 } else {
@@ -1714,15 +1846,13 @@ impl TurboQuantEngine {
                 }
             }
             None => {
-                let active = self.id_pool.iter_active();
-                if active.is_empty() {
+                let active_slots = self.id_pool.iter_active_slots();
+                if active_slots.is_empty() {
                     return Ok(Vec::new());
                 }
                 if let Some(f) = filter {
-                    let active_set: std::collections::HashSet<u32> =
-                        active.iter().map(|(_, s)| *s).collect();
                     // Fast path: try eq_index for O(1) candidate resolution.
-                    if let Some(indexed_slots) = self.resolve_filter_via_index(f, &active_set) {
+                    if let Some(indexed_slots) = self.resolve_filter_via_index(f, &active_slots) {
                         // Still need full filter eval in case there are additional conditions
                         // beyond the indexed ones (e.g. range operators alongside $eq).
                         let all_eq = extract_indexable_eq(f)
@@ -1731,33 +1861,32 @@ impl TurboQuantEngine {
                         if all_eq {
                             indexed_slots
                         } else {
-                            let meta_map = self.metadata.get_many(&indexed_slots)?;
+                            let meta_map = self.metadata.get_many_properties(&indexed_slots)?;
+                            let empty_props: HashMap<String, JsonValue> = HashMap::new();
                             indexed_slots
                                 .into_iter()
                                 .filter(|s| {
-                                    meta_map
-                                        .get(s)
-                                        .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                                    let props = meta_map.get(s).unwrap_or(&empty_props);
+                                    metadata_matches_filter(props, f)
                                 })
                                 .collect()
                         }
                     } else {
                         // Fallback: O(n) scan.
-                        let all_slots: Vec<u32> = active_set.into_iter().collect();
-                        let meta_map = self.metadata.get_many(&all_slots)?;
-                        let mut cands: Vec<u32> = all_slots
+                        let all_slots = active_slots;
+                        let meta_map = self.metadata.get_many_properties(&all_slots)?;
+                        let empty_props: HashMap<String, JsonValue> = HashMap::new();
+                        let cands: Vec<u32> = all_slots
                             .into_iter()
                             .filter(|s| {
-                                meta_map
-                                    .get(s)
-                                    .is_some_and(|m| metadata_matches_filter(&m.properties, f))
+                                let props = meta_map.get(s).unwrap_or(&empty_props);
+                                metadata_matches_filter(props, f)
                             })
                             .collect();
-                        cands.sort_unstable();
                         cands
                     }
                 } else {
-                    active.iter().map(|(_, s)| *s).collect()
+                    active_slots
                 }
             }
         };
@@ -1777,7 +1906,7 @@ impl TurboQuantEngine {
         // Scoring: sequential for small N (avoids Rayon thread park/unpark on Windows
         // where scheduler granularity dominates the actual sub-millisecond work);
         // parallel chunk-based for large N where the work outweighs the thread overhead.
-        const CHUNK: usize = 512;
+        const CHUNK: usize = 1024;
         let n_candidates = candidate_slots.len();
         let scored: Vec<(u32, f64)> = if n_candidates <= SEQ_THRESHOLD {
             // Sequential path: single idx buffer reused across all slots.
@@ -1963,21 +2092,22 @@ impl TurboQuantEngine {
             }
         };
 
-        // Build top-k heap from flat scored list
-        let mut results = BinaryHeap::with_capacity(internal_k + 1);
-        for (slot, score) in scored {
-            results.push(OrderingWrapper(SearchCandidate { id: slot, score }));
-            if results.len() > internal_k {
-                results.pop();
-            }
+        // Keep only the top internal_k scores with partial selection instead of
+        // heap push/pop on every candidate (faster for large candidate sets).
+        let mut candidates = scored;
+        if internal_k < candidates.len() {
+            candidates.select_nth_unstable_by(internal_k, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+            });
+            candidates.truncate(internal_k);
         }
-
-        // Drain to Vec for deterministic indexing (BinaryHeap iter/into_iter order
-        // is unspecified and may differ — Vec guarantees consistent order for the
-        // batch-dequantize index alignment below).
-        let candidates: Vec<OrderingWrapper> = results.into_iter().collect();
-        let slots: Vec<u32> = candidates.iter().map(|OrderingWrapper(c)| c.id).collect();
-        let meta_map = self.metadata.get_many(&slots)?;
+        let slots: Vec<u32> = candidates.iter().map(|(slot, _)| *slot).collect();
+        let needs_payload = include_metadata || include_document;
+        let meta_map = if needs_payload && self.metadata.len() > 0 {
+            Some(self.metadata.get_many(&slots)?)
+        } else {
+            None
+        };
         let mut out = Vec::with_capacity(candidates.len());
 
         // Batch-dequantize all rerank candidates in parallel when raw vecs unavailable.
@@ -1998,30 +2128,43 @@ impl TurboQuantEngine {
             Vec::new()
         };
 
-        for (i, OrderingWrapper(cand)) in candidates.into_iter().enumerate() {
-            let id = self
-                .id_pool
-                .get_str(cand.id)
-                .unwrap_or_default()
-                .to_string();
-            let meta = meta_map.get(&cand.id).cloned().unwrap_or_default();
+        for (i, (cand_slot, cand_score)) in candidates.into_iter().enumerate() {
+            let id = if include_id {
+                self.id_pool
+                    .get_str(cand_slot)
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                String::new()
+            };
 
             let score = if self.rerank_enabled {
                 if self.live_vraw.is_some() {
-                    let raw_vec = self.live_raw_vector_at_slot(cand.id as usize);
+                    let raw_vec = self.live_raw_vector_at_slot(cand_slot as usize);
                     score_vectors_with_metric(&self.metric, query, &raw_vec)
                 } else {
                     score_vectors_with_metric(&self.metric, query, &deq_vecs[i])
                 }
             } else {
-                cand.score
+                cand_score
             };
+
+            let mut metadata = HashMap::new();
+            let mut document = None;
+            if let Some(meta) = meta_map.as_ref().and_then(|m| m.get(&cand_slot)).cloned() {
+                if include_metadata {
+                    metadata = meta.properties;
+                }
+                if include_document {
+                    document = meta.document;
+                }
+            }
 
             out.push(SearchResult {
                 id,
                 score,
-                metadata: meta.properties,
-                document: meta.document,
+                metadata,
+                document,
             });
         }
         out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
@@ -2094,6 +2237,10 @@ impl TurboQuantEngine {
         }
         self.invalidate_index_state()?;
         self.manifest.vector_count = self.live_active_count() as u64;
+        // Keep segment count bounded in long ingest sessions.
+        if self.segments.segments.len() >= AUTO_CHECKPOINT_SEGMENTS_THRESHOLD {
+            self.compact_segments_now()?;
+        }
         self.maybe_persist_state(false)?;
         Ok(())
     }
@@ -2312,7 +2459,50 @@ impl TurboQuantEngine {
     /// Flushes the WAL first so all buffered data is on disk before merging.
     pub fn compact(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
-        // Compaction is a background concern; no-op if below threshold.
+        self.compact_segments_now()?;
+        Ok(())
+    }
+
+    /// Force a maintenance checkpoint: flush WAL, persist side stores, and run
+    /// segment compaction when the threshold is met.
+    pub fn checkpoint(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.compact()
+    }
+
+    fn compact_segments_now(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let compactor = Compactor::new(self.backend.clone());
+        let seg_count = self.segments.segments.len();
+        if !compactor.should_compact(seg_count) {
+            return Ok(());
+        }
+
+        let old_segment_names: Vec<String> = self
+            .segments
+            .segments
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        if old_segment_names.is_empty() {
+            return Ok(());
+        }
+
+        let mut live_records: Vec<SegmentRecord> = self
+            .live_iter_id_slots()
+            .into_iter()
+            .map(|(id, _)| SegmentRecord {
+                id,
+                is_deleted: false,
+            })
+            .collect();
+        live_records.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let new_segment_name = self.segments.next_segment_name();
+        compactor.begin_compaction(&old_segment_names, &new_segment_name)?;
+        let new_seg =
+            compactor.compact_live_records(&old_segment_names, &new_segment_name, &live_records)?;
+        self.segments.remove_segments(&old_segment_names);
+        self.segments.add_segment(new_seg);
+        compactor.finish_compaction()?;
         Ok(())
     }
 
@@ -2691,7 +2881,11 @@ impl TurboQuantEngine {
                 self.live_save_raw_vector(slot, &approx_raw);
             }
             let meta: VectorMetadata = serde_json::from_str(&entry.metadata_json)?;
-            self.metadata.put(slot, &meta)?;
+            if has_meaningful_metadata(&meta) {
+                self.metadata.put(slot, &meta)?;
+            } else {
+                self.metadata.delete(slot)?;
+            }
         }
 
         Ok(())
@@ -2981,7 +3175,11 @@ impl TurboQuantEngine {
                 }
             }
             self.live_save_raw_vector(slot, raw_for_rerank);
-            self.metadata.put(slot, &meta)?;
+            if has_meaningful_metadata(&meta) {
+                self.metadata.put(slot, &meta)?;
+            } else {
+                self.metadata.delete(slot)?;
+            }
         }
         // Inserts do NOT invalidate the HNSW index — new slots go to delta_slots.
         self.manifest.vector_count = self.live_active_count() as u64;
@@ -3007,6 +3205,8 @@ impl TurboQuantEngine {
         for chunk in items.chunks(5000) {
             let mut wal_entries = Vec::with_capacity(chunk.len());
             let mut metadata_entries: Vec<(u32, VectorMetadata)> = Vec::with_capacity(chunk.len());
+            let mut metadata_deletes: Vec<u32> = Vec::new();
+            let mut touched_slots: Vec<u32> = Vec::with_capacity(chunk.len());
             // Normalize each vector to unit sphere before quantization so the
             // Lloyd-Max codebook (fitted to Beta-distribution unit-sphere coords) is valid.
             // Compute (unit_vec, norm) once to avoid a second O(d) pass per vector.
@@ -3086,16 +3286,24 @@ impl TurboQuantEngine {
                     stored_norm,
                 )?;
                 self.live_save_raw_vector(slot, raw_for_rerank);
-                metadata_entries.push((slot, meta));
+                touched_slots.push(slot);
+                if has_meaningful_metadata(&meta) {
+                    metadata_entries.push((slot, meta));
+                } else {
+                    metadata_deletes.push(slot);
+                }
                 wal_entries.push(entry);
             }
             self.wal.append_batch(&wal_entries, false)?;
             self.metadata.put_many(&metadata_entries)?;
+            for slot in metadata_deletes {
+                self.metadata.delete(slot)?;
+            }
             // Track newly allocated slots in the delta overlay so ANN search finds
             // them without a rebuild. indexed_set is built once before the chunk
             // loop. delta_slots is kept sorted; binary_search gives O(log n).
             if !indexed_set.is_empty() {
-                for (slot, _) in &metadata_entries {
+                for slot in &touched_slots {
                     if !indexed_set.contains(slot) {
                         if let Err(pos) = self.delta_slots.binary_search(slot) {
                             self.delta_slots.insert(pos, *slot);
@@ -3150,7 +3358,17 @@ fn save_id_pool(
     backend: &Arc<StorageBackend>,
     pool: &IdPool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bytes = bincode::serialize(pool)?;
+    let bytes = if let Some(alive_bits) = pool.dense_alive_bits_if_compatible() {
+        let dense = DenseIdDashDisk {
+            slot_count: pool.slot_count() as u32,
+            alive_bits,
+        };
+        let mut out = ID_POOL_DENSE_MAGIC.to_vec();
+        out.extend_from_slice(&bincode::serialize(&dense)?);
+        out
+    } else {
+        bincode::serialize(pool)?
+    };
     let local = format!("{}/{}", local_dir, ID_POOL_FILE);
     std::fs::write(&local, &bytes)?;
     backend.write(ID_POOL_FILE, &bytes)?;
@@ -3164,17 +3382,36 @@ fn load_id_pool(
     let local = format!("{}/{}", local_dir, ID_POOL_FILE);
     if Path::new(&local).exists() {
         let bytes = std::fs::read(&local)?;
-        let mut pool: IdPool = bincode::deserialize(&bytes)?;
+        let mut pool: IdPool = deserialize_id_pool_bytes(&bytes)?;
         pool.rebuild_lookup();
         return Ok(pool);
     }
     if let Ok(bytes) = backend.read(ID_POOL_FILE) {
         std::fs::write(&local, &bytes)?;
-        let mut pool: IdPool = bincode::deserialize(&bytes)?;
+        let mut pool: IdPool = deserialize_id_pool_bytes(&bytes)?;
         pool.rebuild_lookup();
         return Ok(pool);
     }
     Err("live_ids.bin not found".into())
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct DenseIdDashDisk {
+    slot_count: u32,
+    alive_bits: Vec<u8>,
+}
+
+fn deserialize_id_pool_bytes(
+    bytes: &[u8],
+) -> Result<IdPool, Box<dyn std::error::Error + Send + Sync>> {
+    if bytes.starts_with(ID_POOL_DENSE_MAGIC) {
+        let dense: DenseIdDashDisk = bincode::deserialize(&bytes[ID_POOL_DENSE_MAGIC.len()..])?;
+        return Ok(IdPool::from_dense_id_dash(
+            dense.slot_count as usize,
+            &dense.alive_bits,
+        ));
+    }
+    Ok(bincode::deserialize(bytes)?)
 }
 
 fn save_index_ids(
