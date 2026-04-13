@@ -19,6 +19,22 @@ Configure via environment variables before launching (see [Environment Variables
 
 ```bash
 cd server
+cargo build --release
+```
+
+Then launch the compiled binary:
+
+```bash
+# Linux / macOS
+./target/release/tqdb-server
+
+# Windows
+.\target\release\tqdb-server.exe
+```
+
+Or build and launch in one step (all platforms):
+
+```bash
 cargo run --release
 ```
 
