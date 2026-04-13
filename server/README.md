@@ -1,14 +1,23 @@
-# tqdb-server
+# TurboQuantDB Server
 
 Optional Axum HTTP service providing TurboQuantDB in multi-tenant server mode. Use this when you need REST API access, multi-tenancy, authentication, quotas, or async job management. For single-process Python use, the embedded `tqdb` package is simpler.
 
-## Build & Run
+## Quick Start
+
+The server binary ships pre-built inside the `tqdb` wheel — no compilation required:
+
+```bash
+pip install tqdb
+tqdb-server          # listens on 127.0.0.1:8080 by default
+```
+
+Configure via environment variables before launching (see [Environment Variables](#environment-variables) below).
+
+## Building from Source (development only)
 
 ```bash
 cd server
 cargo build --release
-
-# Configure via environment variables (see below), then run:
 ./target/release/tqdb-server
 ```
 
