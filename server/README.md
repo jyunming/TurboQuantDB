@@ -4,7 +4,9 @@ Optional Axum HTTP service providing TurboQuantDB in multi-tenant server mode. U
 
 ## Quick Start
 
-The server binary ships pre-built inside the `tqdb` wheel — no compilation required:
+The server binary ships pre-built inside the `tqdb` wheel on all supported platforms
+(Linux x86-64, macOS, Windows). **Linux arm64/aarch64** is the exception — see
+[Building from Source](#building-from-source-development-only) for that platform.
 
 ```bash
 pip install tqdb
@@ -17,8 +19,7 @@ Configure via environment variables before launching (see [Environment Variables
 
 ```bash
 cd server
-cargo build --release
-./target/release/tqdb-server
+cargo run --release
 ```
 
 ## Environment Variables
