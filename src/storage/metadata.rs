@@ -300,7 +300,7 @@ impl MetadataStore {
         if docs.is_empty() {
             let _ = std::fs::remove_file(&self.docs_path);
         } else {
-            let docs_tmp = self.docs_path.with_extension("docs.tmp");
+            let docs_tmp = self.docs_path.with_extension("tmp");
             let mut raw = Vec::new();
             raw.write_all(DOCS_RAW_MAGIC)?;
             raw.write_all(&(docs.len() as u64).to_le_bytes())?;

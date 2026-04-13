@@ -620,6 +620,22 @@ class TestFlushClose:
         db.insert("a", np.ones(8, dtype=np.float32))
         db.close()  # should not raise
 
+    def test_checkpoint_is_callable(self, tmp_path):
+        db = open_db(str(tmp_path / "db"), d=8)
+        for i in range(5):
+            db.insert(str(i), np.ones(8, dtype=np.float32))
+        db.checkpoint()  # should not raise
+
+    def test_checkpoint_data_readable_after_reopen(self, tmp_path):
+        path = str(tmp_path / "db")
+        db = open_db(path, d=8)
+        for i in range(10):
+            db.insert(str(i), np.ones(8, dtype=np.float32))
+        db.checkpoint()
+        del db
+        db2 = open_db(path, d=8)
+        assert db2.count() == 10
+
     def test_flush_data_readable_after_reopen(self, tmp_path):
         path = str(tmp_path / "db")
         db = open_db(path, d=8)

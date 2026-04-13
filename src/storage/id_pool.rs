@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Allocation-free check: returns true iff `id == format!("id-{slot}")`.
+#[inline]
+fn is_id_dash_slot(id: &str, slot: u32) -> bool {
+    id.strip_prefix("id-")
+        .and_then(|s| s.parse::<u32>().ok())
+        .is_some_and(|n| n == slot)
+}
+
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct IdPool {
     bytes: Vec<u8>,
@@ -79,7 +87,7 @@ impl IdPool {
         self.alive.push(true);
         self.bytes.extend_from_slice(id.as_bytes());
 
-        if self.dense_id_dash_possible && id != format!("id-{}", slot) {
+        if self.dense_id_dash_possible && !is_id_dash_slot(id, slot) {
             self.dense_id_dash_possible = false;
         }
 
@@ -194,7 +202,7 @@ impl IdPool {
                 self.active_count += 1;
                 if self
                     .get_str(i as u32)
-                    .is_none_or(|id| id != format!("id-{}", i))
+                    .is_none_or(|id| !is_id_dash_slot(id, i as u32))
                 {
                     self.dense_id_dash_possible = false;
                 }

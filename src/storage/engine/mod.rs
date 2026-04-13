@@ -2311,8 +2311,58 @@ impl TurboQuantEngine {
         Ok(())
     }
 
+    /// Flush live state for a clean close without writing a new immutable segment.
+    ///
+    /// `close()` drops all segment files immediately after flushing, so calling
+    /// `flush_wal_to_segment()` would write a segment only to delete it on the next
+    /// line.  This path drains the WAL buffer, compacts the live slab if needed, and
+    /// syncs live_codes.bin / live_vectors.bin to the backend — identical to the
+    /// segment-flush path except no `segments.flush_batch()` is invoked.
+    fn flush_for_close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // WAL records are already applied to live state on write; just discard.
+        self.wal_buffer.clear();
+        if self.has_pending_deletes {
+            self.live_compact_slab()?;
+            self.has_pending_deletes = false;
+        }
+        self.live_codes.flush()?;
+        if let Some(vraw) = &mut self.live_vraw {
+            vraw.flush()?;
+        }
+        self.wal.truncate()?;
+        self.metadata.flush()?;
+        self.persist_id_pool()?;
+
+        // Sync live_codes.bin to the backend (required for cloud / remote backends).
+        self.live_codes.release_handles();
+        let had_vraw = self.live_vraw.is_some();
+        if had_vraw {
+            if let Some(vraw) = &mut self.live_vraw {
+                vraw.release_handles();
+            }
+        }
+        let live_codes_path = Path::new(&self.local_dir).join("live_codes.bin");
+        let live_vraw_path = Path::new(&self.local_dir).join("live_vectors.bin");
+        let live_codes_data = std::fs::read(&live_codes_path)?;
+        self.backend.write("live_codes.bin", &live_codes_data)?;
+        if had_vraw {
+            let live_vraw_data = std::fs::read(&live_vraw_path)?;
+            self.backend.write("live_vectors.bin", &live_vraw_data)?;
+        }
+        // Reopen handles so truncate_to() in close() can operate on an open file.
+        self.live_codes = LiveCodesFile::open(live_codes_path, self.live_stride())?;
+        let slot_count = self.id_pool.slot_count();
+        self.live_codes.set_len(slot_count);
+        if had_vraw {
+            let mut vraw = LiveCodesFile::open(live_vraw_path, self.live_vraw_stride())?;
+            vraw.set_len(slot_count);
+            self.live_vraw = Some(vraw);
+        }
+        Ok(())
+    }
+
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.flush_wal_to_segment()?;
+        self.flush_for_close()?;
         // Trim pre-allocated capacity to the exact slot count so the on-disk and
         // memory-mapped sizes are minimal after the database is closed.
         let slot_count = self.id_pool.slot_count();
