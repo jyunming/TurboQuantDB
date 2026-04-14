@@ -38,6 +38,17 @@ pub trait StorageProvider: Send + Sync {
     /// is written before the old key is deleted, so a crash between those two
     /// operations leaves both keys present (safe to retry).
     fn rename(&self, from: &str, to: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Returns true if this backend stores files at the same path as `local_dir`.
+    ///
+    /// When true, `write()` for mmap'd slab files (`live_codes.bin`,
+    /// `live_vectors.bin`) is a no-op: the mmap flush already wrote the data
+    /// in-place and re-writing the same bytes would needlessly truncate the file,
+    /// which on Windows causes ERROR_USER_MAPPED_FILE (1224) when a previous
+    /// mapping hasn't been fully released by the kernel yet.
+    fn is_local(&self) -> bool {
+        false
+    }
 }
 
 /// Local filesystem storage provider.
@@ -54,6 +65,10 @@ impl LocalProvider {
 }
 
 impl StorageProvider for LocalProvider {
+    fn is_local(&self) -> bool {
+        true
+    }
+
     fn read(&self, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let full = self.root.join(path);
         Ok(fs::read(full)?)
@@ -418,6 +433,10 @@ impl StorageBackend {
         to: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.provider.rename(from, to)
+    }
+
+    pub fn is_local(&self) -> bool {
+        self.provider.is_local()
     }
 }
 
