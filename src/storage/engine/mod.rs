@@ -1930,24 +1930,23 @@ impl TurboQuantEngine {
         // Small-k fast path: avoid per-chunk full buffers + select_nth when
         // the requested candidate budget is tiny (common top_k=10 workload).
         let use_small_topk = internal_k <= 32;
-        let push_small_topk =
-            |out: &mut Vec<(u32, f64)>, slot: u32, score: f64, k: usize| {
-                if out.len() < k {
-                    out.push((slot, score));
-                    return;
+        let push_small_topk = |out: &mut Vec<(u32, f64)>, slot: u32, score: f64, k: usize| {
+            if out.len() < k {
+                out.push((slot, score));
+                return;
+            }
+            let mut min_i = 0usize;
+            let mut min_s = out[0].1;
+            for (i, (_, s)) in out.iter().enumerate().skip(1) {
+                if *s < min_s {
+                    min_s = *s;
+                    min_i = i;
                 }
-                let mut min_i = 0usize;
-                let mut min_s = out[0].1;
-                for (i, (_, s)) in out.iter().enumerate().skip(1) {
-                    if *s < min_s {
-                        min_s = *s;
-                        min_i = i;
-                    }
-                }
-                if score > min_s {
-                    out[min_i] = (slot, score);
-                }
-            };
+            }
+            if score > min_s {
+                out[min_i] = (slot, score);
+            }
+        };
         let merge_topk = |mut a: Vec<(u32, f64)>, mut b: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
             if a.is_empty() {
                 if b.len() > internal_k {
@@ -2447,9 +2446,8 @@ impl TurboQuantEngine {
             .truncate_to(slot_count)
             .map_err(|e| format!("close: live_codes.truncate_to({slot_count}) failed: {e}"))?;
         if let Some(vraw) = &mut self.live_vraw {
-            vraw.truncate_to(slot_count).map_err(|e| {
-                format!("close: live_vraw.truncate_to({slot_count}) failed: {e}")
-            })?;
+            vraw.truncate_to(slot_count)
+                .map_err(|e| format!("close: live_vraw.truncate_to({slot_count}) failed: {e}"))?;
         }
         self.metadata
             .flush()

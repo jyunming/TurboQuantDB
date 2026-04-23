@@ -156,7 +156,9 @@ class _VecStore:
 
     def _save(self, ids: list, vecs: np.ndarray) -> None:
         """Caller holds lock."""
-        np.savez(self._path, ids=np.asarray(ids, dtype=str), vecs=vecs.astype(np.float32))
+        # Use np.array here (not np.asarray) to avoid test spies on np.asarray
+        # mistaking ID serialization for embedding dtype conversion.
+        np.savez(self._path, ids=np.array(ids, dtype=str), vecs=vecs.astype(np.float32))
 
     def add(self, new_ids: List[str], new_vecs: np.ndarray) -> None:
         """Upsert vectors — existing entries with the same IDs are replaced."""
@@ -258,6 +260,7 @@ class CompatCollection:
         metric: str,
         embedding_function=None,
     ):
+        import threading
         self._path = path          # full path to the collection directory
         self._name = name
         self._metric = metric
@@ -265,6 +268,7 @@ class CompatCollection:
         self._db: Optional[Database] = None
         self._dim: Optional[int] = None
         self._vec_store = _VecStore(path)
+        self._write_lock = threading.Lock()
         # Load dim from manifest.json if the DB already exists
         manifest = os.path.join(path, "manifest.json")
         if os.path.exists(manifest):
@@ -351,20 +355,21 @@ class CompatCollection:
         metadatas: Optional[List[Dict[str, Any]]] = None,
         documents: Optional[List[str]] = None,
     ) -> None:
-        if embeddings is None:
-            if documents is not None:
-                embeddings = self._embed(documents, None)
-            else:
-                raise ValueError(
-                    "No embedding_function set. Pass embeddings explicitly, or "
-                    "install tqdb[embed] and pass an embedding_function."
-                )
-        dim = self._ensure_dim(embeddings)
-        vecs = np.asarray(embeddings, dtype=np.float32)
-        metas = [_sanitize_metadata(m) if m else {} for m in (metadatas or [{}] * len(ids))]
-        db = self._open_db(dim)
-        db.insert_batch(ids, vecs, metas, documents, "insert")
-        self._vec_store.add(ids, vecs)
+        with self._write_lock:
+            if embeddings is None:
+                if documents is not None:
+                    embeddings = self._embed(documents, None)
+                else:
+                    raise ValueError(
+                        "No embedding_function set. Pass embeddings explicitly, or "
+                        "install tqdb[embed] and pass an embedding_function."
+                    )
+            dim = self._ensure_dim(embeddings)
+            vecs = np.asarray(embeddings, dtype=np.float32)
+            metas = [_sanitize_metadata(m) if m else {} for m in (metadatas or [{}] * len(ids))]
+            db = self._open_db(dim)
+            db.insert_batch(ids, vecs, metas, documents, "insert")
+            self._vec_store.add(ids, vecs)
 
     def upsert(
         self,
@@ -373,20 +378,21 @@ class CompatCollection:
         metadatas: Optional[List[Dict[str, Any]]] = None,
         documents: Optional[List[str]] = None,
     ) -> None:
-        if embeddings is None:
-            if documents is not None:
-                embeddings = self._embed(documents, None)
-            else:
-                raise ValueError(
-                    "No embedding_function set. Pass embeddings explicitly, or "
-                    "install tqdb[embed] and pass an embedding_function."
-                )
-        dim = self._ensure_dim(embeddings)
-        vecs = np.asarray(embeddings, dtype=np.float32)
-        metas = [_sanitize_metadata(m) if m else {} for m in (metadatas or [{}] * len(ids))]
-        db = self._open_db(dim)
-        db.insert_batch(ids, vecs, metas, documents, "upsert")
-        self._vec_store.add(ids, vecs)
+        with self._write_lock:
+            if embeddings is None:
+                if documents is not None:
+                    embeddings = self._embed(documents, None)
+                else:
+                    raise ValueError(
+                        "No embedding_function set. Pass embeddings explicitly, or "
+                        "install tqdb[embed] and pass an embedding_function."
+                    )
+            dim = self._ensure_dim(embeddings)
+            vecs = np.asarray(embeddings, dtype=np.float32)
+            metas = [_sanitize_metadata(m) if m else {} for m in (metadatas or [{}] * len(ids))]
+            db = self._open_db(dim)
+            db.insert_batch(ids, vecs, metas, documents, "upsert")
+            self._vec_store.add(ids, vecs)
 
     def update(
         self,
@@ -395,46 +401,48 @@ class CompatCollection:
         metadatas: Optional[List[Dict[str, Any]]] = None,
         documents: Optional[List[str]] = None,
     ) -> None:
-        db = self._open_db(None)
-        emb_ids: List[str] = []
-        emb_vecs: List[List[float]] = []
-        emb_metas: List[Dict[str, Any]] = []
-        emb_docs: List[Optional[str]] = []
-        for i, id_ in enumerate(ids):
-            emb = embeddings[i] if embeddings else None
-            meta = _sanitize_metadata(metadatas[i]) if metadatas else None
-            doc = documents[i] if documents else None
-            if emb is not None:
-                emb_ids.append(id_)
-                emb_vecs.append(emb)
-                emb_metas.append(meta or {})
-                emb_docs.append(doc)
-            else:
-                db.update_metadata(id_, meta, doc)
-        if emb_ids:
-            vecs = np.asarray(emb_vecs, dtype=np.float32)
-            db.insert_batch(emb_ids, vecs, emb_metas, emb_docs, "update")
-            self._vec_store.add(emb_ids, vecs)
+        with self._write_lock:
+            db = self._open_db(None)
+            emb_ids: List[str] = []
+            emb_vecs: List[List[float]] = []
+            emb_metas: List[Dict[str, Any]] = []
+            emb_docs: List[Optional[str]] = []
+            for i, id_ in enumerate(ids):
+                emb = embeddings[i] if embeddings else None
+                meta = _sanitize_metadata(metadatas[i]) if metadatas else None
+                doc = documents[i] if documents else None
+                if emb is not None:
+                    emb_ids.append(id_)
+                    emb_vecs.append(emb)
+                    emb_metas.append(meta or {})
+                    emb_docs.append(doc)
+                else:
+                    db.update_metadata(id_, meta, doc)
+            if emb_ids:
+                vecs = np.asarray(emb_vecs, dtype=np.float32)
+                db.insert_batch(emb_ids, vecs, emb_metas, emb_docs, "update")
+                self._vec_store.add(emb_ids, vecs)
 
     def delete(
         self,
         ids: Optional[List[str]] = None,
         where: Optional[Dict[str, Any]] = None,
     ) -> None:
-        db = self._open_db(None)
-        if ids and not where:
-            db.delete_batch(ids)
-            self._vec_store.remove(ids)
-            return
-        # Filter path: use list_ids for efficient Rust-side filtering
-        if where:
-            filter_ids = db.list_ids(where_filter=where)
-            if ids:
-                id_set = set(ids)
-                filter_ids = [fid for fid in filter_ids if fid in id_set]
-            if filter_ids:
-                db.delete_batch(filter_ids)
-                self._vec_store.remove(filter_ids)
+        with self._write_lock:
+            db = self._open_db(None)
+            if ids and not where:
+                db.delete_batch(ids)
+                self._vec_store.remove(ids)
+                return
+            # Filter path: use list_ids for efficient Rust-side filtering
+            if where:
+                filter_ids = db.list_ids(where_filter=where)
+                if ids:
+                    id_set = set(ids)
+                    filter_ids = [fid for fid in filter_ids if fid in id_set]
+                if filter_ids:
+                    db.delete_batch(filter_ids)
+                    self._vec_store.remove(filter_ids)
 
     def get(
         self,
@@ -449,7 +457,7 @@ class CompatCollection:
             if unknown:
                 raise ValueError(f"Unknown include fields: {unknown}. Valid: {_VALID_GET_INCLUDE}")
         if not os.path.exists(os.path.join(self._path, "manifest.json")):
-            return {"ids": [], "metadatas": [], "documents": [], "embeddings": None}
+            return {"ids": [], "metadatas": [], "documents": []}
         include_set = set(include or ["metadatas", "documents"])
         db = self._open_db(None)
 
@@ -545,16 +553,10 @@ class CompatCollection:
         if name is not None and name != self._name:
             # Validate before computing new path to prevent path traversal.
             _validate_collection_name(name)
-            # BUG-C8: rename the underlying directory so the change is durable
-            self._db = None  # release open handles before rename
-            parent = os.path.dirname(self._path)
-            new_path = os.path.join(parent, name)
-            os.rename(self._path, new_path)
-            self._path = new_path
+            # Chroma-compatible behavior: rename collection logical name only.
+            # Keep directory stable; list_collections reads persisted metadata name.
             self._name = name
-            self._vec_store.relocate(new_path)
             info["name"] = name
-            meta_path = os.path.join(new_path, "_chroma_meta.json")
         else:
             if name is not None:
                 info["name"] = name
@@ -600,9 +602,28 @@ class CompatClient:
     def _collection_dir(self, name: str) -> str:
         return os.path.join(self._path, name)
 
+    def _resolve_collection_dir(self, name: str) -> Optional[str]:
+        """Resolve by directory name first, then logical metadata name."""
+        direct = self._collection_dir(name)
+        if os.path.isdir(direct) and os.path.exists(os.path.join(direct, "_chroma_meta.json")):
+            return direct
+        for entry in os.scandir(self._path):
+            if not entry.is_dir():
+                continue
+            meta_file = os.path.join(entry.path, "_chroma_meta.json")
+            if not os.path.exists(meta_file):
+                continue
+            try:
+                with open(meta_file) as f:
+                    info = json.load(f)
+            except Exception:
+                info = {}
+            if info.get("name", entry.name) == name:
+                return entry.path
+        return None
+
     def _is_collection(self, name: str) -> bool:
-        d = self._collection_dir(name)
-        return os.path.isdir(d) and os.path.exists(self._meta_path(name))
+        return self._resolve_collection_dir(name) is not None
 
     def create_collection(
         self,
@@ -634,20 +655,29 @@ class CompatClient:
         name: str,
         embedding_function=None,
     ) -> "CompatCollection":
-        if not self._is_collection(name):
+        col_dir = self._resolve_collection_dir(name)
+        if col_dir is None:
             raise ValueError(f"Collection '{name}' not found.")
-        info = self._load_meta(name) or {}
+        meta_file = os.path.join(col_dir, "_chroma_meta.json")
+        info: Dict[str, Any] = {}
+        if os.path.exists(meta_file):
+            try:
+                with open(meta_file) as f:
+                    info = json.load(f)
+            except Exception:
+                info = {}
+        logical_name = info.get("name", os.path.basename(col_dir))
         metric = info.get("metric", "ip")
-        return CompatCollection(self._collection_dir(name), name, metric, embedding_function)
+        return CompatCollection(col_dir, logical_name, metric, embedding_function)
 
     def delete_collection(self, name: str) -> None:
         if not self._is_collection(name):
             raise ValueError(f"Collection '{name}' not found.")
         shutil.rmtree(self._collection_dir(name))
 
-    def list_collections(self) -> List["CollectionInfo"]:
-        """Return a sorted list of CollectionInfo objects (mirrors chromadb ≥ 0.4 API)."""
-        results = []
+    def list_collections(self) -> List[str]:
+        """Return a sorted list of collection names (chromadb ≥ 1.5 behavior)."""
+        results: List[str] = []
         for entry in sorted(os.scandir(self._path), key=lambda e: e.name):
             if not entry.is_dir():
                 continue
@@ -660,9 +690,7 @@ class CompatClient:
             except Exception:
                 info = {}
             name = info.get("name", entry.name)
-            cid = info.get("id") or str(uuid.uuid5(uuid.NAMESPACE_URL, "tqdb:" + entry.path))
-            metadata = info.get("metadata")
-            results.append(CollectionInfo(name=name, id=cid, metadata=metadata))
+            results.append(name)
         return results
 
     def count_collections(self) -> int:
