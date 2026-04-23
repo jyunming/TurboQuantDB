@@ -3864,9 +3864,7 @@ impl TurboQuantEngine {
             }
             self.wal.append_batch(&wal_entries, false)?;
             self.metadata.put_many(&metadata_entries)?;
-            for slot in metadata_deletes {
-                self.metadata.delete(slot)?;
-            }
+            self.metadata.delete_many(&metadata_deletes)?;
             // Track newly allocated slots in the delta overlay so ANN search finds
             // them without a rebuild. indexed_set is built once before the chunk
             // loop. delta_slots is kept sorted; binary_search gives O(log n).

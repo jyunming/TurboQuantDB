@@ -236,10 +236,48 @@ impl MetadataStore {
     }
 
     pub fn delete(&mut self, slot: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Only write WAL tombstone when the slot had actual metadata in memory;
+        // if it was never stored there's nothing to undo on replay.
+        if !self.data.contains_key(&slot) {
+            return Ok(());
+        }
+        // index_remove reads self.data to know which index entries to drop,
+        // so it must run before data.remove.
         self.index_remove(slot);
         self.data.remove(&slot);
         self.dirty = true;
         self.append_wal_delete(slot)?;
+        Ok(())
+    }
+
+    pub fn delete_many(
+        &mut self,
+        slots: &[u32],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        // Collect only slots that actually have metadata — avoids opening the WAL
+        // file at all when inserting no-metadata vectors (the common fast path).
+        let mut to_tombstone: Vec<u32> = Vec::new();
+        for &slot in slots {
+            if self.data.contains_key(&slot) {
+                self.index_remove(slot); // must run before data.remove
+                self.data.remove(&slot);
+                self.dirty = true;
+                to_tombstone.push(slot);
+            }
+        }
+        if to_tombstone.is_empty() {
+            return Ok(());
+        }
+        // Write all delete tombstones in one file open.
+        let mut f = Self::wal_open_append(&self.wal_path)?;
+        for slot in to_tombstone {
+            f.write_all(&[WAL_DELETE])?;
+            f.write_all(&slot.to_le_bytes())?;
+        }
+        self.wal_has_entries = true;
         Ok(())
     }
 
