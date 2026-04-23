@@ -139,8 +139,10 @@ impl MetadataStore {
         }
 
         // Replay WAL entries if any exist since the last flush.
+        // Propagate replay errors rather than silently ignoring them — a corrupt WAL
+        // that exists but fails to parse should not silently load stale state.
         let wal_has_entries = if wal_path.exists() {
-            Self::replay_wal(&wal_path, &mut data).unwrap_or(false)
+            Self::replay_wal(&wal_path, &mut data)?
         } else {
             false
         };
@@ -1313,14 +1315,6 @@ mod tests {
             &[0, 2]
         );
     }
-}
-
-#[cfg(test)]
-mod or_debug_test {
-    use super::*;
-    use serde_json::json;
-    use std::collections::HashMap;
-    use tempfile::tempdir;
 
     #[test]
     fn or_index_lookup_works() {
@@ -1328,7 +1322,6 @@ mod or_debug_test {
         let path = dir.path().join("meta.bin");
         let mut store = MetadataStore::open(path.to_str().unwrap()).unwrap();
 
-        // Insert slots with cat=a or cat=b
         let entries: Vec<(u32, VectorMetadata)> = (0..20u32)
             .map(|i| {
                 let cat = if i < 10 { "a" } else { "b" };
@@ -1345,20 +1338,11 @@ mod or_debug_test {
             .collect();
         store.put_many(&entries).unwrap();
 
-        // Check eq_index has cat field
-        let all_a = store.get_eq_candidates("cat", &json!("a"));
-        println!("cat=a slots: {:?}", all_a);
-        assert!(all_a.is_some(), "cat field should be indexed");
-
-        // Check get_in_candidates_refs works
+        assert!(store.get_eq_candidates("cat", &json!("a")).is_some());
         let vals = vec![json!("a"), json!("b")];
         let val_refs: Vec<&serde_json::Value> = vals.iter().collect();
         let candidates = store.get_in_candidates_refs("cat", &val_refs);
-        println!("or candidates: {:?}", candidates);
-        assert!(
-            candidates.is_some(),
-            "get_in_candidates_refs should return Some for indexed field"
-        );
-        assert_eq!(candidates.unwrap().len(), 20, "should find all 20 slots");
+        assert!(candidates.is_some());
+        assert_eq!(candidates.unwrap().len(), 20);
     }
 }

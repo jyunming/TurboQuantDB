@@ -184,7 +184,7 @@ impl IvfIndex {
 
     pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let payload = bincode::serialize(self)?;
-        let tmp = path.with_extension("ivf.tmp");
+        let tmp = path.with_file_name("ivf.bin.tmp");
         let mut out = Vec::with_capacity(payload.len() + 4);
         out.extend_from_slice(IVF_MAGIC);
         out.extend_from_slice(&payload);

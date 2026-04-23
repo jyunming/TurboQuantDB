@@ -870,7 +870,7 @@ impl TurboQuantEngine {
     /// Blocked batch scorer: scan all N codes once, score against all Q queries in parallel.
     ///
     /// Reduces memory traffic from Q×N×stride to N×stride bytes. Activated when
-    /// Q ≥ 8, N ≥ 50k, brute-force path, Ip/Cosine metric, rerank disabled.
+    /// Q ≥ 8, N ≥ 500k, brute-force path, Ip/Cosine metric, rerank disabled.
     fn score_batch_brute(
         &self,
         queries: &[Array1<f64>],
@@ -882,6 +882,21 @@ impl TurboQuantEngine {
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let nq = queries.len();
         let internal_k = top_k; // no rerank — caller already checked rerank_enabled=false
+
+        // Apply the same query normalisation as the single-query path.
+        let normalized_storage: Vec<Array1<f64>>;
+        let effective_queries: &[Array1<f64>] = if self.normalize {
+            normalized_storage = queries
+                .iter()
+                .map(|q| {
+                    let qn = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    if qn > 1e-10 { q / qn } else { q.to_owned() }
+                })
+                .collect();
+            &normalized_storage
+        } else {
+            queries
+        };
 
         // Resolve candidate slots (shared across all Q queries).
         let active_slots = self.id_pool.iter_active_slots();
@@ -927,7 +942,7 @@ impl TurboQuantEngine {
         let quantizer = &self.quantizer;
 
         // Per-query q_norm_inv for cosine.
-        let q_norms_inv: Vec<f64> = queries
+        let q_norms_inv: Vec<f64> = effective_queries
             .iter()
             .map(|q| {
                 let n = q.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -936,7 +951,7 @@ impl TurboQuantEngine {
             .collect();
 
         // Pre-build Q LUTs — O(Q × n) work done once outside the scoring loop.
-        let preps: Vec<_> = queries
+        let preps: Vec<_> = effective_queries
             .iter()
             .map(|q| quantizer.prepare_ip_query(q))
             .collect();
@@ -3000,6 +3015,8 @@ impl TurboQuantEngine {
         );
         let ivf_path = Path::new(&self.local_dir).join("ivf.bin");
         ivf.save(&ivf_path)?;
+        // Mirror to the backend so cloud backends (S3/GCS) persist the index.
+        self.backend.write("ivf.bin", &std::fs::read(&ivf_path)?)?;
         self.ivf = Some(ivf);
         Ok(())
     }
@@ -3019,6 +3036,21 @@ impl TurboQuantEngine {
         include_metadata: bool,
         include_document: bool,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        // IVF centroid scoring uses IP in the MSE-rotated space; non-IP/Cosine metrics
+        // would need distance-consistent centroid assignment — fall back to brute-force.
+        if !matches!(self.metric, DistanceMetric::Ip | DistanceMetric::Cosine) {
+            return self.search_with_filter_and_ann_include(
+                query,
+                top_k,
+                filter,
+                None,
+                false,
+                rerank_factor,
+                include_id,
+                include_metadata,
+                include_document,
+            );
+        }
         let Some(ivf) = &self.ivf else {
             // No IVF index — fall back to brute-force.
             return self.search_with_filter_and_ann_include(
@@ -3037,8 +3069,22 @@ impl TurboQuantEngine {
             return Ok(Vec::new());
         }
 
-        // Rotate query into SRHT space to score against IVF centroids.
-        let query_f32: Vec<f32> = query.iter().map(|&v| v as f32).collect();
+        // Apply the same query normalisation that the main search path does.
+        let normalized_query;
+        let effective_query = if self.normalize {
+            let qn = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+            normalized_query = if qn > 1e-10 {
+                query / qn
+            } else {
+                query.to_owned()
+            };
+            &normalized_query
+        } else {
+            query
+        };
+
+        // Rotate query into MSE-rotated space to score against IVF centroids.
+        let query_f32: Vec<f32> = effective_query.iter().map(|&v| v as f32).collect();
         let mut y_query = vec![0.0f32; self.quantizer.n];
         self.quantizer
             .mse_quantizer
@@ -3047,13 +3093,25 @@ impl TurboQuantEngine {
         // Probe IVF: get candidate slots from top-nprobe clusters.
         let mut candidates = ivf.probe(&y_query, nprobe);
 
-        // Intersect with filter candidates (use index fast path when available).
+        // Intersect with filter candidates using sorted-list merge (both sides are sorted).
         if let Some(f) = filter {
             let active_slots = self.id_pool.iter_active_slots();
-            if let Some(filter_slots) = self.resolve_filter_via_index(f, &active_slots) {
-                // Intersect IVF candidates with filter-resolved slots (both sorted).
-                let fs_set: std::collections::HashSet<u32> = filter_slots.into_iter().collect();
-                candidates.retain(|s| fs_set.contains(s));
+            if let Some(mut filter_slots) = self.resolve_filter_via_index(f, &active_slots) {
+                filter_slots.sort_unstable();
+                let mut merged = Vec::with_capacity(candidates.len().min(filter_slots.len()));
+                let (mut ci, mut fi) = (0, 0);
+                while ci < candidates.len() && fi < filter_slots.len() {
+                    match candidates[ci].cmp(&filter_slots[fi]) {
+                        std::cmp::Ordering::Equal => {
+                            merged.push(candidates[ci]);
+                            ci += 1;
+                            fi += 1;
+                        }
+                        std::cmp::Ordering::Less => ci += 1,
+                        std::cmp::Ordering::Greater => fi += 1,
+                    }
+                }
+                candidates = merged;
             }
         }
 
@@ -3063,7 +3121,7 @@ impl TurboQuantEngine {
 
         // Score the shortlist using the existing quantized scorer.
         self.exhaustive_search_simd(
-            query,
+            effective_query,
             top_k,
             filter,
             Some(candidates),

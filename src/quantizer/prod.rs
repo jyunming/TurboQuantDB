@@ -572,10 +572,29 @@ impl ProdQuantizer {
                 x_mat[(row, col)] = val;
             }
         }
-        // GEMM: Y = R × X  (one call through matrixmultiply's SGEMM kernel).
+        // GEMM: Y = R × X via matrixmultiply's SGEMM kernel.
+        // Interpret the rotation matrix slice directly without DMatrix allocation.
         let mat = self.mse_quantizer.rotation_matrix.as_ref().unwrap();
-        let r = DMatrix::from_row_slice(d, d, mat);
-        let y_mat = r * x_mat;
+        let mut y_mat = DMatrix::<f32>::zeros(d, b);
+        // SAFETY: mat, x_mat, y_mat are valid f32 slices; dimensions match.
+        unsafe {
+            matrixmultiply::sgemm(
+                d,
+                d,
+                b,
+                1.0,
+                mat.as_ptr(),
+                d as isize,
+                1, // R: row-major (d×d)
+                x_mat.as_ptr(),
+                1,
+                d as isize, // X: col-major (d×b)
+                0.0,
+                y_mat.as_mut_ptr(),
+                1,
+                d as isize, // Y: col-major (d×b)
+            );
+        }
 
         // Per-vector: centroid lookup on each column of Y, then QJL if needed.
         (0..b)

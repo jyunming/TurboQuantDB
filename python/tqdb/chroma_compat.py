@@ -671,9 +671,10 @@ class CompatClient:
         return CompatCollection(col_dir, logical_name, metric, embedding_function)
 
     def delete_collection(self, name: str) -> None:
-        if not self._is_collection(name):
+        col_dir = self._resolve_collection_dir(name)
+        if col_dir is None:
             raise ValueError(f"Collection '{name}' not found.")
-        shutil.rmtree(self._collection_dir(name))
+        shutil.rmtree(col_dir)
 
     def list_collections(self) -> List[str]:
         """Return a sorted list of collection names (chromadb ≥ 1.5 behavior)."""
