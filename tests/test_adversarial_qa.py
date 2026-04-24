@@ -80,8 +80,10 @@ class TestInputHardening:
 
 class TestValidationStrictness:
     def test_open_rejects_bits_below_2_without_panic(self, tmp_path):
+        # bits=1 is valid in fast_mode=True; only invalid values (e.g. bits=0)
+        # should raise, and must raise cleanly (not via panic).
         with pytest.raises(BaseException) as exc_info:
-            Database.open(str(tmp_path / "db"), dimension=8, bits=1, metric="ip")
+            Database.open(str(tmp_path / "db"), dimension=8, bits=0, metric="ip")
         assert _safe_error(exc_info), f"unexpected panic type: {exc_info.type.__name__}"
 
     def test_filter_unknown_operator_raises_count(self, tmp_path):

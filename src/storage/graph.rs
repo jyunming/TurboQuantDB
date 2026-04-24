@@ -67,6 +67,19 @@ pub struct GraphManager {
 }
 
 impl GraphManager {
+    #[inline]
+    fn choose_top_ids(mut scored: Vec<(u32, f64)>, degree_cap: usize) -> Vec<u32> {
+        if scored.len() > degree_cap {
+            scored.select_nth_unstable_by(degree_cap, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+            });
+            scored.truncate(degree_cap);
+        }
+        let mut chosen: Vec<u32> = scored.into_iter().map(|(id, _)| id).collect();
+        chosen.sort_unstable();
+        chosen
+    }
+
     /// Open (or create) the graph manager. Reads `graph.bin` from `backend` into
     /// `cache_dir` and memory-maps it; if the file is absent the manager starts empty.
     pub fn open(
@@ -429,15 +442,8 @@ impl GraphManager {
                     }
 
                     let cand_vec: Vec<u32> = candidates.into_iter().collect();
-                    let mut scored = build_scorer(i, &cand_vec);
-                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                    let mut chosen: Vec<u32> = scored
-                        .into_iter()
-                        .take(degree_cap)
-                        .map(|(id, _)| id)
-                        .collect();
-                    chosen.sort_unstable();
-                    chosen
+                    let scored = build_scorer(i, &cand_vec);
+                    Self::choose_top_ids(scored, degree_cap)
                 })
                 .collect();
 
@@ -460,15 +466,8 @@ impl GraphManager {
                             }
                         }
                         let cand_vec: Vec<u32> = candidates.into_iter().collect();
-                        let mut scored = build_scorer(i, &cand_vec);
-                        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                        let mut chosen: Vec<u32> = scored
-                            .into_iter()
-                            .take(degree_cap)
-                            .map(|(id, _)| id)
-                            .collect();
-                        chosen.sort_unstable();
-                        chosen
+                        let scored = build_scorer(i, &cand_vec);
+                        Self::choose_top_ids(scored, degree_cap)
                     })
                     .collect();
 
@@ -699,15 +698,8 @@ impl GraphManager {
                         }
                     }
                     let cand_vec: Vec<u32> = candidates.into_iter().collect();
-                    let mut scored = build_scorer(i, &cand_vec);
-                    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                    let mut chosen: Vec<u32> = scored
-                        .into_iter()
-                        .take(degree_cap)
-                        .map(|(id, _)| id)
-                        .collect();
-                    chosen.sort_unstable();
-                    chosen
+                    let scored = build_scorer(i, &cand_vec);
+                    Self::choose_top_ids(scored, degree_cap)
                 })
                 .collect();
 
@@ -730,15 +722,8 @@ impl GraphManager {
                             }
                         }
                         let cand_vec: Vec<u32> = candidates.into_iter().collect();
-                        let mut scored = build_scorer(i, &cand_vec);
-                        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                        let mut chosen: Vec<u32> = scored
-                            .into_iter()
-                            .take(degree_cap)
-                            .map(|(id, _)| id)
-                            .collect();
-                        chosen.sort_unstable();
-                        chosen
+                        let scored = build_scorer(i, &cand_vec);
+                        Self::choose_top_ids(scored, degree_cap)
                     })
                     .collect();
                 for (idx, &i) in new_level_nodes.iter().enumerate() {
@@ -758,14 +743,8 @@ impl GraphManager {
                         if nb_neighbors.len() > degree_cap {
                             // Score all neighbors and keep best degree_cap.
                             let all: Vec<u32> = nb_neighbors.drain(..).collect();
-                            let mut scored = build_scorer(nb, &all);
-                            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                            *nb_neighbors = scored
-                                .into_iter()
-                                .take(degree_cap)
-                                .map(|(id, _)| id)
-                                .collect();
-                            nb_neighbors.sort_unstable();
+                            let scored = build_scorer(nb, &all);
+                            *nb_neighbors = Self::choose_top_ids(scored, degree_cap);
                         }
                     }
                 }

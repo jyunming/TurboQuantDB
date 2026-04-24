@@ -11,6 +11,7 @@ use super::backend::StorageBackend;
 use super::compaction::Compactor;
 use super::graph::GraphManager;
 use super::id_pool::IdPool;
+use super::ivf::IvfIndex;
 use super::live_codes::LiveCodesFile;
 use super::metadata::{MetadataStore, VectorMetadata};
 use super::segment::{SegmentManager, SegmentRecord};
@@ -19,8 +20,8 @@ use crate::quantizer::CodeIndex;
 use crate::quantizer::prod::ProdQuantizer;
 pub(crate) mod filter;
 use filter::{
-    extract_indexable_eq, extract_range_condition, get_nested_field, metadata_matches_filter,
-    score_vectors_with_metric,
+    extract_in_condition, extract_indexable_eq, extract_nin_condition, extract_or_single_field_eq,
+    extract_range_condition, get_nested_field, metadata_matches_filter, score_vectors_with_metric,
 };
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
@@ -152,6 +153,21 @@ fn default_rerank_enabled() -> bool {
 #[inline]
 fn has_meaningful_metadata(meta: &VectorMetadata) -> bool {
     !meta.properties.is_empty() || meta.document.is_some()
+}
+
+/// Returns true when `resolve_filter_via_index()` fully resolves `filter` with no
+/// additional per-candidate evaluation needed.  Pure-$eq, $in, $nin, single-field $or,
+/// and single-field range conditions are all exact — callers can skip the post-scan.
+fn filter_is_exact_index(filter: &HashMap<String, JsonValue>) -> bool {
+    // Pure equality conditions (existing behaviour).
+    if let Some(eqs) = extract_indexable_eq(filter) {
+        return eqs.len() == filter.len();
+    }
+    // Single-field $in / $nin / single-field $or / single-field range.
+    extract_in_condition(filter).is_some()
+        || extract_nin_condition(filter).is_some()
+        || extract_or_single_field_eq(filter).is_some()
+        || extract_range_condition(filter).is_some()
 }
 
 fn intersect_sorted_slots(a: &[u32], b: &[u32]) -> Vec<u32> {
@@ -301,6 +317,8 @@ pub struct TurboQuantEngine {
     /// When true, input vectors and query vectors are L2-normalised internally
     /// before quantisation / scoring so that IP ≡ cosine similarity.
     pub normalize: bool,
+    /// Optional IVF coarse index — loaded at open if `ivf.bin` exists.
+    ivf: Option<IvfIndex>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -548,6 +566,7 @@ impl TurboQuantEngine {
             has_pending_deletes: false,
             rerank_enabled: manifest.rerank_enabled,
             normalize: normalize_flag,
+            ivf: None,
         };
 
         let id_pool_loaded = if let Ok(ip) = load_id_pool(local_dir, &engine.backend) {
@@ -582,6 +601,11 @@ impl TurboQuantEngine {
             return Err(
                 "live_ids.bin missing and WAL is empty; database state appears corrupt".into(),
             );
+        }
+        // Load IVF index if present.
+        let ivf_path = Path::new(local_dir).join("ivf.bin");
+        if ivf_path.exists() {
+            engine.ivf = IvfIndex::load(&ivf_path).ok();
         }
         Ok(engine)
     }
@@ -843,6 +867,206 @@ impl TurboQuantEngine {
         self.delta_slots.len() * AUTO_ANN_MAX_DELTA_DEN <= n * AUTO_ANN_MAX_DELTA_NUM
     }
 
+    /// Blocked batch scorer: scan all N codes once, score against all Q queries in parallel.
+    ///
+    /// Reduces memory traffic from Q×N×stride to N×stride bytes. Activated when
+    /// Q ≥ 8, N ≥ 500k, brute-force path, Ip/Cosine metric, rerank disabled.
+    fn score_batch_brute(
+        &self,
+        queries: &[Array1<f64>],
+        top_k: usize,
+        filter: Option<&HashMap<String, JsonValue>>,
+        include_id: bool,
+        include_metadata: bool,
+        include_document: bool,
+    ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
+        let nq = queries.len();
+        let internal_k = top_k; // no rerank — caller already checked rerank_enabled=false
+
+        // Apply the same query normalisation as the single-query path.
+        let normalized_storage: Vec<Array1<f64>>;
+        let effective_queries: &[Array1<f64>] = if self.normalize {
+            normalized_storage = queries
+                .iter()
+                .map(|q| {
+                    let qn = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    if qn > 1e-10 { q / qn } else { q.to_owned() }
+                })
+                .collect();
+            &normalized_storage
+        } else {
+            queries
+        };
+
+        // Resolve candidate slots (shared across all Q queries).
+        let active_slots = self.id_pool.iter_active_slots();
+        if active_slots.is_empty() {
+            return Ok(vec![Vec::new(); nq]);
+        }
+        let candidate_slots: Vec<u32> = if let Some(f) = filter {
+            if let Some(indexed) = self.resolve_filter_via_index(f, &active_slots) {
+                let all_eq = filter_is_exact_index(f);
+                if all_eq {
+                    indexed
+                } else {
+                    let meta_map = self.metadata.get_many_properties(&indexed)?;
+                    let empty: HashMap<String, JsonValue> = HashMap::new();
+                    indexed
+                        .into_iter()
+                        .filter(|s| {
+                            metadata_matches_filter(meta_map.get(s).copied().unwrap_or(&empty), f)
+                        })
+                        .collect()
+                }
+            } else {
+                let meta_map = self.metadata.get_many_properties(&active_slots)?;
+                let empty: HashMap<String, JsonValue> = HashMap::new();
+                active_slots
+                    .into_iter()
+                    .filter(|s| {
+                        metadata_matches_filter(meta_map.get(s).copied().unwrap_or(&empty), f)
+                    })
+                    .collect()
+            }
+        } else {
+            active_slots
+        };
+        if candidate_slots.is_empty() {
+            return Ok(vec![Vec::new(); nq]);
+        }
+
+        let codes_bytes = self.live_codes.as_bytes();
+        let stride = self.live_stride();
+        let mse_len = self.live_mse_len();
+        let qjl_len = self.live_qjl_len();
+        let quantizer = &self.quantizer;
+
+        // Per-query q_norm_inv for cosine.
+        let q_norms_inv: Vec<f64> = effective_queries
+            .iter()
+            .map(|q| {
+                let n = q.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if n > 0.0 { 1.0 / n } else { 0.0 }
+            })
+            .collect();
+
+        // Pre-build Q LUTs — O(Q × n) work done once outside the scoring loop.
+        let preps: Vec<_> = effective_queries
+            .iter()
+            .map(|q| quantizer.prepare_ip_query(q))
+            .collect();
+
+        // Per-query bounded heap: Vec<(slot, score)>, capped at internal_k.
+        let use_small_topk = internal_k <= 32;
+        let mut per_query: Vec<Vec<(u32, f64)>> = (0..nq)
+            .map(|_| Vec::with_capacity(internal_k.min(256)))
+            .collect();
+        let mut idx_buf = vec![0u16; quantizer.n];
+
+        for &slot in &candidate_slots {
+            let rec = &codes_bytes[slot as usize * stride..(slot as usize + 1) * stride];
+            quantizer.unpack_mse_indices(&rec[..mse_len], &mut idx_buf);
+            let gamma = f32::from_le_bytes(
+                rec[mse_len + qjl_len..mse_len + qjl_len + 4]
+                    .try_into()
+                    .expect("gamma field is 4 bytes"),
+            );
+            let doc_norm = f32::from_le_bytes(
+                rec[mse_len + qjl_len + 4..mse_len + qjl_len + 8]
+                    .try_into()
+                    .expect("doc_norm field is 4 bytes"),
+            );
+            let qjl_bits = &rec[mse_len..mse_len + qjl_len];
+
+            for q_idx in 0..nq {
+                let raw =
+                    quantizer.score_ip_encoded(&preps[q_idx], &idx_buf, qjl_bits, gamma as f64)
+                        * doc_norm as f64;
+                let score = if matches!(self.metric, DistanceMetric::Cosine) {
+                    raw * q_norms_inv[q_idx]
+                } else {
+                    raw
+                };
+                let heap = &mut per_query[q_idx];
+                if use_small_topk {
+                    if heap.len() < internal_k {
+                        heap.push((slot, score));
+                    } else {
+                        let (mut min_i, mut min_s) = (0, heap[0].1);
+                        for (i, &(_, s)) in heap.iter().enumerate().skip(1) {
+                            if s < min_s {
+                                min_s = s;
+                                min_i = i;
+                            }
+                        }
+                        if score > min_s {
+                            heap[min_i] = (slot, score);
+                        }
+                    }
+                } else {
+                    heap.push((slot, score));
+                    // Periodic trim: avoid O(N) memory per query.
+                    if heap.len() > internal_k * 4 {
+                        heap.select_nth_unstable_by(internal_k, |a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                        });
+                        heap.truncate(internal_k);
+                    }
+                }
+            }
+        }
+
+        // Finalize: trim, sort, convert to SearchResult.
+        let mut results = Vec::with_capacity(nq);
+        for mut candidates in per_query {
+            if !use_small_topk && candidates.len() > internal_k {
+                candidates.select_nth_unstable_by(internal_k, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
+                });
+                candidates.truncate(internal_k);
+            }
+            candidates.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            candidates.truncate(top_k);
+
+            let slots: Vec<u32> = candidates.iter().map(|(s, _)| *s).collect();
+            let meta_map = if (include_metadata || include_document) && self.metadata.len() > 0 {
+                Some(self.metadata.get_many(&slots)?)
+            } else {
+                None
+            };
+
+            let mut row = Vec::with_capacity(candidates.len());
+            for (cand_slot, score) in candidates {
+                let id = if include_id {
+                    self.id_pool
+                        .get_str(cand_slot)
+                        .unwrap_or_default()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                let mut metadata = HashMap::new();
+                let mut document = None;
+                if let Some(meta) = meta_map.as_ref().and_then(|m| m.get(&cand_slot)).cloned() {
+                    if include_metadata {
+                        metadata = meta.properties;
+                    }
+                    if include_document {
+                        document = meta.document;
+                    }
+                }
+                row.push(SearchResult {
+                    id,
+                    score,
+                    metadata,
+                    document,
+                });
+            }
+            results.push(row);
+        }
+        Ok(results)
+    }
+
     /// Run the same search for multiple query vectors in one call.
     ///
     /// `use_ann_opt`:
@@ -884,6 +1108,27 @@ impl TurboQuantEngine {
         include_document: bool,
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let use_ann = use_ann_opt.unwrap_or_else(|| self.auto_use_ann());
+        // Blocked batch scorer: one pass through codes scores all Q queries simultaneously.
+        // Reduces memory traffic Q×N×stride → N×stride at the cost of sequential access.
+        // Break-even on memory-bandwidth-limited workloads (codes >> L3 cache, typically N > 500k).
+        // On multi-core machines with small N, the Rayon par_iter path beats this.
+        const BATCH_BRUTE_MIN_Q: usize = 8;
+        const BATCH_BRUTE_MIN_N: usize = 500_000;
+        if !use_ann
+            && queries.len() >= BATCH_BRUTE_MIN_Q
+            && self.id_pool.active_count() >= BATCH_BRUTE_MIN_N
+            && !self.rerank_enabled
+            && matches!(self.metric, DistanceMetric::Ip | DistanceMetric::Cosine)
+        {
+            return self.score_batch_brute(
+                queries,
+                top_k,
+                filter,
+                include_id,
+                include_metadata,
+                include_document,
+            );
+        }
         // For small query batches, Rayon scheduling overhead can dominate
         // end-to-end latency. Use a sequential path to reduce p50/p99 for
         // tiny batches (common in interactive RAG calls).
@@ -1493,10 +1738,7 @@ impl TurboQuantEngine {
 
                 let matches = if let Some(indexed) = self.resolve_filter_via_index(f, &active_slots)
                 {
-                    let all_eq = extract_indexable_eq(f)
-                        .map(|eqs| eqs.len() == f.len())
-                        .unwrap_or(false);
-                    if all_eq {
+                    if filter_is_exact_index(f) {
                         indexed
                     } else {
                         let meta_map = self.metadata.get_many_properties(&indexed)?;
@@ -1807,6 +2049,36 @@ impl TurboQuantEngine {
             return Some(intersect_sorted_slots(&slots, active_slots));
         }
 
+        // Fast path 3: $in — union of eq_index lookups for each value in the list.
+        if let Some((field, values)) = extract_in_condition(filter) {
+            if let Some(candidates) = self.metadata.get_in_candidates(field, values) {
+                return Some(intersect_sorted_slots(&candidates, active_slots));
+            }
+            // Field not indexed → fall through to O(N) scan.
+        }
+
+        // Fast path 4: $nin — complement of excluded-value slots against active slots.
+        if let Some((field, excluded)) = extract_nin_condition(filter) {
+            let excluded_slots = self
+                .metadata
+                .get_in_candidates(field, excluded)
+                .unwrap_or_default();
+            let result: Vec<u32> = active_slots
+                .iter()
+                .copied()
+                .filter(|s| excluded_slots.binary_search(s).is_err())
+                .collect();
+            return Some(result);
+        }
+
+        // Fast path 5: single-field $or with pure equality sub-conditions → $in union.
+        if let Some((field, values)) = extract_or_single_field_eq(filter) {
+            if let Some(candidates) = self.metadata.get_in_candidates_refs(field, &values) {
+                return Some(intersect_sorted_slots(&candidates, active_slots));
+            }
+            // Field not indexed → fall through to O(N) scan.
+        }
+
         None
     }
 
@@ -1860,12 +2132,9 @@ impl TurboQuantEngine {
                 if let Some(f) = filter {
                     // Fast path: try eq_index for O(1) candidate resolution.
                     if let Some(indexed_slots) = self.resolve_filter_via_index(f, &active_slots) {
-                        // Still need full filter eval in case there are additional conditions
-                        // beyond the indexed ones (e.g. range operators alongside $eq).
-                        let all_eq = extract_indexable_eq(f)
-                            .map(|eqs| eqs.len() == f.len())
-                            .unwrap_or(false);
-                        if all_eq {
+                        // Skip post-scan when the indexed result is exact.
+                        // Applies to: pure-$eq, $in, $nin, single-field $or, single-field range.
+                        if filter_is_exact_index(f) {
                             indexed_slots
                         } else {
                             let meta_map = self.metadata.get_many_properties(&indexed_slots)?;
@@ -1927,6 +2196,26 @@ impl TurboQuantEngine {
         };
         let par_chunk = (2_000_000 / quantizer.d.max(1)).clamp(128, par_chunk_max);
         let n_candidates = candidate_slots.len();
+        // Small-k fast path: avoid per-chunk full buffers + select_nth when
+        // the requested candidate budget is tiny (common top_k=10 workload).
+        let use_small_topk = internal_k <= 32;
+        let push_small_topk = |out: &mut Vec<(u32, f64)>, slot: u32, score: f64, k: usize| {
+            if out.len() < k {
+                out.push((slot, score));
+                return;
+            }
+            let mut min_i = 0usize;
+            let mut min_s = out[0].1;
+            for (i, (_, s)) in out.iter().enumerate().skip(1) {
+                if *s < min_s {
+                    min_s = *s;
+                    min_i = i;
+                }
+            }
+            if score > min_s {
+                out[min_i] = (slot, score);
+            }
+        };
         let merge_topk = |mut a: Vec<(u32, f64)>, mut b: Vec<(u32, f64)>| -> Vec<(u32, f64)> {
             if a.is_empty() {
                 if b.len() > internal_k {
@@ -1957,7 +2246,11 @@ impl TurboQuantEngine {
         };
         let scored: Vec<(u32, f64)> = if n_candidates <= seq_threshold {
             // Sequential path: single idx buffer reused across all slots.
-            let mut out = Vec::with_capacity(n_candidates);
+            let mut out = Vec::with_capacity(if use_small_topk {
+                internal_k
+            } else {
+                n_candidates
+            });
             let mut idx = vec![0u16; quantizer.n];
             match metric {
                 DistanceMetric::Ip => {
@@ -1982,7 +2275,11 @@ impl TurboQuantEngine {
                             &rec[mse_len..mse_len + qjl_len],
                             gamma as f64,
                         ) * doc_norm as f64;
-                        out.push((slot, score));
+                        if use_small_topk {
+                            push_small_topk(&mut out, slot, score, internal_k);
+                        } else {
+                            out.push((slot, score));
+                        }
                     }
                 }
                 DistanceMetric::Cosine => {
@@ -2003,7 +2300,11 @@ impl TurboQuantEngine {
                             gamma as f64,
                         );
                         let score = ip * q_norm_inv;
-                        out.push((slot, score));
+                        if use_small_topk {
+                            push_small_topk(&mut out, slot, score, internal_k);
+                        } else {
+                            out.push((slot, score));
+                        }
                     }
                 }
                 _ => {
@@ -2028,7 +2329,11 @@ impl TurboQuantEngine {
                         );
                         v.mapv_inplace(|x| x * doc_norm as f64);
                         let score = score_vectors_with_metric(metric, query, &v);
-                        out.push((slot, score));
+                        if use_small_topk {
+                            push_small_topk(&mut out, slot, score, internal_k);
+                        } else {
+                            out.push((slot, score));
+                        }
                     }
                 }
             }
@@ -2043,7 +2348,11 @@ impl TurboQuantEngine {
                         .par_chunks(par_chunk)
                         .map(|chunk| {
                             let mut idx = vec![0u16; quantizer.n];
-                            let mut out = Vec::with_capacity(chunk.len());
+                            let mut out = Vec::with_capacity(if use_small_topk {
+                                internal_k
+                            } else {
+                                chunk.len()
+                            });
                             for &slot in chunk {
                                 let rec = &codes_bytes
                                     [slot as usize * stride..(slot as usize + 1) * stride];
@@ -2065,9 +2374,13 @@ impl TurboQuantEngine {
                                     &rec[mse_len..mse_len + qjl_len],
                                     gamma as f64,
                                 ) * doc_norm as f64;
-                                out.push((slot, score));
+                                if use_small_topk {
+                                    push_small_topk(&mut out, slot, score, internal_k);
+                                } else {
+                                    out.push((slot, score));
+                                }
                             }
-                            if out.len() > internal_k {
+                            if !use_small_topk && out.len() > internal_k {
                                 out.select_nth_unstable_by(internal_k, |a, b| {
                                     b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
                                 });
@@ -2083,7 +2396,11 @@ impl TurboQuantEngine {
                         .par_chunks(par_chunk)
                         .map(|chunk| {
                             let mut idx = vec![0u16; quantizer.n];
-                            let mut out = Vec::with_capacity(chunk.len());
+                            let mut out = Vec::with_capacity(if use_small_topk {
+                                internal_k
+                            } else {
+                                chunk.len()
+                            });
                             for &slot in chunk {
                                 let rec = &codes_bytes
                                     [slot as usize * stride..(slot as usize + 1) * stride];
@@ -2102,9 +2419,13 @@ impl TurboQuantEngine {
                                     gamma as f64,
                                 );
                                 let score = ip * q_norm_inv;
-                                out.push((slot, score));
+                                if use_small_topk {
+                                    push_small_topk(&mut out, slot, score, internal_k);
+                                } else {
+                                    out.push((slot, score));
+                                }
                             }
-                            if out.len() > internal_k {
+                            if !use_small_topk && out.len() > internal_k {
                                 out.select_nth_unstable_by(internal_k, |a, b| {
                                     b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
                                 });
@@ -2120,7 +2441,11 @@ impl TurboQuantEngine {
                         .par_chunks(par_chunk)
                         .map(|chunk| {
                             let mut idx = vec![0u16; quantizer.n];
-                            let mut out = Vec::with_capacity(chunk.len());
+                            let mut out = Vec::with_capacity(if use_small_topk {
+                                internal_k
+                            } else {
+                                chunk.len()
+                            });
                             for &slot in chunk {
                                 let rec = &codes_bytes
                                     [slot as usize * stride..(slot as usize + 1) * stride];
@@ -2143,9 +2468,13 @@ impl TurboQuantEngine {
                                 );
                                 v.mapv_inplace(|x| x * doc_norm as f64);
                                 let score = score_vectors_with_metric(metric, query, &v);
-                                out.push((slot, score));
+                                if use_small_topk {
+                                    push_small_topk(&mut out, slot, score, internal_k);
+                                } else {
+                                    out.push((slot, score));
+                                }
                             }
-                            if out.len() > internal_k {
+                            if !use_small_topk && out.len() > internal_k {
                                 out.select_nth_unstable_by(internal_k, |a, b| {
                                     b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
                                 });
@@ -2325,13 +2654,21 @@ impl TurboQuantEngine {
             self.live_compact_slab()?;
             self.has_pending_deletes = false;
         }
-        self.live_codes.flush()?;
+        self.live_codes
+            .flush()
+            .map_err(|e| format!("flush_for_close: live_codes.flush failed: {e}"))?;
         if let Some(vraw) = &mut self.live_vraw {
-            vraw.flush()?;
+            vraw.flush()
+                .map_err(|e| format!("flush_for_close: live_vraw.flush failed: {e}"))?;
         }
-        self.wal.truncate()?;
-        self.metadata.flush()?;
-        self.persist_id_pool()?;
+        self.wal
+            .truncate()
+            .map_err(|e| format!("flush_for_close: wal.truncate failed: {e}"))?;
+        self.metadata
+            .flush()
+            .map_err(|e| format!("flush_for_close: metadata.flush failed: {e}"))?;
+        self.persist_id_pool()
+            .map_err(|e| format!("flush_for_close: persist_id_pool failed: {e}"))?;
 
         // Sync live_codes.bin to the backend (required for cloud / remote backends).
         self.live_codes.release_handles();
@@ -2369,22 +2706,32 @@ impl TurboQuantEngine {
     }
 
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.flush_for_close()?;
+        self.flush_for_close()
+            .map_err(|e| format!("close: flush_for_close failed: {e}"))?;
         // Trim pre-allocated capacity to the exact slot count so the on-disk and
         // memory-mapped sizes are minimal after the database is closed.
         let slot_count = self.id_pool.slot_count();
-        self.live_codes.truncate_to(slot_count)?;
+        self.live_codes
+            .truncate_to(slot_count)
+            .map_err(|e| format!("close: live_codes.truncate_to({slot_count}) failed: {e}"))?;
         if let Some(vraw) = &mut self.live_vraw {
-            vraw.truncate_to(slot_count)?;
+            vraw.truncate_to(slot_count)
+                .map_err(|e| format!("close: live_vraw.truncate_to({slot_count}) failed: {e}"))?;
         }
-        self.metadata.flush()?;
-        self.persist_id_pool()?;
-        self.maybe_persist_state(true)?;
+        self.metadata
+            .flush()
+            .map_err(|e| format!("close: metadata.flush failed: {e}"))?;
+        self.persist_id_pool()
+            .map_err(|e| format!("close: persist_id_pool failed: {e}"))?;
+        self.maybe_persist_state(true)
+            .map_err(|e| format!("close: maybe_persist_state(true) failed: {e}"))?;
         // Segments are crash-recovery fallbacks: live_codes.bin + live_ids.bin are now
         // the authoritative state and are fully flushed.  Delete segment files so a clean
         // close does not leave duplicate data on disk.  On next open an empty segment list
         // is fine — WAL replay and live_codes restore state without them.
-        self.segments.drop_all()?;
+        self.segments
+            .drop_all()
+            .map_err(|e| format!("close: segments.drop_all failed: {e}"))?;
         Ok(())
     }
 
@@ -2632,6 +2979,157 @@ impl TurboQuantEngine {
         self.segments.add_segment(new_seg);
         compactor.finish_compaction()?;
         Ok(())
+    }
+
+    /// Build IVF coarse routing index and persist it to disk.
+    ///
+    /// `n_clusters`: number of clusters (coarse centroids). Recommended: 256 for N ≥ 100k.
+    /// Use `nprobe` parameter in `search()` to activate IVF routing at query time.
+    pub fn create_coarse_index(
+        &mut self,
+        n_clusters: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let active_slots = self.id_pool.iter_active_slots();
+        if active_slots.is_empty() {
+            return Ok(());
+        }
+        let codes_bytes = self.live_codes.as_bytes();
+        let stride = self.live_stride();
+        let mse_len = self.live_mse_len();
+        let n = self.quantizer.n;
+        let bits = self.quantizer.mse_bits_per_idx();
+        let mse_centroids = &self.quantizer.mse_quantizer.centroids;
+        let seed = self.quantizer.mse_quantizer.b as u64 * 1234567891;
+
+        let ivf = IvfIndex::build(
+            codes_bytes,
+            &active_slots,
+            stride,
+            mse_len,
+            n,
+            bits,
+            mse_centroids,
+            n_clusters,
+            20, // max_iter
+            seed,
+        );
+        let ivf_path = Path::new(&self.local_dir).join("ivf.bin");
+        ivf.save(&ivf_path)?;
+        // Mirror to the backend so cloud backends (S3/GCS) persist the index.
+        self.backend.write("ivf.bin", &std::fs::read(&ivf_path)?)?;
+        self.ivf = Some(ivf);
+        Ok(())
+    }
+
+    /// Search using IVF coarse routing: score only nprobe clusters instead of all N vectors.
+    ///
+    /// Requires `create_coarse_index()` to have been called first. Falls back to
+    /// brute-force when no IVF index is loaded.
+    pub fn search_with_ivf(
+        &self,
+        query: &Array1<f64>,
+        top_k: usize,
+        filter: Option<&HashMap<String, JsonValue>>,
+        nprobe: usize,
+        rerank_factor: Option<usize>,
+        include_id: bool,
+        include_metadata: bool,
+        include_document: bool,
+    ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        // IVF centroid scoring uses IP in the MSE-rotated space; non-IP/Cosine metrics
+        // would need distance-consistent centroid assignment — fall back to brute-force.
+        if !matches!(self.metric, DistanceMetric::Ip | DistanceMetric::Cosine) {
+            return self.search_with_filter_and_ann_include(
+                query,
+                top_k,
+                filter,
+                None,
+                false,
+                rerank_factor,
+                include_id,
+                include_metadata,
+                include_document,
+            );
+        }
+        let Some(ivf) = &self.ivf else {
+            // No IVF index — fall back to brute-force.
+            return self.search_with_filter_and_ann_include(
+                query,
+                top_k,
+                filter,
+                None,
+                false,
+                rerank_factor,
+                include_id,
+                include_metadata,
+                include_document,
+            );
+        };
+        if self.id_pool.active_count() == 0 || top_k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Apply the same query normalisation that the main search path does.
+        let normalized_query;
+        let effective_query = if self.normalize {
+            let qn = query.iter().map(|x| x * x).sum::<f64>().sqrt();
+            normalized_query = if qn > 1e-10 {
+                query / qn
+            } else {
+                query.to_owned()
+            };
+            &normalized_query
+        } else {
+            query
+        };
+
+        // Rotate query into MSE-rotated space to score against IVF centroids.
+        let query_f32: Vec<f32> = effective_query.iter().map(|&v| v as f32).collect();
+        let mut y_query = vec![0.0f32; self.quantizer.n];
+        self.quantizer
+            .mse_quantizer
+            .apply_rotation(&query_f32, &mut y_query);
+
+        // Probe IVF: get candidate slots from top-nprobe clusters.
+        let mut candidates = ivf.probe(&y_query, nprobe);
+
+        // Intersect with filter candidates using sorted-list merge (both sides are sorted).
+        if let Some(f) = filter {
+            let active_slots = self.id_pool.iter_active_slots();
+            if let Some(mut filter_slots) = self.resolve_filter_via_index(f, &active_slots) {
+                filter_slots.sort_unstable();
+                let mut merged = Vec::with_capacity(candidates.len().min(filter_slots.len()));
+                let (mut ci, mut fi) = (0, 0);
+                while ci < candidates.len() && fi < filter_slots.len() {
+                    match candidates[ci].cmp(&filter_slots[fi]) {
+                        std::cmp::Ordering::Equal => {
+                            merged.push(candidates[ci]);
+                            ci += 1;
+                            fi += 1;
+                        }
+                        std::cmp::Ordering::Less => ci += 1,
+                        std::cmp::Ordering::Greater => fi += 1,
+                    }
+                }
+                candidates = merged;
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Score the shortlist using the existing quantized scorer.
+        self.exhaustive_search_simd(
+            effective_query,
+            top_k,
+            filter,
+            Some(candidates),
+            rerank_factor,
+            include_id,
+            include_metadata,
+            include_document,
+        )
     }
 
     /// Build the HNSW index with server-friendly defaults.
@@ -3424,9 +3922,7 @@ impl TurboQuantEngine {
             }
             self.wal.append_batch(&wal_entries, false)?;
             self.metadata.put_many(&metadata_entries)?;
-            for slot in metadata_deletes {
-                self.metadata.delete(slot)?;
-            }
+            self.metadata.delete_many(&metadata_deletes)?;
             // Track newly allocated slots in the delta overlay so ANN search finds
             // them without a rebuild. indexed_set is built once before the chunk
             // loop. delta_slots is kept sorted; binary_search gives O(log n).
