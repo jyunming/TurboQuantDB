@@ -610,12 +610,12 @@ class TestDeleteWithIdsAndWhere:
 
 
 # ===========================================================================
-# CompatCollection.get — line 296 (no manifest → early empty return)
+# CompatCollection.get — no manifest -> early empty return
 # ===========================================================================
 
 class TestGetNoManifest:
     def test_get_returns_empty_dict_when_no_manifest(self, tmp_path):
-        """Line 296: get() returns empty result dict when manifest.json absent."""
+        """get() returns an empty result dict when manifest.json is absent."""
         col = CompatCollection(str(tmp_path / "col"), "col", "ip")
         result = col.get()
         assert result == {
@@ -626,7 +626,7 @@ class TestGetNoManifest:
         }
 
     def test_get_with_ids_returns_empty_when_no_manifest(self, tmp_path):
-        """Line 296: get(ids=...) also returns empty when no manifest.json exists."""
+        """get(ids=...) also returns empty when manifest.json is absent."""
         col = CompatCollection(str(tmp_path / "col"), "col", "ip")
         result = col.get(ids=["a", "b"])
         assert result == {
@@ -637,7 +637,7 @@ class TestGetNoManifest:
         }
 
     def test_get_with_where_returns_empty_when_no_manifest(self, tmp_path):
-        """Line 296: get(where=...) also returns empty when no manifest.json."""
+        """get(where=...) also returns empty when manifest.json is absent."""
         col = CompatCollection(str(tmp_path / "col"), "col", "ip")
         result = col.get(where={"x": {"$eq": 1}})
         assert result == {
