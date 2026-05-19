@@ -510,6 +510,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn serde_preserves_srht_rotation_matrix_none() {
+        let q = MseQuantizer::new(32, 4, 42);
+        assert!(q.rotation_matrix.is_none());
+
+        let bytes = bincode::serialize(&q).unwrap();
+        let decoded: MseQuantizer = bincode::deserialize(&bytes).unwrap();
+
+        assert!(decoded.rotation_matrix.is_none());
+        assert_eq!(decoded.d, q.d);
+        assert_eq!(decoded.n, q.n);
+        assert_eq!(decoded.rotation_signs, q.rotation_signs);
+    }
+
+    #[test]
+    fn serde_roundtrips_dense_rotation_matrix_as_bf16() {
+        let q = MseQuantizer::new_dense(8, 4, 42);
+        let original = q.rotation_matrix.as_ref().unwrap().clone();
+
+        let bytes = bincode::serialize(&q).unwrap();
+        let decoded: MseQuantizer = bincode::deserialize(&bytes).unwrap();
+        let restored = decoded.rotation_matrix.as_ref().unwrap();
+
+        assert_eq!(restored.len(), original.len());
+        for (i, (&before, &after)) in original.iter().zip(restored.iter()).enumerate() {
+            let err = (before - after).abs();
+            assert!(
+                err <= 0.005,
+                "bf16 rotation roundtrip error too high at {i}: {before} vs {after}"
+            );
+        }
+    }
+
     /// C4 (v0.8.2 audit): b=1 produces 2 centroids and quantize/dequantize is
     /// stable (no panic, finite output). The 1-bit path is rarely exercised
     /// in production but is supported.

@@ -66,8 +66,8 @@ impl Database {
     ///           string explicitly.
     ///         - ``"dense"``: Haar-uniform QR rotation + dense Gaussian
     ///           projection. n=d (no padding). O(d²) ingest cost; stores a
-    ///           d×d f32 matrix on disk. ``"exact"`` is accepted as a legacy
-    ///           alias.
+    ///           d×d rotation matrix as bf16 on disk and rehydrates it to f32
+    ///           on load. ``"exact"`` is accepted as a legacy alias.
     ///         - ``"srht"``: structured Walsh-Hadamard rotation. n=next
     ///           power-of-two of d. O(d log d) ingest; pads to the next pow2
     ///           in storage at non-pow2 d.

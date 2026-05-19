@@ -612,13 +612,20 @@ impl ProdQuantizer {
         qjl: &[u8],
         gamma: f64,
     ) -> f64 {
-        assert_eq!(
+        debug_assert_eq!(
             packed_mse.len(),
             self.packed_mse_len(),
             "score_ip_encoded_packed: packed_mse.len() must equal ceil(n*b/8) ({})",
             self.packed_mse_len()
         );
-        self.assert_qjl_len_if_used(qjl, gamma, "score_ip_encoded_packed");
+        if gamma != 0.0 {
+            debug_assert_eq!(
+                qjl.len(),
+                self.qjl_len(),
+                "score_ip_encoded_packed: qjl.len() must equal ceil(n/8) ({}) when gamma is non-zero",
+                self.qjl_len()
+            );
+        }
 
         #[cfg(target_arch = "x86_64")]
         {
