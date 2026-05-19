@@ -32,7 +32,7 @@ An embedded vector database with a Python API. Built around the **TurboQuant** a
 pip install tqdb
 ```
 
-Optional integration extras: `tqdb[langchain]`, `tqdb[llamaindex]`, `tqdb[migrate]` (Chroma + LanceDB import). Build from source: see [`DEVELOPMENT.md`](https://github.com/jyunming/TurboQuantDB/blob/main/DEVELOPMENT.md). Upgrading from v0.8 dense-mode databases: see [`docs/QUANTIZER_MODES.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/QUANTIZER_MODES.md#compatibility-notes).
+Optional integration extras: `tqdb[langchain]`, `tqdb[llamaindex]`, `tqdb[migrate]` (Chroma + LanceDB import). Build from source: see [`DEVELOPMENT.md`](https://github.com/jyunming/TurboQuantDB/blob/main/DEVELOPMENT.md). Upgrading from v0.8 dense-mode databases: see [`docs/QUANTIZER_MODES.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/QUANTIZER_MODES.md#backward-compatibility).
 
 ---
 

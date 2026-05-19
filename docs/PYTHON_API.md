@@ -568,7 +568,7 @@ print(col.peek(limit=3))    # dict same shape as query result
 
 **Metric mapping:** `metadata={"hnsw:space": "cosine"}` → `metric="cosine"`, `"ip"` → inner product (default), `"l2"` → L2. The metric is fixed at collection creation and cannot be changed.
 
-**Empty behavior:** `get(ids=[])` returns an empty Chroma-shaped response, not a full-table scan. `query(...)` on an empty collection returns one empty result row per query embedding. `add(ids=[], embeddings=[])` is a no-op only when the collection already has a known dimension; a brand-new collection still needs at least one embedding to establish dimension.
+**Empty behavior:** `get(ids=[])` returns an empty Chroma-shaped response, not a full-table scan. `query(...)` on an empty collection returns one empty result row per query embedding. `add(ids=[], embeddings=[])` raises `ValueError` because Chroma-compatible adds require at least one embedding to validate or establish dimension.
 
 **Not implemented:** `HttpClient`, `Settings`, server/cloud mode, `chromadb.Client()` (ephemeral), `where_document` filtering, automatic text embedding (pass pre-computed `embeddings`; or provide an `embedding_function` callable at collection creation time).
 
@@ -608,7 +608,7 @@ tbl.optimize()   # no-op; tqdb handles compaction automatically
 
 **SQL WHERE parser:** supports `field = 'value'`, `field != 'value'`, `field IN ('a', 'b', ...)` (including `id IN (...)`), and numeric comparisons (`field > 10`, `field >= 10`, `field < 10`, `field <= 10`). More complex predicates raise `NotImplementedError`.
 
-**Empty behavior:** a table without a manifest reports `count_rows()==0`; `head()`, `to_arrow()`, `to_pandas()`, and searches with no matches return empty tables/lists rather than raising. `add([])` and `add(empty_pyarrow_table)` are no-ops once table shape is known.
+**Empty behavior:** a table without a manifest reports `count_rows()==0`; `head()`, `to_arrow()`, `to_pandas()`, and searches with no matches return empty tables/lists rather than raising. `add([])` and `add(empty_pyarrow_table)` are always no-ops; they do not create a manifest or establish a brand-new table's schema.
 
 **Implemented compatibility subset:** `update(where, values)` and `merge_insert(on).when_matched_update_all().when_not_matched_insert_all().execute(data)` are supported for basic upsert/update workflows. Other merge clauses are accepted as no-ops.
 
