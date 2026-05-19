@@ -2,11 +2,10 @@
 
 Optional Axum HTTP service providing TurboQuantDB in multi-tenant server mode. Use this when you need REST API access, multi-tenancy, authentication, quotas, or async job management. For single-process Python use, the embedded `tqdb` package is simpler.
 
-## v0.8 feature availability
+## Embedded feature availability
 
-The v0.8 sprint shipped five Python-side features. Most are **embedded-Python only**
-— they don't have HTTP equivalents on the server. Use the embedded `tqdb` package
-when you need them.
+Several Python-side features are **embedded-Python only** — they don't have HTTP
+equivalents on the server. Use the embedded `tqdb` package when you need them.
 
 | Feature | Embedded Python | HTTP server |
 |---|---|---|
@@ -17,14 +16,15 @@ when you need them.
 | Migration toolkit (`tqdb.migrate`, CLI) | yes | n/a — offline batch tool |
 | BM25 hybrid (`db.search(..., hybrid={...})`, v0.7) | yes | yes — `hybrid` field in `/query` request |
 
-Bridging integrations into server mode is a v0.9-or-later candidate; the embedded
-mode is canonical for those workflows today.
+Bridging integrations into server mode remains a future hardening item; the
+embedded mode is canonical for those workflows today.
 
 ## Installation
 
-The server binary ships pre-built inside the `tqdb` wheel on all supported platforms
-(Linux x86-64, macOS, Windows). **Linux arm64/aarch64** is the exception — see
-[Building from Source](#building-from-source-development-only) for that platform.
+The server binary ships pre-built inside the `tqdb` wheel on Linux x86-64,
+macOS, and Windows. **Linux arm64/aarch64** wheels do not bundle the server
+binary — see [Building from Source](#building-from-source-development-only) for
+that platform.
 
 ```bash
 pip install tqdb
@@ -42,7 +42,8 @@ launching to change the address, data directory, or other options (see
 
 ## Building from Source (development only)
 
-Linux arm64/aarch64 users and contributors building from the Git repo:
+Linux arm64/aarch64 users, source-distribution installs, and contributors
+building from the Git repo must build the server binary separately:
 
 ```bash
 cd server
@@ -58,6 +59,14 @@ Then launch the compiled binary:
 # Windows
 .\target\release\tqdb-server.exe
 ```
+
+The Python source distribution includes `server/Cargo.toml`, `server/Cargo.lock`,
+and `server/src/**`, but `pip install` from sdist does not build or bundle the
+server executable automatically. The `tqdb-server` console script first looks for
+`python/tqdb/_bin/tqdb-server*` in an installed wheel, then for
+`server/target/release/tqdb-server*` in a development checkout. If neither path
+exists, it prints the missing candidate paths and the `cd server && cargo build
+--release` command.
 
 ## Environment Variables
 

@@ -9,7 +9,7 @@ Five new Python-side features and **no breaking changes**:
 1. **Multi-vector / ColBERT** retrieval with MaxSim scoring.
 2. **LangChain v2** native `VectorStore` ABC.
 3. **LlamaIndex** native `BasePydanticVectorStore` integration.
-4. **`AsyncDatabase`** — asyncio facade with real concurrency (PyO3 releases the GIL).
+4. **`AsyncDatabase`** — asyncio facade that dispatches long-running calls through a thread-pool executor; Rust engine calls release the GIL while they run.
 5. **`tqdb.migrate`** — one-command import from existing Chroma / LanceDB collections.
 
 Existing v0.7 code keeps working. Upgrade is `pip install -U tqdb`.
@@ -71,13 +71,15 @@ from tqdb.aio import AsyncDatabase
 
 async with await AsyncDatabase.open("./mydb", dimension=1536) as db:
     await db.insert("doc1", vec)
-    # 50 concurrent searches — actually run in parallel:
+    # Concurrent searches fan out through the executor:
     all_results = await asyncio.gather(*(db.search(q, top_k=5) for q in queries))
 ```
 
-Thread-pool-backed wrapper over the sync `Database`. Because every PyO3 method
-already releases the GIL via `py.allow_threads`, concurrent `await` calls
-genuinely parallelise — the existing test suite includes a 50-task proof.
+Thread-pool-backed wrapper over the sync `Database`. Because Rust engine calls
+release the GIL while they run, concurrent awaits can proceed without blocking
+the event loop. Current tests verify executor fan-out with a blocking fake DB
+and event-loop responsiveness with a real DB; they are not a throughput
+benchmark.
 
 Full guide: [`docs/PYTHON_API.md` — Async API](PYTHON_API.md#async-api).
 
@@ -125,14 +127,14 @@ The new class implements the full LangChain `VectorStore` ABC, so calls like
 `store.add_documents(...)`, `store.similarity_search_with_score(...)`, and
 `store.from_texts(...)` work as documented in the LangChain reference.
 
-## What's coming in v0.9
+## After v0.8
 
-The v0.9-v1.0 hardening sprint targets:
+The v0.9-v1.0 hardening work targets:
 
-- **Native multi-vector engine integration** — replaces the v0.8 Python-layer
+- **Native multi-vector engine integration** — replaces the Python-layer
   wrapper with `IdPool` doc-id grouping, an on-disk MaxSim kernel, and native
   filter pushdown. Same public Python API, much tighter storage and faster search.
-- Server mode v0.8 feature parity (LangChain / LlamaIndex / multi-vector exposed
+- Server mode feature parity (LangChain / LlamaIndex / multi-vector exposed
   over HTTP) is a candidate but not yet committed.
 - Pre-1.0 hardening: `≥80%` test coverage, `.unwrap()` audit pass 2, API-key
   authentication baseline, complete `0.x → 1.0` migration guide.

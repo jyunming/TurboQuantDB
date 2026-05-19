@@ -35,6 +35,11 @@ Both commands print one summary line per collection/table:
 OK: migrated 12345 rows in 2.4s
 ```
 
+Empty Chroma collections are reported as `empty — skipping` and do not create a
+target TQDB directory. Empty LanceDB tables are reported as `empty — nothing to
+migrate`. In both cases the command exits successfully and the programmatic API
+returns `0`.
+
 ## Programmatic API
 
 ```python
@@ -66,7 +71,7 @@ Both return the number of rows migrated.
 |-------|--------|---------|
 | ID | yes | yes (column `id`; if missing, auto-numbered as `row_N`) |
 | Vector | yes (float32) | yes (auto-detected: column `vector` or first fixed-size-list column) |
-| Metadata | yes | yes (every column other than id/vector/text) |
+| Metadata | yes; `None` metadata rows become `{}` | yes (every column other than id/vector/text) |
 | Document text | yes | yes (column `text` / `document` / `content`, in that order) |
 
 ## What's *not* preserved
@@ -78,10 +83,12 @@ Both return the number of rows migrated.
 
 ## Dimension and metric
 
-Both migrators detect the dimension from the source's vector column and pass it
-to `Database.open(dimension=…)`. The metric defaults to `cosine` — the most
-common choice for text embeddings. Change with `Database.open(metric="ip")`
-on the destination after migration if needed.
+Both migrators detect the dimension from the first non-empty source vector
+column and pass it to `Database.open(dimension=...)`. The target metric is
+`cosine`, the most common choice for text embeddings, and is fixed once the
+target database is created. If you need `metric="ip"` or `metric="l2"`, run a
+custom migration loop that opens the destination with that metric before
+inserting rows.
 
 ## Multi-collection Chroma sources
 
