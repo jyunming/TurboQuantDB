@@ -80,12 +80,6 @@ recall = hits / (N_Q * K)
 p95_ms = float(np.percentile(latencies, 95))
 p50_ms = float(np.percentile(latencies, 50))
 
-print(f"\n-- Sprint Smoke ({'PASS' if recall >= RECALL_FLOOR and p95_ms <= P95_LAT_MS else 'FAIL'}) --")
-print(f"  Ingest:   {throughput:>8,.0f} vec/s  (min {INGEST_MIN:.0f})")
-print(f"  Recall@{K}: {recall:>8.3f}     (min {RECALL_FLOOR})")
-print(f"  P50 lat:  {p50_ms:>8.2f} ms")
-print(f"  P95 lat:  {p95_ms:>8.2f} ms  (max {P95_LAT_MS} ms)")
-
 failures = []
 if recall < RECALL_FLOOR:
     failures.append(f"Recall@{K} {recall:.3f} < {RECALL_FLOOR}")
@@ -93,6 +87,12 @@ if p95_ms > P95_LAT_MS:
     failures.append(f"P95 latency {p95_ms:.1f} ms > {P95_LAT_MS} ms")
 if throughput < INGEST_MIN:
     failures.append(f"Throughput {throughput:.0f} vec/s < {INGEST_MIN:.0f}")
+
+print(f"\n-- Sprint Smoke ({'FAIL' if failures else 'PASS'}) --")
+print(f"  Ingest:   {throughput:>8,.0f} vec/s  (min {INGEST_MIN:.0f})")
+print(f"  Recall@{K}: {recall:>8.3f}     (min {RECALL_FLOOR})")
+print(f"  P50 lat:  {p50_ms:>8.2f} ms")
+print(f"  P95 lat:  {p95_ms:>8.2f} ms  (max {P95_LAT_MS} ms)")
 
 if failures:
     print("\nFAILED:")
