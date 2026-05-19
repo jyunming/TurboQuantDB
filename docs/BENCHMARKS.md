@@ -3,7 +3,10 @@
 Three datasets from [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — n=100k vectors each.
 Full script: [`benchmarks/paper_recall_bench.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/paper_recall_bench.py).
 
-All results use `quantizer_type=None/"dense"` and `fast_mode=True, rerank=True` (MSE-only, matching paper Figure 5 bit allocation). ANN rows use HNSW (md=32, ef=128).
+The benchmark script opens databases with `quantizer_type=None`, so v0.9 runs
+`"dense"` below d=1024 and `"srht"` at d>=1024. All rows use `fast_mode=True`
+(MSE-only, matching paper Figure 5 bit allocation); rerank varies by config.
+ANN rows use HNSW (md=32, ef=128).
 
 To regenerate:
 ```bash
@@ -14,6 +17,14 @@ python benchmarks/paper_recall_bench.py --update-readme --track
 CI perf gate:
 - PR CI runs a fast smoke perf gate (`benchmarks/sprint_smoke.py`) in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
 - This is a regression tripwire (latency/recall/ingest), not a full publish benchmark replacement.
+- `sprint_smoke.py` prints a compact PASS/FAIL summary for ingest, Recall@10,
+  p50, and p95, then exits non-zero only when a gate fails. It does not write
+  JSON or update history files.
+- `paper_recall_bench.py` always writes `benchmarks/_bench_recall_results.json`
+  after a real run. `--update-readme` patches only the marked section in this
+  file, `--track` appends `benchmarks/perf_history.json` and regenerates the
+  HTML report, and `--plots-only` regenerates plots from saved JSON without
+  rerunning the benchmark.
 
 ---
 
@@ -190,12 +201,13 @@ what most RAG pipelines actually consume.
 
 ---
 
-## v0.8 features — what isn't yet benchmarked
+## Embedded Python features not yet benchmarked
 
-The v0.8 sprint added five Python-side features. Three of them have correctness coverage in the test suite but aren't yet tracked in the longitudinal perf history:
+Several Python-side features have correctness coverage in the test suite but
+aren't yet tracked in the longitudinal perf history:
 
-- **Multi-vector / MaxSim retrieval at scale** (`MultiVectorStore`) — the v0.8 wrapper is a Python layer over the existing single-vector engine. Per-config recall and latency at 10k+ docs / 80k+ tokens are pending, and will be the headline numbers when v0.9 lands the native engine integration.
-- **`AsyncDatabase` concurrent-search throughput** — `tests/test_async_api.py` includes a 50-concurrent-search proof of parallelism but no longitudinal numbers; the actual ceiling depends on user thread-pool sizing and embedder latency.
+- **Multi-vector / MaxSim retrieval at scale** (`MultiVectorStore`) — the wrapper is a Python layer over the existing single-vector engine. Per-config recall and latency at 10k+ docs / 80k+ tokens are pending and should be measured before native engine integration work.
+- **`AsyncDatabase` concurrent-search throughput** — `tests/test_async_api.py` verifies executor fan-out with a blocking fake DB and event-loop responsiveness with a real DB, but there are no longitudinal throughput numbers. The actual ceiling depends on user thread-pool sizing, CPU cores, storage, and embedder latency.
 - **Migration toolkit throughput** (`tqdb.migrate`) — the CLI prints rows/sec per run but those numbers aren't tracked in perf_history. For now, expect rates close to a plain `Database.insert_batch` loop on the same hardware.
 
 LangChain / LlamaIndex / hybrid-via-integration overhead is also not benchmarked separately. The wrappers add a small Python-layer cost per call (one filter-dict translation + one numpy conversion) which has been negligible in practice on the 1k-5k corpora the test suite uses.

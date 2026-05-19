@@ -32,7 +32,7 @@ An embedded vector database with a Python API. Built around the **TurboQuant** a
 pip install tqdb
 ```
 
-Optional integration extras: `tqdb[langchain]`, `tqdb[llamaindex]`, `tqdb[migrate]` (Chroma + LanceDB import). Build from source: see [`DEVELOPMENT.md`](https://github.com/jyunming/TurboQuantDB/blob/main/DEVELOPMENT.md). Upgrading from v0.7: see [`docs/WHAT_S_NEW_0_8.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/WHAT_S_NEW_0_8.md).
+Optional integration extras: `tqdb[langchain]`, `tqdb[llamaindex]`, `tqdb[migrate]` (Chroma + LanceDB import). Build from source: see [`DEVELOPMENT.md`](https://github.com/jyunming/TurboQuantDB/blob/main/DEVELOPMENT.md). Upgrading from v0.8 dense-mode databases: see [`docs/QUANTIZER_MODES.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/QUANTIZER_MODES.md#compatibility-notes).
 
 ---
 
@@ -114,7 +114,7 @@ All numbers below come from runs on a single Windows laptop; absolute values wil
 
 ### A. Paper-validation (n=100k, brute-force, fast_mode=True)
 
-Config: dbpedia-1536, b=4, `rerank=True`, brute-force, `quantizer_type="dense"`. Matches arXiv:2504.19874 Figure 5b's bit allocation. (As of v0.9 the default at d ≥ 1024 is `"srht"`, which is faster on ingest and p50 with comparable recall — see [QUANTIZER_MODES.md](docs/QUANTIZER_MODES.md).)
+Config: dbpedia-1536, b=4, `rerank=True`, brute-force, `quantizer_type=None` (v0.9 auto-selects `"srht"` at this dimension). Matches arXiv:2504.19874 Figure 5b's bit allocation; pin `quantizer_type="dense"` when you need the paper-faithful QR rotation.
 
 | Metric | Value |
 |---|---:|
@@ -219,7 +219,7 @@ Detailed setup, pagination, hybrid wiring, and async patterns: [LangChain integr
 
 ## Async API
 
-For FastAPI / Starlette / async RAG services, `AsyncDatabase` exposes awaitable versions of every long-running operation. The Rust extension releases the GIL inside, so concurrent `await db.search(...)` calls run in real parallel.
+For FastAPI / Starlette / async RAG services, `AsyncDatabase` exposes awaitable versions of every long-running operation. Calls are dispatched through a `ThreadPoolExecutor`, so concurrent awaits do not block the event loop; Rust engine calls release the GIL while they run.
 
 ```python
 import asyncio
@@ -331,7 +331,7 @@ Full endpoint reference, environment variables, and the Server Recovery Runbook:
 
 ## Advanced features
 
-- **Two quantizer modes** — `dense` (default, best recall) and `srht` (faster ingest at high d). See [`docs/QUANTIZER_MODES.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/QUANTIZER_MODES.md).
+- **Two quantizer modes** — `quantizer_type=None` auto-selects `dense` below d=1024 and `srht` at d>=1024. Pin `dense` for paper-faithful QR/no-padding storage or `srht` for faster high-dimensional ingest and p50. See [`docs/QUANTIZER_MODES.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/QUANTIZER_MODES.md).
 - **Optional ANN index** — HNSW graph for low-latency search at n ≥ 100k; auto-fallback to brute-force when N is small.
 - **IVF coarse routing** — `db.create_coarse_index(n_clusters=256)` + `nprobe=N` to score ~6% of the corpus at very large N.
 - **MongoDB-style metadata filters** — `$eq $ne $gt $gte $lt $lte $in $nin $exists $and $or $contains`; `$in / $nin / $or` use O(1) indexed fast-paths.
@@ -341,7 +341,7 @@ Full endpoint reference, environment variables, and the Server Recovery Runbook:
 
 `MultiVectorStore` lets each document hold N token vectors and scores queries with MaxSim (`Σ_i max_j <q_i, d_j>`), useful for late-interaction retrieval experiments.
 
-This is currently a **Python-layer wrapper** over the single-vector engine; native engine-level support is planned for a future v0.9 release. The public API is designed to stay stable across that move. See [`docs/MULTI_VECTOR.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/MULTI_VECTOR.md).
+This is currently a **Python-layer wrapper** over the single-vector engine; native engine-level support remains a future hardening item. The public API is designed to stay stable across that move. See [`docs/MULTI_VECTOR.md`](https://github.com/jyunming/TurboQuantDB/blob/main/docs/MULTI_VECTOR.md).
 
 ---
 
