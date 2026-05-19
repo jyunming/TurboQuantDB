@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+---
+
+## [0.8.4] — 2026-05-19
+
 ### Changed
 
 - **`quantizer_type=None` default is now dimension-aware.** Picks `"dense"` (Haar QR) for `d < 1024` and `"srht"` (Walsh–Hadamard) for `d >= 1024`. Empirical wins for SRHT once the rotation dominates ingest/latency cost: 2–3× ingest throughput, 1.5–3× lower p50 latency, recall equal or slightly better than dense in the public bench (R@1 0.962 vs 0.958 at d=1536 b=4 rerank=F; 0.980 vs 0.963 at d=3072 b=4 rerank=F). Below d=1024 the SRHT pow2-padding tax wipes the win so dense remains the default. To restore explicit control, pass `quantizer_type="dense"` or `quantizer_type="srht"`.
