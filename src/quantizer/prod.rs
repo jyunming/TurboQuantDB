@@ -612,7 +612,6 @@ impl ProdQuantizer {
         qjl: &[u8],
         gamma: f64,
     ) -> f64 {
-        let b = self.mse_quantizer.b;
         assert_eq!(
             packed_mse.len(),
             self.packed_mse_len(),
@@ -623,6 +622,7 @@ impl ProdQuantizer {
 
         #[cfg(target_arch = "x86_64")]
         {
+            let b = self.mse_quantizer.b;
             if (1..=8).contains(&b)
                 && is_x86_feature_detected!("avx2")
                 && is_x86_feature_detected!("fma")
