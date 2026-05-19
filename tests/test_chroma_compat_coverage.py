@@ -618,19 +618,34 @@ class TestGetNoManifest:
         """Line 296: get() returns empty result dict when manifest.json absent."""
         col = CompatCollection(str(tmp_path / "col"), "col", "ip")
         result = col.get()
-        assert result == {"ids": [], "metadatas": [], "documents": []}
+        assert result == {
+            "ids": [],
+            "metadatas": [],
+            "documents": [],
+            "embeddings": None,
+        }
 
     def test_get_with_ids_returns_empty_when_no_manifest(self, tmp_path):
         """Line 296: get(ids=...) also returns empty when no manifest.json exists."""
         col = CompatCollection(str(tmp_path / "col"), "col", "ip")
         result = col.get(ids=["a", "b"])
-        assert result == {"ids": [], "metadatas": [], "documents": []}
+        assert result == {
+            "ids": [],
+            "metadatas": [],
+            "documents": [],
+            "embeddings": None,
+        }
 
     def test_get_with_where_returns_empty_when_no_manifest(self, tmp_path):
         """Line 296: get(where=...) also returns empty when no manifest.json."""
         col = CompatCollection(str(tmp_path / "col"), "col", "ip")
         result = col.get(where={"x": {"$eq": 1}})
-        assert result == {"ids": [], "metadatas": [], "documents": []}
+        assert result == {
+            "ids": [],
+            "metadatas": [],
+            "documents": [],
+            "embeddings": None,
+        }
 
 
 # ===========================================================================
