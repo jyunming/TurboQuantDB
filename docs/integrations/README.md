@@ -15,7 +15,7 @@ module.
 
 ## Related guides
 
-These aren't strictly "integrations" but cover related v0.8 surfaces and live
+These aren't strictly "integrations" but cover related embedded surfaces and live
 one directory up:
 
 - **Multi-vector / ColBERT** — late-interaction retrieval with MaxSim scoring.

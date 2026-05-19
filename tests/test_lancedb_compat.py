@@ -155,6 +155,19 @@ class TestSearch:
         arrow_tbl = tbl.search(q).limit(2).to_arrow()
         assert arrow_tbl.num_rows == 2
 
+    def test_limit_zero_returns_empty_for_vector_and_scan(self, tmp_path):
+        db = connect(str(tmp_path))
+        tbl = db.create_table("t", data=make_rows(2))
+        q = rand_vecs(1)[0].astype(np.float32)
+        assert tbl.search(q).limit(0).to_list() == []
+        assert tbl.search(None).limit(0).to_list() == []
+
+    def test_empty_table_search_returns_empty(self, tmp_path):
+        db = connect(str(tmp_path))
+        tbl = db.create_table("t")
+        assert tbl.search(None).limit(5).to_list() == []
+        assert tbl.search(rand_vecs(1)[0]).limit(5).to_list() == []
+
 
 # ---------------------------------------------------------------------------
 # where filter
@@ -281,6 +294,11 @@ class TestSQLParser:
         from tqdb.lancedb_compat import _parse_sql_where
         result = _parse_sql_where("count = 42")
         assert result == {"count": {"$eq": 42.0}}
+
+    def test_field_eq_negative_number(self):
+        from tqdb.lancedb_compat import _parse_sql_where
+        result = _parse_sql_where("score = -1")
+        assert result == {"score": {"$eq": -1.0}}
 
     def test_field_gt_numeric(self):
         from tqdb.lancedb_compat import _parse_sql_where

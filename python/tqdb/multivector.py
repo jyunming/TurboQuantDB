@@ -10,7 +10,7 @@ This module is a **Python-layer wrapper** over the existing single-vector
 TQDB; a JSON sidecar tracks the ``doc_id → [token_id, ...]`` mapping, and a
 ``_VecStore`` keeps raw float32 token vectors for exact MaxSim scoring.
 
-Future v0.9 release will move multi-vector into the engine for tighter
+Future engine work will move multi-vector into the core for tighter
 storage and native filter pushdown — this module's public API is designed
 to stay stable across that move.
 
@@ -289,6 +289,12 @@ class MultiVectorStore:
         n = vectors.shape[0]
         if n == 0:
             raise ValueError("must provide at least one token vector per doc")
+        expected_dim = self._db.stats().get("dimension")
+        if expected_dim is not None and vectors.shape[1] != expected_dim:
+            raise ValueError(
+                f"vector dimension mismatch: expected {expected_dim}, got "
+                f"{vectors.shape[1]}"
+            )
 
         # Replace semantics: drop stale token IDs first.
         old = self._index.remove(doc_id)

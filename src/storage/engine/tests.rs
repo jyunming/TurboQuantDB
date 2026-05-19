@@ -166,6 +166,31 @@ fn cosine_zero_norm_vector_scores_zero() {
     assert_eq!(results[0].score, 0.0);
 }
 
+#[test]
+fn score_batch_brute_top_k_zero_returns_empty_rows() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 8;
+    let mut e = TurboQuantEngine::open_with_metric_and_rerank(
+        p,
+        p,
+        d,
+        2,
+        42,
+        DistanceMetric::Ip,
+        false,
+        false,
+    )
+    .unwrap();
+    e.insert("a".into(), &make_vec(d, 0.5), no_meta()).unwrap();
+    let queries = vec![make_vec(d, 0.1), make_vec(d, 0.2)];
+    let rows = e
+        .score_batch_brute(&queries, 0, None, true, true, true)
+        .unwrap();
+    assert_eq!(rows.len(), queries.len());
+    assert!(rows.iter().all(|row| row.is_empty()));
+}
+
 // ── L2 exhaustive search ───────────────────────────────────────────────
 
 #[test]
@@ -598,18 +623,39 @@ fn residual_int4_reload_preserves_recall() {
     let v: Vec<f64> = (0..d).map(|i| (i as f64 * 0.013).sin()).collect();
     {
         let mut e = TurboQuantEngine::open_with_options(
-            p, p, d, 4, 42,
-            DistanceMetric::Ip, true, false,
-            RerankPrecision::ResidualInt4, None, false, None,
-        ).unwrap();
-        e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta()).unwrap();
+            p,
+            p,
+            d,
+            4,
+            42,
+            DistanceMetric::Ip,
+            true,
+            false,
+            RerankPrecision::ResidualInt4,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
+            .unwrap();
         e.checkpoint().unwrap();
     }
     let e = TurboQuantEngine::open_with_options(
-        p, p, d, 4, 42,
-        DistanceMetric::Ip, true, false,
-        RerankPrecision::ResidualInt4, None, false, None,
-    ).unwrap();
+        p,
+        p,
+        d,
+        4,
+        42,
+        DistanceMetric::Ip,
+        true,
+        false,
+        RerankPrecision::ResidualInt4,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
     let results = e
         .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, false, None)
         .unwrap();

@@ -77,6 +77,26 @@ _VALID_GET_INCLUDE = {"ids", "metadatas", "documents", "embeddings"}
 _VALID_QUERY_INCLUDE = {"ids", "metadatas", "documents", "embeddings", "distances"}
 
 
+def _empty_get_response(include_set: set[str]) -> Dict[str, Any]:
+    return {
+        "ids": [],
+        "metadatas": [] if "metadatas" in include_set else None,
+        "documents": [] if "documents" in include_set else None,
+        "embeddings": [] if "embeddings" in include_set else None,
+    }
+
+
+def _empty_query_response(include_set: set[str], n_queries: int) -> Dict[str, Any]:
+    rows = [[] for _ in range(n_queries)]
+    return {
+        "ids": rows,
+        "distances": [[] for _ in range(n_queries)] if "distances" in include_set else None,
+        "metadatas": [[] for _ in range(n_queries)] if "metadatas" in include_set else None,
+        "documents": [[] for _ in range(n_queries)] if "documents" in include_set else None,
+        "embeddings": [[] for _ in range(n_queries)] if "embeddings" in include_set else None,
+    }
+
+
 def _apply_filter(records: List[Dict[str, Any]], where: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Very small subset of Chroma where-filter evaluation."""
     def _matches(metadata: Dict[str, Any], expr: Dict[str, Any]) -> bool:
@@ -429,6 +449,8 @@ class CompatCollection:
         where: Optional[Dict[str, Any]] = None,
     ) -> None:
         with self._write_lock:
+            if not os.path.exists(os.path.join(self._path, "manifest.json")):
+                return
             db = self._open_db(None)
             if ids and not where:
                 db.delete_batch(ids)
@@ -456,9 +478,9 @@ class CompatCollection:
             unknown = set(include) - _VALID_GET_INCLUDE
             if unknown:
                 raise ValueError(f"Unknown include fields: {unknown}. Valid: {_VALID_GET_INCLUDE}")
-        if not os.path.exists(os.path.join(self._path, "manifest.json")):
-            return {"ids": [], "metadatas": [], "documents": []}
         include_set = set(include or ["metadatas", "documents"])
+        if not os.path.exists(os.path.join(self._path, "manifest.json")):
+            return _empty_get_response(include_set)
         db = self._open_db(None)
 
         # BUG-C7: an explicitly-passed empty list means "return nothing";
@@ -510,6 +532,8 @@ class CompatCollection:
                 raise ValueError(f"Unknown include fields: {unknown}. Valid: {_VALID_QUERY_INCLUDE}")
         query_embeddings = self._embed(query_texts or [], query_embeddings)
         include_set = set(include or ["metadatas", "documents", "distances"])
+        if not os.path.exists(os.path.join(self._path, "manifest.json")):
+            return _empty_query_response(include_set, len(query_embeddings))
         db = self._open_db(None)
 
         all_ids, all_distances, all_metas, all_docs, all_embeddings = [], [], [], [], []

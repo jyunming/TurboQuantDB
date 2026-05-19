@@ -24,8 +24,8 @@ db = Database.open(
     dimension=None,          # int|None — vector dimension. Required for new databases.
                              #            Omit to reopen an existing database — the
                              #            dimension and fixed params are loaded from manifest.json.
-    bits=4,                  # int — quantization bits (any int >= 2; 2 = highest compression,
-                             #        4 = better recall (default), 8 = near-lossless)
+    bits=4,                  # int — quantization bits, 1..8. bits=1 is allowed only
+                             #        with fast_mode=True; common values are 2, 4, 8.
     seed=42,                 # int — RNG seed for quantizer, must stay the same across sessions
     metric="ip",             # str — "ip" (inner product), "cosine", or "l2"
     rerank=False,            # bool — store raw vectors for exact second-pass rescoring.
@@ -37,7 +37,8 @@ db = Database.open(
                              #        at d ≥ 1536 when rerank=False; no benefit when rerank=True.
     rerank_precision=None,   # str|None — None → "int8" (default when rerank=True)
                              #            "int8"/"i8" = INT8 per-vector-scaled (+n×(d+4) bytes)
-                             #            "int4"/"i4" = INT4 nibble-packed (+n×(⌈d/2⌉+4) bytes)
+                             #            "residual_int4"/"ri4" = residual INT4 rerank
+                             #            "int4"/"i4" = deprecated raw INT4 rerank
                              #            "f16" = float16 exact reranking (+n×d×2 bytes)
                              #            "f32" = float32 exact reranking (+n×d×4 bytes)
                              #            "disabled"/"dequant" = no extra storage (legacy)
@@ -46,11 +47,13 @@ db = Database.open(
     normalize=False,         # bool — L2-normalize every inserted vector and every query at
                              #        write time; makes inner-product scoring equivalent to
                              #        cosine similarity without changing the metric parameter
-    quantizer_type=None,     # str|None — None/"dense" = default Haar-uniform QR path
-                             #            (O(d²) ingest, n=d, best recall)
-                             #            "exact" is a legacy alias for "dense"
-                             #            "srht" = structured fast path (O(d log d),
-                             #            n=next_power_of_two(d), faster ingest)
+    quantizer_type=None,     # str|None — None = auto: "dense" if d<1024, "srht" if d>=1024.
+                             #            "dense" = Haar-uniform QR (O(d²) ingest, n=d).
+                             #                     Rotation matrix stored as bf16 on disk.
+                             #            "exact" is a legacy alias for "dense".
+                             #            "srht" = structured Walsh-Hadamard (O(d log d) ingest,
+                             #                    n=next_power_of_two(d), faster ingest+search at
+                             #                    d>=1024).
 )
 
 # Parameterless reopen — reads all parameters from manifest.json:
@@ -75,8 +78,11 @@ images   = Database.open("./mydb", dimension=512,  collection="images")
 
 TurboQuantDB exposes the same two-stage MSE + residual-QJL layout through two quantizer families:
 
-- **`None` / `"dense"` (default)** — Haar-uniform QR rotation + dense i.i.d. Gaussian QJL with `n = d`. Best recall; O(d²) ingest cost. `"exact"` is a legacy alias.
-- **`"srht"`** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, O(d log d) ingest. Use for streaming or frequent-ingest workloads at high d.
+- **`None` (default)** — auto-pick based on dimension. `"dense"` for `d < 1024`, `"srht"` for `d >= 1024`. The crossover reflects empirical wins for SRHT once the rotation dominates ingest/latency cost.
+- **`"dense"`** — Haar-uniform QR rotation + dense i.i.d. Gaussian QJL with `n = d`. O(d²) ingest cost; rotation matrix stored as bf16 on disk (~50% rotation-tax savings vs f32). `"exact"` is a legacy alias.
+- **`"srht"`** — structured Walsh-Hadamard + random-sign transforms, `n = next_power_of_two(d)`, O(d log d) ingest. At `d >= 1024` this is now the default — typically 2–3× faster ingest, 1.5–3× lower p50 latency, with recall equal to or slightly better than dense in our public-bench numbers.
+
+See [`docs/QUANTIZER_MODES.md`](QUANTIZER_MODES.md) for the full per-dim trade-off table including disk and RAM.
 
 ### `fast_mode` and `rerank` interaction
 
@@ -88,12 +94,12 @@ These two parameters work together and must be understood as a pair:
 | `True` | `True` | MSE codes + INT8 raw vectors | +5–25 pp R@1 vs default; ~2–4× more disk |
 | `False` | `False` | MSE+QJL codes | d ≥ 1536: +5–10 pp R@1; d < 512: hurts recall |
 | `False` | `True` | MSE+QJL codes + INT8 raw vectors | Maximum recall at d ≥ 1536 |
-| `True` | `False` | MSE codes only | Paper Figure 5 baseline; minimum disk |
-| `False` | `False` | MSE+QJL codes only | Modest recall gain over fast_mode=True at d ≥ 1536 |
 
 **`rerank=True`** stores per-vector-scaled INT8 vectors by default for exact second-pass rescoring. The quantized pass pre-selects `rerank_factor × top_k` candidates; exact dot products on the dequantized INT8 vectors then re-rank to the final `top_k`. This consistently improves R@1 by +5–25 pp depending on dimension and bits, at ~2× lower disk cost than F16.
 
-**`fast_mode=False`** adds 1-bit QJL residual codes on top of MSE codes. At d < 512, the projections are too noisy and reduce recall. At d ≥ 1536, enough bits accumulate to add meaningful signal — gains +5–10 pp R@1 when `rerank=False`. When `rerank=True`, the QJL residuals provide secondary benefit since f16 re-scoring dominates.
+**`fast_mode=False`** adds 1-bit QJL residual codes on top of MSE codes. At d < 512, the projections are too noisy and reduce recall. At d ≥ 1536, enough bits accumulate to add meaningful signal — gains +5–10 pp R@1 when `rerank=False`. When `rerank=True`, the QJL residuals provide secondary benefit because raw-vector re-scoring dominates.
+
+Validation edge cases are intentionally Python-visible: `dimension=0`, `bits=0`, `bits>8`, `bits=1` with `fast_mode=False`, unknown `quantizer_type`, non-finite vectors, vector dimension mismatches, `top_k<=0`, `n_results<=0`, negative `limit`, and negative `offset` raise `ValueError`. `insert_batch(..., metadatas=[None, ...])` treats each `None` row as empty metadata, matching Chroma collections that have no metadata.
 
 ---
 
@@ -442,7 +448,7 @@ The delta overlay is persisted to `delta_ids.json` and survives restarts. Delete
 
 ## Async API
 
-`AsyncDatabase` is an asyncio-friendly wrapper around `Database`. Every long-running method is awaitable; the underlying call dispatches to a thread-pool executor, so concurrent `await db.search(...)` calls genuinely run in parallel (the Rust extension releases the GIL inside).
+`AsyncDatabase` is an asyncio-friendly wrapper around `Database`. Every long-running method is awaitable; the underlying call dispatches to a thread-pool executor, so concurrent awaits fan out through the pool and the event loop stays responsive. Rust engine calls release the GIL while they run; actual throughput still depends on executor size, CPU cores, and storage.
 
 ```python
 import asyncio
@@ -452,7 +458,7 @@ async def main():
     async with await AsyncDatabase.open("./mydb", dimension=1536, bits=4) as db:
         await db.insert("doc1", vec, document="...")
         results = await db.search(query, top_k=5)
-        # 50 concurrent searches — actually run in parallel:
+        # Concurrent searches fan out through the executor:
         all_results = await asyncio.gather(
             *(db.search(q, top_k=5) for q in queries)
         )
@@ -562,6 +568,8 @@ print(col.peek(limit=3))    # dict same shape as query result
 
 **Metric mapping:** `metadata={"hnsw:space": "cosine"}` → `metric="cosine"`, `"ip"` → inner product (default), `"l2"` → L2. The metric is fixed at collection creation and cannot be changed.
 
+**Empty behavior:** `get(ids=[])` returns an empty Chroma-shaped response, not a full-table scan. `query(...)` on an empty collection returns one empty result row per query embedding. `add(ids=[], embeddings=[])` raises `ValueError` because Chroma-compatible adds require at least one embedding to validate or establish dimension.
+
 **Not implemented:** `HttpClient`, `Settings`, server/cloud mode, `chromadb.Client()` (ephemeral), `where_document` filtering, automatic text embedding (pass pre-computed `embeddings`; or provide an `embedding_function` callable at collection creation time).
 
 **Where-filter operators supported:** `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$and`, `$or`, `$exists`, `$contains`.
@@ -600,7 +608,11 @@ tbl.optimize()   # no-op; tqdb handles compaction automatically
 
 **SQL WHERE parser:** supports `field = 'value'`, `field != 'value'`, `field IN ('a', 'b', ...)` (including `id IN (...)`), and numeric comparisons (`field > 10`, `field >= 10`, `field < 10`, `field <= 10`). More complex predicates raise `NotImplementedError`.
 
-**Not implemented:** `update(where, values)`, `merge_insert()`, `create_fts_index`, `create_scalar_index`, `drop_database`, remote/cloud URIs.
+**Empty behavior:** a table without a manifest reports `count_rows()==0`; `head()`, `to_arrow()`, `to_pandas()`, and searches with no matches return empty tables/lists rather than raising. `add([])` and `add(empty_pyarrow_table)` are always no-ops; they do not create a manifest or establish a brand-new table's schema.
+
+**Implemented compatibility subset:** `update(where, values)` and `merge_insert(on).when_matched_update_all().when_not_matched_insert_all().execute(data)` are supported for basic upsert/update workflows. Other merge clauses are accepted as no-ops.
+
+**Not implemented:** `create_fts_index`, `create_scalar_index`, `drop_database`, remote/cloud URIs.
 
 ---
 

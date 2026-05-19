@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -110,44 +111,38 @@ async def test_get_and_metadata_update(tmp_db_path):
 
 @pytest.mark.asyncio
 async def test_concurrent_searches_dont_serialize(tmp_db_path):
-    """Fire 50 concurrent searches and confirm they don't run sequentially.
+    """Concurrent awaits should fan out through the executor.
 
-    The expected wall-clock is much less than (n_tasks × per-task latency);
-    if the wrapper accidentally serialized, total time would scale linearly
-    with task count.
+    Use a tiny blocking fake DB instead of timing real Rust searches. The real
+    search path can be sub-millisecond on small corpora, making ratio checks
+    mostly scheduler noise rather than a test of the Python wrapper.
     """
-    d = 64
-    async with await AsyncDatabase.open(tmp_db_path, dimension=d, bits=4) as db:
-        # Populate with enough data that each search isn't a sub-microsecond no-op.
-        ids = [f"d{i}" for i in range(2_000)]
-        vecs = np.stack([_vec(d, i) for i in range(2_000)])
-        await db.insert_batch(ids, vecs, None, None, "insert")
 
-        # Warm-up so the first call's overhead doesn't skew the median.
-        await db.search(_vec(d, 0), top_k=10)
+    class _SleepyDb:
+        def search(self, query, top_k):
+            time.sleep(0.02)
+            return [{"id": str(query), "score": 1.0}]
 
-        # Time a single search to set the bar.
+        def close(self):
+            return None
+
+    pool = ThreadPoolExecutor(max_workers=8)
+    db = AsyncDatabase(_SleepyDb(), executor=pool, owns_executor=True)
+    try:
+        n_tasks = 16
         t0 = time.perf_counter()
-        await db.search(_vec(d, 0), top_k=10)
-        single_s = max(time.perf_counter() - t0, 1e-4)
-
-        # Fire many concurrent searches.
-        n_tasks = 50
-        t0 = time.perf_counter()
-        await asyncio.gather(
-            *(db.search(_vec(d, i), top_k=10) for i in range(n_tasks))
+        results = await asyncio.gather(
+            *(db.search(i, top_k=1) for i in range(n_tasks))
         )
-        concurrent_s = time.perf_counter() - t0
+        elapsed = time.perf_counter() - t0
 
-        # Sequential would take ~ n_tasks × single_s. Concurrent should be
-        # WAY less — we accept up to a generous 0.5 × that as proof of
-        # parallelism (covers slow CI / Windows scheduler jitter).
-        sequential_estimate = n_tasks * single_s
-        assert concurrent_s < 0.5 * sequential_estimate, (
-            f"50 concurrent searches took {concurrent_s:.3f}s; sequential "
-            f"would be ~{sequential_estimate:.3f}s. The wrapper appears to "
-            f"serialize."
+        assert len(results) == n_tasks
+        assert elapsed < 0.20, (
+            f"{n_tasks} executor-backed searches took {elapsed:.3f}s; "
+            "the wrapper appears to serialize."
         )
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio

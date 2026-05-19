@@ -174,6 +174,17 @@ class TestGet:
         assert res["metadatas"] is not None
         assert res["documents"] is None
 
+    def test_get_empty_collection_honors_include_shape(self, tmp_path):
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        res = col.get(include=["embeddings"])
+        assert res == {
+            "ids": [],
+            "metadatas": None,
+            "documents": None,
+            "embeddings": [],
+        }
+
 
 # ---------------------------------------------------------------------------
 # query
@@ -220,6 +231,16 @@ class TestQuery:
         with pytest.raises(NotImplementedError):
             col.query(query_embeddings=[rand_vecs(1)[0]], where_document={"$contains": "hi"})
 
+    def test_query_empty_collection_returns_nested_empty_results(self, tmp_path):
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        res = col.query(query_embeddings=rand_vecs(2), n_results=3)
+        assert res["ids"] == [[], []]
+        assert res["distances"] == [[], []]
+        assert res["metadatas"] == [[], []]
+        assert res["documents"] == [[], []]
+        assert res["embeddings"] is None
+
 
 # ---------------------------------------------------------------------------
 # delete / upsert / update
@@ -245,6 +266,13 @@ class TestMutations:
         res = col.get()
         assert "a" not in res["ids"]
         assert "b" in res["ids"]
+
+    def test_delete_empty_collection_is_noop(self, tmp_path):
+        client = PersistentClient(str(tmp_path))
+        col = client.get_or_create_collection("col")
+        col.delete(ids=["missing"])
+        col.delete(where={"tag": {"$eq": "missing"}})
+        assert col.count() == 0
 
     def test_upsert_inserts_new(self, tmp_path):
         client = PersistentClient(str(tmp_path))

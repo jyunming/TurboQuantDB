@@ -12,14 +12,15 @@ For full empirical numbers across 32 configs × 4 datasets (GloVe-200, arXiv-768
 db = Database.open(
     path,
     dimension,
-    bits=4,                 # 2 or 4 — compression bits per subspace
+    bits=4,                 # 1..8; bits=1 requires fast_mode=True. Common: 2, 4, 8.
     rerank=False,           # False (default) = MSE codes only, minimum disk
                             # True = store raw INT8 vectors for exact second-pass rescoring
-    rerank_precision=None,  # None (→ "int8"), "int8"/"i8", "int4"/"i4", "f16", "f32", "disabled"
+    rerank_precision=None,  # None (→ "int8"), "int8"/"i8", "residual_int4"/"ri4",
+                            # "int4"/"i4" (deprecated), "f16", "f32", "disabled"
     fast_mode=True,         # True (default) = MSE-only (fastest ingest, minimum disk)
                             # False = MSE + QJL residual (+5–10 pp R@1 at d ≥ 1536, rerank=False)
-    quantizer_type=None,    # None/"dense" (Haar QR) or "srht" (Hadamard)
-    metric="ip",            # "ip" (inner product) or "l2" (Euclidean)
+    quantizer_type=None,    # None auto-selects dense for d<1024, srht for d>=1024
+    metric="ip",            # "ip" (inner product), "cosine", or "l2" (Euclidean)
     seed=42,
 )
 
@@ -113,16 +114,17 @@ results = db.search(query, top_k=10, rerank_factor=5)
 
 ---
 
-### `quantizer_type` — `None`/`"dense"` vs `"srht"`
+### `quantizer_type` — auto, `"dense"`, or `"srht"`
 
 Selects the rotation applied before Lloyd-Max quantization.
 
 | quantizer_type | Rotation | Ingest cost | Recall | When to use |
 |----------------|----------|-------------|--------|-------------|
-| `None` / `"dense"` | Haar QR | O(d²) | best | Default; d < 2048 |
-| `"srht"` | SRHT (Hadamard) | O(d log d) | −1 to −3 pp | d ≥ 1536 with high throughput requirement |
+| `None` | Auto: `"dense"` for d<1024, `"srht"` for d>=1024 | dimension-aware | default | Let the library pick the dimension crossover |
+| `"dense"` / `"exact"` | Haar QR | O(d²) | strongest low-d / no padding | d < 1024, or when you want paper-faithful QR |
+| `"srht"` | SRHT (Hadamard) | O(d log d) | equal/slightly better in high-d public benches | d >= 1024 with high throughput or latency requirements |
 
-**Rule:** Use `"dense"` (default). Switch to `"srht"` only when ingest throughput is the primary bottleneck at d ≥ 1536 (e.g., real-time embedding pipelines).
+**Rule:** Leave `quantizer_type=None` unless you need a reproducible mode choice. Pin `"dense"` for low-dimensional or no-padding storage; pin `"srht"` for high-dimensional ingest/search speed.
 
 ---
 
@@ -149,7 +151,7 @@ Call `db.create_index()` after bulk load to build the HNSW graph.
 ```python
 db = Database.open(path, dimension=1536,
     bits=4, rerank=True, fast_mode=False,
-    quantizer_type=None)  # dense, default; rerank_precision=None → int8
+    quantizer_type="dense")  # pin dense for maximum-recall QR; rerank_precision=None → int8
 # ~149 MB for 100k vectors; R@1 ≈ 0.94–0.96 (DBpedia-1536)
 ```
 
@@ -212,7 +214,7 @@ Recommended starting config for ColBERTv2-style late interaction:
 | `dimension` | 96 (ColBERTv2) or 128 (ColBERT) | per-token dim of the model |
 | `bits` | 4 | good recall at modest disk |
 | `metric` | `"cosine"` | ColBERT vectors are unit-normalised |
-| `quantizer_type` | `"dense"` (default) | best recall |
+| `quantizer_type` | `None` or `"dense"` | auto resolves to dense at ColBERT dimensions; pin dense for reproducibility |
 
 The wrapper rejects `metric="l2"` at construction — MaxSim is a dot-product
 aggregation that doesn't generalise cleanly to lower-is-better metrics.
@@ -236,11 +238,11 @@ it on memory-constrained hosts.
 ## Decision Flowchart
 
 ```
-Start from defaults: bits=4, rerank=False, fast_mode=True, quantizer_type="dense"
+Start from defaults: bits=4, rerank=False, fast_mode=True, quantizer_type=None
 
 Need better recall?
   YES → rerank=True (+5–25 pp R@1; adds INT8 raw vectors, ~2–4× more disk)
-      → rerank_precision="int4" if storage is tight (~half disk vs int8)
+      → rerank_precision="residual_int4" if storage is tight (~31% less disk vs int8 at b=4)
       → rerank_precision="f16" for maximum precision
 
 Is d ≥ 1536 AND rerank=False?
@@ -251,9 +253,10 @@ Is N > 100k or p50 < 10ms required?
   YES → create_index() + _use_ann=True (or None for auto)
   NO  → brute-force is fine
 
-Is ingest throughput critical (streaming, d≥1536)?
-  YES → quantizer_type="srht"
-  NO  → quantizer_type="dense" (default)
+Need a fixed quantizer mode instead of dimension-aware auto?
+  d < 1024 or no-padding/paper-faithful QR → quantizer_type="dense"
+  d >= 1024 and ingest/latency matter      → quantizer_type="srht"
+  otherwise                                → keep quantizer_type=None
 ```
 
 ---

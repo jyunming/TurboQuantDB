@@ -84,7 +84,7 @@ _FIELD_NEQ_STR_PATTERN = re.compile(
     r"""^\s*(\w+)\s*!=\s*'([^']*)'\s*$"""
 )
 _FIELD_EQ_NUM_PATTERN = re.compile(
-    r"""^\s*(\w+)\s*=\s*(\d+(?:\.\d+)?)\s*$"""
+    r"""^\s*(\w+)\s*=\s*(-?\d+(?:\.\d+)?)\s*$"""
 )
 _FIELD_CMP_PATTERN = re.compile(
     r"""^\s*(\w+)\s*(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)\s*$"""
@@ -343,6 +343,8 @@ class CompatQuery:
         return self
 
     def to_list(self) -> List[Dict[str, Any]]:
+        if self._k == 0:
+            return []
         tqdb_filter: Optional[Dict[str, Any]] = None
         id_allowset: Optional[set] = None
         if self._where:
@@ -352,6 +354,9 @@ class CompatQuery:
                 id_allowset = set(id_cond["$in"])
             else:
                 tqdb_filter = parsed
+
+        if not os.path.exists(os.path.join(self._table._path, "manifest.json")):
+            return []
 
         # Full-table scan when query is None
         if self._query is None:

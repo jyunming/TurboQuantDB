@@ -12,15 +12,15 @@ syntactic signal that single-vector dense retrieval misses.
 
 ## Status
 
-This is a **Python-layer wrapper** in v0.8: token vectors are stored as
+This is a **Python-layer wrapper**: token vectors are stored as
 regular slots in the underlying `Database`; a JSON sidecar tracks the
 `doc_id → [token_id]` mapping; raw float32 token vectors are kept in a
 NumPy `.npz` sidecar for exact MaxSim scoring.
 
-A future v0.9 release will move multi-vector into the engine (native slot
-grouping in `IdPool`, on-disk MaxSim kernel) for tighter storage and native
-filter pushdown. **The public Python API is designed to stay stable across
-that move** — your code shouldn't need to change.
+Native engine-level multi-vector storage remains a future hardening item
+(native slot grouping in `IdPool`, on-disk MaxSim kernel) for tighter storage
+and native filter pushdown. **The public Python API is designed to stay stable
+across that move** — your code shouldn't need to change.
 
 ## Quick start
 
@@ -63,6 +63,14 @@ len(store)
 
 `hit` is `{"doc_id": str, "score": float, "document": str | None, "metadata": dict}`.
 
+`insert(doc_id, vectors, ...)` has replace semantics. If `doc_id` already
+exists, the old token IDs are removed from the engine and sidecars before fresh
+UUID-backed token IDs are inserted. Shape, empty-vector, and dimension checks
+run before the old document is removed; failures after that point, such as I/O
+errors during the replacement write, can leave the document absent rather than
+rolled back. Use application-level retry or a staging path for critical bulk
+replacements.
+
 ## Knobs
 
 - `oversample` (default 4): each query token asks the engine for
@@ -84,7 +92,7 @@ For ColBERTv2-style late interaction:
 | `metric` | `cosine` | ColBERT vectors are unit-normalised |
 | `oversample` | 4 | Default; raise to 8-16 for long-tail recall |
 
-## Limitations (v0.8 — temporary)
+## Limitations
 
 - Inserting `N` token vectors per document is still `O(N)` work per doc, but
   `MultiVectorStore.insert()` batches all N tokens into a single
@@ -99,4 +107,5 @@ For ColBERTv2-style late interaction:
   raises at construction time. MaxSim is a dot-product aggregation that
   doesn't generalise cleanly to lower-is-better metrics.
 
-All four are addressed by the v0.9 native engine integration.
+These are the reasons native engine-level multi-vector support remains on the
+hardening roadmap.

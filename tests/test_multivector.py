@@ -99,6 +99,23 @@ def test_insert_replaces_existing_doc():
             store._db.close()
 
 
+def test_failed_replace_keeps_existing_doc():
+    d = 8
+    with _tempdir() as path:
+        store = MultiVectorStore.open(path, dimension=d, bits=2, metric="cosine")
+        try:
+            store.insert("x", _doc_tokens(d, 3, 1), document="v1")
+            with pytest.raises(ValueError, match="dimension mismatch"):
+                store.insert("x", np.zeros((2, d - 1), dtype=np.float32))
+
+            info = store.get("x")
+            assert info is not None
+            assert info["document"] == "v1"
+            assert len(store) == 1
+        finally:
+            store._db.close()
+
+
 def test_delete_removes_doc():
     d = 8
     with _tempdir() as path:
