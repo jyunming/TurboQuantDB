@@ -1203,7 +1203,7 @@ pub fn hamming_disagree_b4_signs(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
 /// Lower return = closer in IP.
 #[inline]
 pub fn hamming_disagree_signs<const B: usize>(query_signs: &[u8], mse_bytes: &[u8]) -> u32 {
-    assert_eq!(
+    debug_assert_eq!(
         query_signs.len() * B,
         mse_bytes.len(),
         "hamming_disagree_signs<B={B}>: query_signs.len()*B must equal mse_bytes.len()"

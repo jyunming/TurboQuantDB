@@ -537,9 +537,9 @@ impl TurboQuantEngine {
             // ingest (2-3×), p50 latency (1.5-3×), and matches/beats dense
             // Haar QR on recall in our public bench. Dense remains the default
             // at low dim where SRHT's pow2 padding tax dominates the win.
-            let qt = quantizer_type.as_deref().unwrap_or_else(|| {
-                if d >= 1024 { "srht" } else { "dense" }
-            });
+            let qt = quantizer_type
+                .as_deref()
+                .unwrap_or_else(|| if d >= 1024 { "srht" } else { "dense" });
             let is_dense = qt == "dense" || qt == "exact"; // "exact" is a legacy alias
             let q = if is_dense && fast_mode {
                 ProdQuantizer::new_dense_fast(d, b, seed)
@@ -2294,14 +2294,23 @@ impl TurboQuantEngine {
                     if self.live_vraw.is_some() {
                         // P12: ResidualInt4 uses the additive shortcut to avoid
                         // O(d^2) code re-dequantization per candidate.
-                        if matches!(self.manifest.rerank_precision, RerankPrecision::ResidualInt4)
-                            && !matches!(self.metric, DistanceMetric::L2)
+                        if matches!(
+                            self.manifest.rerank_precision,
+                            RerankPrecision::ResidualInt4
+                        ) && !matches!(self.metric, DistanceMetric::L2)
                         {
                             let q_norm_inv = if matches!(self.metric, DistanceMetric::Cosine) {
                                 let qn = query.iter().map(|x| x * x).sum::<f64>().sqrt();
                                 if qn > 1e-10 { 1.0 / qn } else { 0.0 }
-                            } else { 0.0 };
-                            self.live_rerank_score_residual_int4(slot as usize, query, approx_score, q_norm_inv)
+                            } else {
+                                0.0
+                            };
+                            self.live_rerank_score_residual_int4(
+                                slot as usize,
+                                query,
+                                approx_score,
+                                q_norm_inv,
+                            )
                         } else {
                             let raw_vec = self.live_raw_vector_at_slot(slot as usize);
                             score_vectors_with_metric(&self.metric, query, &raw_vec)
@@ -2589,8 +2598,10 @@ impl TurboQuantEngine {
         const HAMMING_PREFILTER_RETAIN_RATIO: usize = 16; // P4: tightened from 8 -> 16
         let prefilter_b = quantizer.b;
         let prefilter_supports_b = matches!(prefilter_b, 1 | 2 | 4 | 8);
+        let prefilter_layout_ok = quantizer.n.div_ceil(8) * prefilter_b == mse_len;
         let use_sign_prefilter = qjl_len == 0
             && prefilter_supports_b
+            && prefilter_layout_ok
             && quantizer.d >= HAMMING_PREFILTER_MIN_DIM
             && matches!(metric, DistanceMetric::Ip | DistanceMetric::Cosine)
             && candidate_slots.len() >= HAMMING_PREFILTER_MIN_CANDIDATES;
@@ -2991,14 +3002,23 @@ impl TurboQuantEngine {
 
             let score = if self.rerank_enabled {
                 if self.live_vraw.is_some() {
-                    if matches!(self.manifest.rerank_precision, RerankPrecision::ResidualInt4)
-                        && !matches!(self.metric, DistanceMetric::L2)
+                    if matches!(
+                        self.manifest.rerank_precision,
+                        RerankPrecision::ResidualInt4
+                    ) && !matches!(self.metric, DistanceMetric::L2)
                     {
                         let q_norm_inv = if matches!(self.metric, DistanceMetric::Cosine) {
                             let qn = query.iter().map(|x| x * x).sum::<f64>().sqrt();
                             if qn > 1e-10 { 1.0 / qn } else { 0.0 }
-                        } else { 0.0 };
-                        self.live_rerank_score_residual_int4(cand_slot as usize, query, cand_score, q_norm_inv)
+                        } else {
+                            0.0
+                        };
+                        self.live_rerank_score_residual_int4(
+                            cand_slot as usize,
+                            query,
+                            cand_score,
+                            q_norm_inv,
+                        )
                     } else {
                         let raw_vec = self.live_raw_vector_at_slot(cand_slot as usize);
                         score_vectors_with_metric(&self.metric, query, &raw_vec)
@@ -3916,7 +3936,7 @@ impl TurboQuantEngine {
                 let recon = self.quantizer.mse_quantizer.dequantize(&idx);
                 let doc_norm = f32::from_le_bytes(
                     codes_bytes[slot * stride + mse_len + qjl_len + 4
-                              ..slot * stride + mse_len + qjl_len + 8]
+                        ..slot * stride + mse_len + qjl_len + 8]
                         .try_into()
                         .expect("doc_norm field is 4 bytes"),
                 ) as f64;
@@ -3987,7 +4007,9 @@ impl TurboQuantEngine {
         vector: &[f32],
         precomputed_residual: Option<&[f32]>,
     ) {
-        let Some(vraw) = &mut self.live_vraw else { return; };
+        let Some(vraw) = &mut self.live_vraw else {
+            return;
+        };
         let rec = vraw.get_slot_mut(slot as usize);
         match self.manifest.rerank_precision {
             RerankPrecision::Int8 => {
@@ -4023,8 +4045,8 @@ impl TurboQuantEngine {
             }
             RerankPrecision::ResidualInt4 => {
                 // Caller must supply precomputed_residual for this mode.
-                let residual = precomputed_residual
-                    .expect("ResidualInt4 requires precomputed_residual");
+                let residual =
+                    precomputed_residual.expect("ResidualInt4 requires precomputed_residual");
                 let scale = residual
                     .iter()
                     .map(|v| v.abs())
@@ -4116,7 +4138,7 @@ impl TurboQuantEngine {
                     b,
                     1.0,
                     rotation_matrix.as_ptr(),
-                    1, // Q^T: rsa=1
+                    1,          // Q^T: rsa=1
                     d as isize, // Q^T: csa=d
                     y_tilde.as_ptr(),
                     1, // col-major y_tilde
@@ -4198,15 +4220,25 @@ impl TurboQuantEngine {
     }
 
     fn live_residual_score_at_slot(&self, slot: usize, query: &Array1<f64>) -> f64 {
-        let Some(vraw) = &self.live_vraw else { return 0.0; };
+        let Some(vraw) = &self.live_vraw else {
+            return 0.0;
+        };
         let rec = vraw.get_slot(slot);
         let scale = f32::from_le_bytes(rec[..4].try_into().unwrap()) as f64;
         let inv_scale_over_7 = scale / 7.0;
         let mut score = 0.0_f64;
         for i in 0..self.d {
             let byte = rec[4 + i / 2];
-            let nibble = if i % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
-            let signed = if nibble > 7 { nibble as i8 - 16 } else { nibble as i8 };
+            let nibble = if i % 2 == 0 {
+                byte & 0x0F
+            } else {
+                (byte >> 4) & 0x0F
+            };
+            let signed = if nibble > 7 {
+                nibble as i8 - 16
+            } else {
+                nibble as i8
+            };
             let v = signed as f64 * inv_scale_over_7;
             score += query[i] * v;
         }
@@ -4696,7 +4728,8 @@ impl TurboQuantEngine {
             //
             // For non-rerank-stored modes (Disabled) and other precisions this
             // pre-pass is a no-op (vector kept None).
-            let precomputed_residuals: Option<Vec<Vec<f32>>> = match self.manifest.rerank_precision {
+            let precomputed_residuals: Option<Vec<Vec<f32>>> = match self.manifest.rerank_precision
+            {
                 RerankPrecision::ResidualInt4 if self.live_vraw.is_some() => {
                     // For ResidualInt4 the residual is computed against the
                     // vector that's actually stored: vec_unit when normalize=True,
@@ -4704,16 +4737,16 @@ impl TurboQuantEngine {
                     let store_refs: Vec<&[f32]> = unit_vecs_and_norms
                         .iter()
                         .enumerate()
-                        .map(|(i, (uv, _))| if self.normalize {
-                            uv.as_slice()
-                        } else {
-                            chunk[i].vector.as_slice()
+                        .map(|(i, (uv, _))| {
+                            if self.normalize {
+                                uv.as_slice()
+                            } else {
+                                chunk[i].vector.as_slice()
+                            }
                         })
                         .collect();
-                    let all_idx: Vec<Vec<CodeIndex>> = quantized
-                        .iter()
-                        .map(|(idx, _, _)| idx.clone())
-                        .collect();
+                    let all_idx: Vec<Vec<CodeIndex>> =
+                        quantized.iter().map(|(idx, _, _)| idx.clone()).collect();
                     Some(self.compute_residuals_batch_parallel(&store_refs, &all_idx))
                 }
                 _ => None,
@@ -4760,9 +4793,7 @@ impl TurboQuantEngine {
                     entry.gamma,
                     stored_norm,
                 )?;
-                let precomputed = precomputed_residuals
-                    .as_ref()
-                    .map(|all| all[_i].as_slice());
+                let precomputed = precomputed_residuals.as_ref().map(|all| all[_i].as_slice());
                 self.live_save_raw_vector_with_residual(slot, raw_for_rerank, precomputed);
                 touched_slots.push(slot);
                 if has_meaningful_metadata(&meta) {

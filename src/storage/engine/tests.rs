@@ -623,18 +623,39 @@ fn residual_int4_reload_preserves_recall() {
     let v: Vec<f64> = (0..d).map(|i| (i as f64 * 0.013).sin()).collect();
     {
         let mut e = TurboQuantEngine::open_with_options(
-            p, p, d, 4, 42,
-            DistanceMetric::Ip, true, false,
-            RerankPrecision::ResidualInt4, None, false, None,
-        ).unwrap();
-        e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta()).unwrap();
+            p,
+            p,
+            d,
+            4,
+            42,
+            DistanceMetric::Ip,
+            true,
+            false,
+            RerankPrecision::ResidualInt4,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
+            .unwrap();
         e.checkpoint().unwrap();
     }
     let e = TurboQuantEngine::open_with_options(
-        p, p, d, 4, 42,
-        DistanceMetric::Ip, true, false,
-        RerankPrecision::ResidualInt4, None, false, None,
-    ).unwrap();
+        p,
+        p,
+        d,
+        4,
+        42,
+        DistanceMetric::Ip,
+        true,
+        false,
+        RerankPrecision::ResidualInt4,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
     let results = e
         .search_with_filter_and_ann(&Array1::from_vec(v), 1, None, None, false, None)
         .unwrap();
