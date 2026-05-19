@@ -6,8 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-## [0.8.4] — 2026-05-19
-
 ### Changed
 
 - **`quantizer_type=None` default is now dimension-aware.** Picks `"dense"` (Haar QR) for `d < 1024` and `"srht"` (Walsh–Hadamard) for `d >= 1024`. Empirical wins for SRHT once the rotation dominates ingest/latency cost: 2–3× ingest throughput, 1.5–3× lower p50 latency, recall equal or slightly better than dense in the public bench (R@1 0.962 vs 0.958 at d=1536 b=4 rerank=F; 0.980 vs 0.963 at d=3072 b=4 rerank=F). Below d=1024 the SRHT pow2-padding tax wipes the win so dense remains the default. To restore explicit control, pass `quantizer_type="dense"` or `quantizer_type="srht"`.
@@ -18,7 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Migration
 
-- **Pre-0.8.4 dense-mode databases need to be rebuilt.** The bf16 rotation storage is bincode-incompatible with the older dense format. SRHT-mode databases reopen cleanly; only `quantizer_type="dense"` (or the legacy `"exact"` alias) is affected. There is no automatic migration in this release — re-quantize from source vectors. A polish migration tool may follow later.
+- **v0.8 → v0.9 dense-mode databases need to be rebuilt.** The bf16 rotation storage is bincode-incompatible with v0.8.x format. SRHT-mode databases reopen cleanly; only `quantizer_type="dense"` (or the legacy `"exact"` alias) is affected. There is no automatic migration in v0.9 — re-quantize from source vectors. A polish migration tool may follow in v0.10+.
 
 ---
 
