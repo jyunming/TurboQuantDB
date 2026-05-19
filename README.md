@@ -114,7 +114,7 @@ All numbers below come from runs on a single Windows laptop; absolute values wil
 
 ### A. Paper-validation (n=100k, brute-force, fast_mode=True)
 
-Config: dbpedia-1536, b=4, `rerank=True`, brute-force, `quantizer_type=None` (v0.9 auto-selects `"srht"` at this dimension). Matches arXiv:2504.19874 Figure 5b's bit allocation; pin `quantizer_type="dense"` when you need the paper-faithful QR rotation.
+Config: dbpedia-1536, b=4, `rerank=True`, brute-force, `quantizer_type=None` (auto-selects `"srht"` at this dimension). Matches arXiv:2504.19874 Figure 5b's bit allocation; pin `quantizer_type="dense"` when you need the paper-faithful QR rotation.
 
 | Metric | Value |
 |---|---:|

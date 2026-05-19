@@ -120,7 +120,7 @@ Selects the rotation applied before Lloyd-Max quantization.
 
 | quantizer_type | Rotation | Ingest cost | Recall | When to use |
 |----------------|----------|-------------|--------|-------------|
-| `None` | Auto: `"dense"` for d<1024, `"srht"` for d>=1024 | dimension-aware | default | Let the library pick the v0.9 crossover |
+| `None` | Auto: `"dense"` for d<1024, `"srht"` for d>=1024 | dimension-aware | default | Let the library pick the dimension crossover |
 | `"dense"` / `"exact"` | Haar QR | O(d²) | strongest low-d / no padding | d < 1024, or when you want paper-faithful QR |
 | `"srht"` | SRHT (Hadamard) | O(d log d) | equal/slightly better in high-d public benches | d >= 1024 with high throughput or latency requirements |
 

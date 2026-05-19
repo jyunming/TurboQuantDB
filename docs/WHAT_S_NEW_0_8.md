@@ -129,7 +129,7 @@ The new class implements the full LangChain `VectorStore` ABC, so calls like
 
 ## After v0.8
 
-The v0.9-v1.0 hardening work targets:
+The next hardening work targets:
 
 - **Native multi-vector engine integration** — replaces the Python-layer
   wrapper with `IdPool` doc-id grouping, an on-disk MaxSim kernel, and native
@@ -139,5 +139,5 @@ The v0.9-v1.0 hardening work targets:
 - Pre-1.0 hardening: `≥80%` test coverage, `.unwrap()` audit pass 2, API-key
   authentication baseline, complete `0.x → 1.0` migration guide.
 
-See the full [v0.9-v1.0 sprint board](https://github.com/users/jyunming/projects/3)
+See the full [hardening sprint board](https://github.com/users/jyunming/projects/3)
 for the running list.

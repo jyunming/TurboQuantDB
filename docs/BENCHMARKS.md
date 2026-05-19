@@ -3,7 +3,7 @@
 Three datasets from [arXiv:2504.19874](https://arxiv.org/abs/2504.19874) — n=100k vectors each.
 Full script: [`benchmarks/paper_recall_bench.py`](https://github.com/jyunming/TurboQuantDB/blob/main/benchmarks/paper_recall_bench.py).
 
-The benchmark script opens databases with `quantizer_type=None`, so v0.9 runs
+The benchmark script opens databases with `quantizer_type=None`, so current runs
 `"dense"` below d=1024 and `"srht"` at d>=1024. All rows use `fast_mode=True`
 (MSE-only, matching paper Figure 5 bit allocation); rerank varies by config.
 ANN rows use HNSW (md=32, ef=128).
