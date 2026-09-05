@@ -1184,10 +1184,12 @@ class TestLanceDBTableSearch:
         assert "id" in rows[0]
         assert "cat" not in rows[0]
 
-    @pytest.mark.xfail(strict=True, reason="limit(0) calls db.search(q, 0) which raises in tqdb; should return []")
     def test_search_limit_zero_returns_empty(self, tmp_path):
         """LanceDB with limit=0 returns an empty result set.
-        tqdb raises an exception when top_k=0."""
+
+        The compat layer short-circuits limit(0) since #99, so this matches
+        LanceDB; the strict xfail marker it used to carry now XPASSes.
+        """
         db = connect(str(tmp_path))
         tbl = db.create_table("t", data=[{"id": "a", "vector": _rand().tolist()}])
         rows = tbl.search(_rand().tolist()).limit(0).to_list()
