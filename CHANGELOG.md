@@ -19,6 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **`Database` is a context manager** — `with Database.open(...) as db:` closes the database on block exit, including when the block raises.
 
+---
+
 ## [0.8.4] — 2026-05-19
 
 ### Changed
