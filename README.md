@@ -414,6 +414,14 @@ Two common causes:
 1. *Forgot to L2-normalize embeddings before insert* — for `metric="ip"` (default), most embedding models expect normalized inputs to make IP scores meaningful (`<a, b> = cos(a, b)` only for unit vectors). Use `model.encode(..., normalize_embeddings=True)` or normalize manually.
 2. *Mixed `metric=` between insert and query* — the metric is fixed at `Database.open` time and cannot be changed without rebuilding.
 
+**`[Errno 22] Invalid argument` / os error 1224 when resizing or replacing a DB file on Windows (pre-v0.8.5)**
+`close()` used to leave the memory mapping of `live_codes.bin` in place until the `Database` object was garbage-collected, so a still-referenced closed database blocked any resize of its files. Fixed in v0.8.5 — `close()` now releases every handle immediately, and `Database` is a context manager:
+```python
+with Database.open("./my_db", dimension=384) as db:
+    db.insert("a", vec)
+# files are fully released here
+```
+
 **Multi-query batch returned wrong scores under `metric="cosine"` (pre-v0.8.3)**
 Fixed in v0.8.3 — `score_batch_brute` was applying `doc_norm` on the cosine path. Upgrade to `tqdb >= 0.8.3` or pass single queries through `db.search(...)` instead of `db.query(...)`.
 

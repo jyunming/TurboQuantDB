@@ -393,6 +393,9 @@ pub struct TurboQuantEngine {
     pub normalize: bool,
     /// Optional IVF coarse index — loaded at open if `ivf.bin` exists.
     ivf: Option<IvfIndex>,
+    /// Set by [`close`](Self::close).  A closed engine has released every file
+    /// handle and memory map it owned; callers must reopen before using it again.
+    closed: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -663,6 +666,7 @@ impl TurboQuantEngine {
             rerank_enabled: manifest.rerank_enabled,
             normalize: normalize_flag,
             ivf: None,
+            closed: false,
         };
 
         let id_pool_loaded = if let Ok(ip) = load_id_pool(local_dir, &engine.backend) {
@@ -671,6 +675,31 @@ impl TurboQuantEngine {
             // is pre-allocated in GROW_SLOTS increments.  Correct len to the actual number
             // of populated slots so that the next alloc_slot() returns the right index.
             let slot_count = engine.id_pool.slot_count();
+            // Consistency check (#102): a truncated or lost live_codes.bin leaves a store
+            // whose ID pool references slots the file no longer holds.  Without this the
+            // mismatch surfaces much later as an out-of-bounds slice on the first query —
+            // a panic, which PyO3 turns into an uncatchable `PanicException`.  Writes are
+            // ordered so the ID pool is never persisted ahead of the codes it references
+            // (see `flush_for_close`), so once the backend copy has had its chance a
+            // shortfall here means a damaged store.
+            restore_slab_from_backend(
+                &engine.backend,
+                local_dir,
+                "live_codes.bin",
+                slot_count,
+                &mut engine.live_codes,
+            )?;
+            check_slab_covers_slots("live_codes.bin", slot_count, &engine.live_codes, local_dir)?;
+            if let Some(vraw) = engine.live_vraw.as_mut() {
+                restore_slab_from_backend(
+                    &engine.backend,
+                    local_dir,
+                    "live_vectors.bin",
+                    slot_count,
+                    vraw,
+                )?;
+                check_slab_covers_slots("live_vectors.bin", slot_count, vraw, local_dir)?;
+            }
             engine.live_codes.set_len(slot_count);
             if let Some(vraw) = engine.live_vraw.as_mut() {
                 vraw.set_len(slot_count);
@@ -1407,6 +1436,7 @@ impl TurboQuantEngine {
         include_metadata: bool,
         include_document: bool,
     ) -> Result<Vec<Vec<SearchResult>>, Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_live_slabs_intact()?;
         let use_ann = use_ann_opt.unwrap_or_else(|| self.auto_use_ann());
         // Blocked batch scorer: one pass through codes scores all Q queries simultaneously.
         // Reduces memory traffic Q×N×stride → N×stride at the cost of sequential access.
@@ -1566,6 +1596,7 @@ impl TurboQuantEngine {
         n_refinements: usize,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.flush_wal_to_segment()?;
+        self.ensure_live_slabs_intact()?;
         let mut id_slot_pairs = self.live_iter_id_slots();
         if id_slot_pairs.is_empty() {
             return Ok(());
@@ -2037,6 +2068,7 @@ impl TurboQuantEngine {
         if self.id_pool.active_count() == 0 || top_k == 0 {
             return Ok(Vec::new());
         }
+        self.ensure_live_slabs_intact()?;
 
         // When normalize=true, L2-normalise the query so IP ≡ cosine similarity.
         let normalized_query;
@@ -3201,7 +3233,18 @@ impl TurboQuantEngine {
         Ok(())
     }
 
+    /// Flush every pending write and release all file handles and memory maps.
+    ///
+    /// Terminal and idempotent: a second call is a no-op, and any other operation
+    /// on the engine afterwards fails with "database is closed" rather than
+    /// silently reopening a handle.  Releasing the mappings here (rather than
+    /// leaving them to `Drop`) is what lets the caller resize, replace or delete
+    /// the store's files as soon as `close()` returns — on Windows a live mapping
+    /// section makes that fail with os error 1224 / `[Errno 22]` (issue #102).
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.closed {
+            return Ok(());
+        }
         self.flush_for_close()
             .map_err(|e| format!("close: flush_for_close failed: {e}"))?;
         // Trim pre-allocated capacity to the exact slot count so the on-disk and
@@ -3231,6 +3274,14 @@ impl TurboQuantEngine {
         self.segments
             .drop_all()
             .map_err(|e| format!("close: segments.drop_all failed: {e}"))?;
+        // Release the mappings last: flush_for_close() reopens live_codes.bin and
+        // truncate_to() remaps it, so anything earlier would be undone.
+        self.live_codes.release_handles();
+        if let Some(vraw) = &mut self.live_vraw {
+            vraw.release_handles();
+        }
+        self.graph.release_mmap();
+        self.closed = true;
         Ok(())
     }
 
@@ -3493,6 +3544,7 @@ impl TurboQuantEngine {
         if n_clusters == 0 {
             return Err("create_coarse_index requires n_clusters >= 1".into());
         }
+        self.ensure_live_slabs_intact()?;
         let active_slots = self.id_pool.iter_active_slots();
         if active_slots.is_empty() {
             return Ok(());
@@ -3572,6 +3624,7 @@ impl TurboQuantEngine {
         if self.id_pool.active_count() == 0 || top_k == 0 {
             return Ok(Vec::new());
         }
+        self.ensure_live_slabs_intact()?;
 
         // Apply the same query normalisation that the main search path does.
         let normalized_query;
@@ -3846,6 +3899,53 @@ impl TurboQuantEngine {
     }
     fn live_active_count(&self) -> usize {
         self.id_pool.active_count()
+    }
+
+    /// Returns `true` once [`close`](Self::close) has released this engine's
+    /// file handles and memory maps.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Guard every code-reading path against a live slab that no longer covers
+    /// the slots the ID pool references (issue #102).
+    ///
+    /// `open_with_options` rejects a store that is already damaged on disk; this
+    /// catches the same shortfall arising while the database is open — a lost
+    /// file, or a query issued after `close()` released the mappings.  Reporting
+    /// it as an error keeps the failure catchable from Python: an out-of-bounds
+    /// slice would panic, and PyO3 turns a panic into `PanicException`, which
+    /// inherits from `BaseException` and so slips past `except Exception`.
+    fn ensure_live_slabs_intact(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.closed {
+            return Err("database is closed: reopen it before running queries".into());
+        }
+        let slot_count = self.id_pool.slot_count();
+        let need = slot_count.saturating_mul(self.live_stride());
+        if self.live_codes.mapped_len() < need {
+            return Err(format!(
+                "corrupt store at {}: live_codes.bin maps {} bytes but {} slots require {} bytes. The file was truncated or lost - restore it from a backup or re-ingest this collection.",
+                self.local_dir,
+                self.live_codes.mapped_len(),
+                slot_count,
+                need,
+            )
+            .into());
+        }
+        if let Some(vraw) = &self.live_vraw {
+            let need = slot_count.saturating_mul(self.live_vraw_stride());
+            if vraw.mapped_len() < need {
+                return Err(format!(
+                    "corrupt store at {}: live_vectors.bin maps {} bytes but {} slots require {} bytes. The file was truncated or lost - restore it from a backup or re-ingest this collection.",
+                    self.local_dir,
+                    vraw.mapped_len(),
+                    slot_count,
+                    need,
+                )
+                .into());
+            }
+        }
+        Ok(())
     }
 
     fn live_codes_at_slot(&self, slot: usize) -> (Vec<CodeIndex>, &[u8], f32, f32) {
@@ -4919,6 +5019,61 @@ fn save_id_pool(
     std::fs::write(&local, &bytes)?;
     backend.write(ID_POOL_FILE, &bytes)?;
     Ok(())
+}
+
+/// Refill a live slab from the storage backend when the local file is too short.
+///
+/// Cloud backends hold the authoritative copy remotely but mmap the local cache
+/// directly, so a cold cache can leave `live_codes.bin` empty even though
+/// `live_ids.bin` was just fetched from the backend by `load_id_pool`.  Pull the
+/// backend copy before treating the shortfall as corruption.  A local backend
+/// rooted at the same directory reads back the file we already have, finds it no
+/// longer, and changes nothing.
+fn restore_slab_from_backend(
+    backend: &Arc<StorageBackend>,
+    local_dir: &str,
+    file_name: &str,
+    slot_count: usize,
+    slab: &mut LiveCodesFile,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if slab.capacity() >= slot_count {
+        return Ok(());
+    }
+    let stride = slab.stride();
+    let Ok(bytes) = backend.read(file_name) else {
+        return Ok(());
+    };
+    if bytes.len() < slot_count.saturating_mul(stride) {
+        return Ok(()); // backend copy is no better than the local one
+    }
+    let path = Path::new(local_dir).join(file_name);
+    slab.release_handles();
+    std::fs::write(&path, &bytes)?;
+    *slab = LiveCodesFile::open(path, stride)?;
+    Ok(())
+}
+
+/// Verify that a memory-mapped slab is large enough to hold `slot_count` slots.
+///
+/// Reports a damaged store as a normal error instead of letting a later slice
+/// index past the end of the mapping and panic (issue #102).
+fn check_slab_covers_slots(
+    file_name: &str,
+    slot_count: usize,
+    slab: &LiveCodesFile,
+    local_dir: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if slab.capacity() >= slot_count {
+        return Ok(());
+    }
+    let stride = slab.stride();
+    Err(format!(
+        "corrupt store at {local_dir}: {file_name} holds {} slots ({} bytes) but live_ids.bin references {slot_count} slots ({} bytes at {stride} bytes/slot). The file was truncated or lost - restore it from a backup or re-ingest this collection.",
+        slab.capacity(),
+        slab.capacity() * stride,
+        slot_count * stride,
+    )
+    .into())
 }
 
 fn load_id_pool(

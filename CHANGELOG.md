@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.8.5] — 2026-09-05
+
+### Fixed
+
+- **`close()` now releases memory maps deterministically** ([#102](https://github.com/jyunming/TurboQuantDB/issues/102)). The mapping of `live_codes.bin` / `live_vectors.bin` (and `graph.bin`) previously survived `close()` until the Python object was garbage-collected. On Windows that made any later *resize* of a store file fail with `[Errno 22] Invalid argument` / os error 1224 (`The requested operation cannot be performed on a file with a user-mapped section open`) — so a long-lived process holding a closed `Database` could leave a collection permanently unwritable. `close()` is now terminal and idempotent: it releases every handle, a second call is a no-op, and any other call on a closed database raises `RuntimeError("database is closed: ...")` instead of silently reopening a handle.
+- **A truncated or lost `live_codes.bin` is now reported instead of panicking** ([#102](https://github.com/jyunming/TurboQuantDB/issues/102)). Opening a store whose live-codes file is shorter than the slot count recorded in `live_ids.bin` used to succeed and then panic on the first query (`range end index N out of range for slice of length 0`). PyO3 surfaces a panic as `PanicException`, which inherits from `BaseException` and therefore slips past `except Exception`, killing request handlers and worker threads. `open()` now fails fast with a `RuntimeError` naming the file, the expected byte count and the actual one, and every code-reading path (brute-force, batch, ANN, IVF, index builds) re-checks the mapping and returns a normal error.
+
+### Added
+
+- **`Database` is a context manager** — `with Database.open(...) as db:` closes the database on block exit, including when the block raises.
+
 ## [0.8.4] — 2026-05-19
 
 ### Changed

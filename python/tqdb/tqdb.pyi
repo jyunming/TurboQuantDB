@@ -408,7 +408,20 @@ class Database:
         ...
 
     def close(self) -> None:
-        """Flush pending data and release all file handles."""
+        """Flush pending data and release every file handle and memory map.
+
+        Deterministic and terminal: once ``close()`` returns the store's files can
+        be resized, replaced or deleted, and any further call on this object raises
+        ``RuntimeError``. Calling ``close()`` again is a no-op.
+        """
+        ...
+
+    def __enter__(self) -> "Database":
+        """``with Database.open(...) as db:`` — returns the database itself."""
+        ...
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        """Close the database on block exit; never suppresses an exception."""
         ...
 
     # ------------------------------------------------------------------ #
