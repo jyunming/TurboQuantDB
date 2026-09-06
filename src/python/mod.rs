@@ -985,12 +985,27 @@ impl Database {
         ann_search_list_size: Option<usize>,
         rerank_factor: Option<usize>,
     ) -> PyResult<PyObject> {
+        // Same validation as `hybrid={...}` in search(): reject out-of-range knobs
+        // here rather than letting the engine silently clamp them, so a typo in a
+        // tuning session surfaces immediately.
         if let Some(w) = weight {
             if !(0.0..=1.0).contains(&w) || !w.is_finite() {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "weight must be between 0.0 and 1.0, got {w}"
                 )));
             }
+        }
+        if let Some(k) = rrf_k {
+            if k < 1.0 || !k.is_finite() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "rrf_k must be >= 1.0, got {k}"
+                )));
+            }
+        }
+        if oversample == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "oversample must be >= 1",
+            ));
         }
         let q = extract_vec1d(py, &query)?;
         let parsed_filter = parse_pydict(filter)?;
