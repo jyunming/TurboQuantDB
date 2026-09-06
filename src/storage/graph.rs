@@ -118,6 +118,16 @@ impl GraphManager {
         Ok(manager)
     }
 
+    /// Drop the memory map of `graph.bin`.
+    ///
+    /// Required on Windows before the file can be resized, replaced or deleted:
+    /// a live mapping section blocks `SetEndOfFile` (os error 1224) even after
+    /// the `File` handle itself is closed.  `has_index()` reports `false`
+    /// afterwards — reopen the database to run ANN search again.
+    pub fn release_mmap(&mut self) {
+        self.mmap = None;
+    }
+
     /// Number of nodes currently indexed. Returns 0 when no index has been built.
     pub fn node_count(&self) -> usize {
         self.node_count

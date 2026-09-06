@@ -196,6 +196,20 @@ impl LiveCodesFile {
         self.len = len;
     }
 
+    /// Slots the backing file can currently address (`file_size / stride`).
+    ///
+    /// For an intact store this is always `>= len()`: the file is pre-allocated
+    /// in `GROW_SLOTS` chunks and trimmed to the exact slot count on close.  A
+    /// smaller value means the file was truncated behind our back.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Bytes currently mapped — `0` once [`release_handles`] has been called.
+    pub fn mapped_len(&self) -> usize {
+        self.mmap.as_ref().map_or(0, |m| m.len())
+    }
+
     pub fn stride(&self) -> usize {
         self.stride
     }

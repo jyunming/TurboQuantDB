@@ -65,3 +65,80 @@ fn delete_then_reinsert_persists_after_reopen() {
     assert_eq!(got.metadata.get("phase"), Some(&json!(2)));
     assert_eq!(got.document.as_deref(), Some("second"));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #102 — close() must release mappings; a truncated live slab must be
+// reported as an error instead of panicking on the first query.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn close_releases_live_codes_mapping() {
+    // After close() the mapping must be gone so the file can be truncated or
+    // replaced. On Windows a live mapping section fails this with os error 1224.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 16;
+
+    let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+    e.insert("a".into(), &make_vec(d, 1.0), no_meta()).unwrap();
+    e.close().unwrap();
+
+    let codes = dir.path().join("live_codes.bin");
+    std::fs::File::create(&codes).expect("live_codes.bin must be truncatable after close()");
+}
+
+#[test]
+fn close_is_idempotent() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 16;
+
+    let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+    e.insert("a".into(), &make_vec(d, 1.0), no_meta()).unwrap();
+    e.close().unwrap();
+    assert!(e.is_closed());
+    e.close().expect("second close() is a no-op");
+}
+
+#[test]
+fn search_after_close_errors_instead_of_panicking() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 16;
+
+    let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+    e.insert("a".into(), &make_vec(d, 1.0), no_meta()).unwrap();
+    e.close().unwrap();
+
+    let err = e
+        .search(&make_vec(d, 1.0), 1)
+        .expect_err("search on a closed database must return an error");
+    assert!(
+        err.to_string().contains("closed"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn open_reports_truncated_live_codes_instead_of_panicking_later() {
+    // An interrupted write can leave live_codes.bin empty while live_ids.bin
+    // still references its slots. That used to open fine and panic on the first
+    // search ("range end index N out of range for slice of length 0"), which
+    // PyO3 surfaces as an uncatchable PanicException.
+    let dir = tempdir().unwrap();
+    let p = dir.path().to_str().unwrap();
+    let d = 16;
+
+    let mut e = TurboQuantEngine::open(p, p, d, 4, 42).unwrap();
+    e.insert("a".into(), &make_vec(d, 1.0), no_meta()).unwrap();
+    e.close().unwrap();
+
+    std::fs::write(dir.path().join("live_codes.bin"), b"").unwrap();
+
+    let msg = match TurboQuantEngine::open(p, p, d, 4, 42) {
+        Ok(_) => panic!("opening a store with a truncated live_codes.bin must fail"),
+        Err(e) => e.to_string(),
+    };
+    assert!(msg.contains("corrupt store"), "unexpected error: {msg}");
+    assert!(msg.contains("live_codes.bin"), "unexpected error: {msg}");
+}

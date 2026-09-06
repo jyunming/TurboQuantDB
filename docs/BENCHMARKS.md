@@ -40,7 +40,7 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | TurboQuant 2-bit (paper Fig. 5a) | ≈55.0% | ≈70.0% | ≈83.0% | ≈91.0% | ≈96.0% | ≈99.0% | ≈100.0% |
-| **TQDB b=2 rerank=F** | 51.1% | 67.1% | 79.9% | 88.7% | 94.6% | 97.9% | 99.2% |
+| **TQDB b=2 rerank=F** | 51.1% | 67.2% | 79.9% | 88.7% | 94.6% | 97.8% | 99.2% |
 | **TQDB b=2 rerank=T** | 97.1% | 98.2% | 98.2% | 98.2% | 98.2% | 98.2% | 98.2% |
 | TurboQuant 4-bit (paper Fig. 5a) | ≈86.0% | ≈96.0% | ≈99.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
 | **TQDB b=4 rerank=F** | 81.9% | 94.5% | 99.1% | 100.0% | 100.0% | 100.0% | 100.0% |
@@ -51,10 +51,10 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | TurboQuant 2-bit (paper Fig. 5b) | ≈89.5% | ≈98.0% | ≈99.5% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=2 rerank=F** | 83.7% | 95.6% | 99.3% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=2 rerank=F** | 86.2% | 96.6% | 99.7% | 99.9% | 100.0% | 100.0% | 100.0% |
 | **TQDB b=2 rerank=T** | 99.7% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 | TurboQuant 4-bit (paper Fig. 5b) | ≈97.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=4 rerank=F** | 95.8% | 99.6% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=4 rerank=F** | 96.2% | 99.9% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 | **TQDB b=4 rerank=T** | 99.7% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 
 **DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
@@ -62,10 +62,10 @@ Brute-force recall across all three datasets from [arXiv:2504.19874](https://arx
 | Config | @k=1 | @k=2 | @k=4 | @k=8 | @k=16 | @k=32 | @k=64 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | TurboQuant 2-bit (paper Fig. 5c) | ≈90.5% | ≈98.5% | ≈99.5% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=2 rerank=F** | 89.6% | 98.3% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=2 rerank=F** | 90.2% | 97.6% | 99.6% | 100.0% | 100.0% | 100.0% | 100.0% |
 | **TQDB b=2 rerank=T** | 99.7% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 | TurboQuant 4-bit (paper Fig. 5c) | ≈97.5% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% | ≈100.0% |
-| **TQDB b=4 rerank=F** | 96.3% | 99.7% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
+| **TQDB b=4 rerank=F** | 98.0% | 99.7% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 | **TQDB b=4 rerank=T** | 99.7% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% | 100.0% |
 
 All TQDB rows use `fast_mode=True` (MSE-only: all `b` bits go to the MSE codebook, no QJL residual). This is the same allocation as the paper's Figure 5 — b MSE bits/dim. Any residual gap at GloVe k=1 (~0–3%) is attributable to dataset sampling (we use the first 100k vectors from the 1.18M-token corpus; the paper used a random sample). DBpedia results match within 1–2% across all k values.
@@ -80,40 +80,40 @@ All 8 configs — brute-force and ANN (HNSW md=32, ef=128), all using `fast_mode
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 1.4s | — | 6.2 | 197 | 1.39 | 2.06 | 51.1% | 0.651 |
-| b=2 rerank=T | Brute | 5.1s | — | 25.9 | 218 | 2.01 | 2.55 | 97.1% | 0.977 |
-| b=4 rerank=F | Brute | 1.9s | — | 11.0 | 204 | 1.48 | 2.01 | 81.9% | 0.898 |
-| b=4 rerank=T | Brute | 5.5s | — | 30.6 | 223 | 2.44 | 3.18 | 98.7% | 0.994 |
-| b=2 rerank=F | ANN | 1.4s | 9.6s | 14.8 | 230 | 0.57 | 1.22 | 34.3% | 0.421 |
-| b=2 rerank=T | ANN | 4.9s | 15.6s | 34.4 | 254 | 3.25 | 5.42 | 59.3% | 0.596 |
-| b=4 rerank=F | ANN | 1.7s | 9.2s | 19.6 | 232 | 0.38 | 0.82 | 51.1% | 0.548 |
-| b=4 rerank=T | ANN | 5.3s | 15.1s | 39.2 | 257 | 3.24 | 5.62 | 72.4% | 0.728 |
+| b=2 rerank=F | Brute | 2.1s | — | 6.2 | 197 | 3.47 | 6.67 | 51.1% | 0.651 |
+| b=2 rerank=T | Brute | 7.7s | — | 25.8 | 218 | 4.45 | 7.30 | 97.1% | 0.977 |
+| b=4 rerank=F | Brute | 2.6s | — | 10.9 | 204 | 3.51 | 7.19 | 81.9% | 0.898 |
+| b=4 rerank=T | Brute | 7.5s | — | 30.5 | 225 | 5.90 | 10.87 | 98.7% | 0.994 |
+| b=2 rerank=F | ANN | 2.2s | 30.0s | 14.8 | 232 | 0.90 | 2.49 | 33.6% | 0.412 |
+| b=2 rerank=T | ANN | 7.1s | 46.0s | 34.4 | 258 | 4.41 | 12.36 | 59.0% | 0.593 |
+| b=4 rerank=F | ANN | 2.9s | 27.6s | 19.5 | 238 | 0.72 | 2.07 | 52.6% | 0.565 |
+| b=4 rerank=T | ANN | 8.7s | 41.8s | 39.1 | 261 | 4.37 | 13.14 | 72.9% | 0.733 |
 
 **DBpedia OpenAI3 d=1536** (d=1536, 100,000 corpus, 1,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 13.4s | — | 46.9 | 764 | 5.79 | 6.78 | 83.7% | 0.909 |
-| b=2 rerank=T | Brute | 19.3s | — | 193.8 | 964 | 6.63 | 7.63 | 99.7% | 0.999 |
-| b=4 rerank=F | Brute | 15.8s | — | 83.6 | 857 | 9.01 | 9.94 | 95.8% | 0.978 |
-| b=4 rerank=T | Brute | 21.2s | — | 230.4 | 1002 | 9.45 | 10.82 | 99.7% | 0.999 |
-| b=2 rerank=F | ANN | 12.4s | 35.9s | 55.5 | 779 | 4.51 | 7.78 | 80.0% | 0.867 |
-| b=2 rerank=T | ANN | 17.9s | 127.3s | 202.4 | 925 | 6.78 | 11.05 | 96.8% | 0.970 |
-| b=4 rerank=F | ANN | 16.2s | 35.7s | 92.2 | 816 | 3.22 | 5.20 | 90.8% | 0.927 |
-| b=4 rerank=T | ANN | 22.3s | 127.2s | 239.0 | 963 | 4.56 | 7.34 | 95.6% | 0.958 |
+| b=2 rerank=F | Brute | 7.5s | — | 50.2 | 806 | 9.90 | 22.67 | 86.2% | 0.924 |
+| b=2 rerank=T | Brute | 12.6s | — | 197.0 | 956 | 11.41 | 25.55 | 99.7% | 0.999 |
+| b=4 rerank=F | Brute | 13.4s | — | 99.0 | 855 | 21.24 | 40.70 | 96.2% | 0.981 |
+| b=4 rerank=T | Brute | 16.6s | — | 245.9 | 1005 | 21.81 | 38.08 | 99.7% | 0.999 |
+| b=2 rerank=F | ANN | 7.2s | 192.5s | 58.8 | 771 | 6.06 | 14.45 | 81.6% | 0.873 |
+| b=2 rerank=T | ANN | 11.5s | 173.7s | 205.6 | 916 | 8.47 | 16.51 | 95.6% | 0.958 |
+| b=4 rerank=F | ANN | 11.7s | 188.6s | 107.6 | 818 | 4.47 | 10.82 | 91.5% | 0.933 |
+| b=4 rerank=T | ANN | 18.9s | 172.9s | 254.4 | 966 | 7.64 | 16.02 | 96.3% | 0.965 |
 
 **DBpedia OpenAI3 d=3072** (d=3072, 100,000 corpus, 1,000 queries)
 
 | Config | Mode | Ingest | Index | Disk MB | RAM MB | p50 ms | p99 ms | R@1 | MRR |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| b=2 rerank=F | Brute | 45.3s | — | 110.6 | 1452 | 15.59 | 17.98 | 89.6% | 0.945 |
-| b=2 rerank=T | Brute | 52.1s | — | 403.9 | 1844 | 16.60 | 19.55 | 99.7% | 0.999 |
-| b=4 rerank=F | Brute | 50.3s | — | 183.8 | 1526 | 20.97 | 22.55 | 96.3% | 0.981 |
-| b=4 rerank=T | Brute | 61.8s | — | 477.1 | 1924 | 22.32 | 24.44 | 99.7% | 0.999 |
-| b=2 rerank=F | ANN | 43.8s | 60.5s | 119.2 | 1460 | 11.75 | 17.60 | 85.4% | 0.899 |
-| b=2 rerank=T | ANN | 53.8s | 472.2s | 412.5 | 1755 | 18.04 | 29.42 | 96.4% | 0.966 |
-| b=4 rerank=F | ANN | 55.2s | 63.6s | 192.4 | 1533 | 9.36 | 16.66 | 92.2% | 0.939 |
-| b=4 rerank=T | ANN | 68.7s | 526.7s | 485.8 | 1828 | 13.15 | 24.50 | 97.2% | 0.974 |
+| b=2 rerank=F | Brute | 15.0s | — | 99.0 | 1405 | 15.78 | 31.21 | 90.2% | 0.946 |
+| b=2 rerank=T | Brute | 23.9s | — | 392.4 | 1778 | 17.70 | 33.42 | 99.7% | 0.999 |
+| b=4 rerank=F | Brute | 28.6s | — | 196.7 | 1589 | 36.01 | 56.54 | 98.0% | 0.989 |
+| b=4 rerank=T | Brute | 38.3s | — | 490.0 | 1882 | 37.61 | 61.56 | 99.7% | 0.999 |
+| b=2 rerank=F | ANN | 17.0s | 317.7s | 107.6 | 1412 | 13.10 | 29.77 | 85.7% | 0.898 |
+| b=2 rerank=T | ANN | 27.3s | 339.2s | 401.0 | 1705 | 22.61 | 54.59 | 96.3% | 0.965 |
+| b=4 rerank=F | ANN | 30.7s | 345.5s | 205.3 | 1511 | 10.99 | 26.72 | 93.4% | 0.943 |
+| b=4 rerank=T | ANN | 54.9s | 360.1s | 498.6 | 1803 | 25.52 | 51.66 | 96.9% | 0.971 |
 
 **Reproduction:** `maturin develop --release && python benchmarks/paper_recall_bench.py --update-readme --track`  (requires `pip install datasets psutil matplotlib`)
 

@@ -867,11 +867,38 @@ impl Database {
         })
     }
 
+    /// Flush pending data and release every file handle and memory map.
+    ///
+    /// Deterministic and terminal: once ``close()`` returns, the store's files
+    /// can be resized, replaced or deleted (on Windows a live mapping otherwise
+    /// blocks that with ``[Errno 22]`` / os error 1224), and any further call on
+    /// this object raises ``RuntimeError``.  Calling ``close()`` again is a no-op.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| {
-            let mut engine = self.write_engine()?;
+            let mut engine = self.write_engine_even_if_closed()?;
+            if engine.is_closed() {
+                return Ok(());
+            }
             engine.close().map_err(to_py_runtime)
         })
+    }
+
+    /// ``with Database.open(...) as db:`` — closes the database on block exit.
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (exc_type=None, exc_value=None, traceback=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<PyObject>,
+        exc_value: Option<PyObject>,
+        traceback: Option<PyObject>,
+    ) -> PyResult<bool> {
+        let _ = (exc_type, exc_value, traceback);
+        self.close(py)?;
+        Ok(false)
     }
 
     /// `len(db)` — total number of active vectors.
@@ -1186,20 +1213,47 @@ impl Database {
 
 impl Database {
     fn read_engine(&self) -> PyResult<std::sync::RwLockReadGuard<'_, TurboQuantEngine>> {
-        self.engine.read().map_err(|_| {
+        let guard = self.engine.read().map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "database lock poisoned: a previous operation panicked; re-open the database",
             )
-        })
+        })?;
+        if guard.is_closed() {
+            return Err(closed_err());
+        }
+        Ok(guard)
     }
 
     fn write_engine(&self) -> PyResult<std::sync::RwLockWriteGuard<'_, TurboQuantEngine>> {
+        let guard = self.engine.write().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "database lock poisoned: a previous operation panicked; re-open the database",
+            )
+        })?;
+        if guard.is_closed() {
+            return Err(closed_err());
+        }
+        Ok(guard)
+    }
+
+    /// Write guard that is also valid on a closed database — only `close()`
+    /// itself may use it, so that a second `close()` is a no-op instead of an
+    /// error.
+    fn write_engine_even_if_closed(
+        &self,
+    ) -> PyResult<std::sync::RwLockWriteGuard<'_, TurboQuantEngine>> {
         self.engine.write().map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "database lock poisoned: a previous operation panicked; re-open the database",
             )
         })
     }
+}
+
+fn closed_err() -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(
+        "database is closed: every file handle and memory map has been released; re-open it with Database.open()",
+    )
 }
 
 fn get_result_to_py(py: Python<'_>, g: &GetResult) -> PyResult<PyObject> {

@@ -228,12 +228,23 @@ db.update_metadata(
 
 db.stats()                       # dict — see Stats Keys below
 db.flush()                       # flush WAL to a segment file immediately
-db.close()                       # flush and release all file handles
+db.close()                       # flush, release every file handle and memory map;
+                                 # terminal (later calls raise RuntimeError) and idempotent
+
+# Context manager — closes the database on block exit, exceptions included
+with Database.open("./my_db", dimension=1536) as db:
+    db.insert("a", vec)
 
 # Python container protocol
 len(db)                          # int — number of active vectors
 "my-id" in db                    # bool — True if id exists
 ```
+
+`close()` releases the memory maps of `live_codes.bin`, `live_vectors.bin` and
+`graph.bin` immediately rather than at garbage-collection time, so the store's
+files can be resized, moved or deleted as soon as it returns. This matters most
+on Windows, where a live mapping makes a resize fail with `[Errno 22]` /
+os error 1224.
 
 ### Crash Recovery Playbook (WAL)
 
