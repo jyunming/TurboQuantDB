@@ -195,6 +195,13 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      # A release with no perf_history.json entry cannot be reasoned about later:
+      # v0.8.4 shipped without one, leaving a four-month hole in the trend data.
+      # The history is appended by a local `TQDB_TRACK=1` benchmark run, so this
+      # gate is what guarantees the run actually happened before the tag.
+      - name: Require a benchmark history entry for this version
+        run: python3 scripts/ci/check_perf_history.py "${{ steps.version.outputs.VERSION }}"
+
       - name: Extract release notes from CHANGELOG.md
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
