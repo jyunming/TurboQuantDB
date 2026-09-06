@@ -19,6 +19,17 @@ HISTORY = Path(__file__).resolve().parents[2] / "benchmarks" / "perf_history.jso
 PRERELEASE_MARKERS = ("alpha", "beta", "rc")
 
 
+def fail(message: str) -> int:
+    """Emit a GitHub Actions error annotation, plus plain text for local runs.
+
+    `%0A` is how an annotation encodes a newline; the stderr copy converts it back
+    so the message stays readable outside CI.
+    """
+    print(f"::error::{message}")
+    print(message.replace("%0A", "\n"), file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"usage: {argv[0]} <version>", file=sys.stderr)
@@ -29,26 +40,33 @@ def main(argv: list[str]) -> int:
         print(f"pre-release {version} — perf history entry not required")
         return 0
 
+    # This runs as a release gate, so every failure mode has to arrive as a readable
+    # annotation rather than a traceback buried in the job log.
     if not HISTORY.exists():
-        print(f"::error::{HISTORY} is missing", file=sys.stderr)
-        return 1
+        return fail(f"{HISTORY} is missing")
+    try:
+        history = json.loads(HISTORY.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        return fail(f"{HISTORY} could not be read: {exc}")
+    if not isinstance(history, list):
+        return fail(
+            f"{HISTORY} should hold a list of benchmark runs, "
+            f"found {type(history).__name__}"
+        )
 
-    history = json.loads(HISTORY.read_text(encoding="utf-8"))
-    entries = [e for e in history if e.get("version") == version]
+    entries = [e for e in history if isinstance(e, dict) and e.get("version") == version]
     if entries:
-        stamps = ", ".join(sorted(e.get("timestamp", "?")[:10] for e in entries))
+        stamps = ", ".join(sorted(str(e.get("timestamp", "?"))[:10] for e in entries))
         print(f"{version}: {len(entries)} benchmark history entry(ies) on record ({stamps})")
         return 0
 
-    recent = sorted({e.get("version", "?") for e in history})[-5:]
-    print(
-        f"::error::no benchmark history entry for {version}. Run\n"
-        f"  TQDB_TRACK=1 python benchmarks/paper_recall_bench.py --update-readme --track\n"
-        f"and land the updated benchmarks/perf_history.json before tagging.\n"
-        f"Versions on record: {', '.join(recent)}",
-        file=sys.stderr,
+    recent = sorted({str(e.get("version", "?")) for e in history if isinstance(e, dict)})[-5:]
+    return fail(
+        f"no benchmark history entry for {version}. Run%0A"
+        f"  TQDB_TRACK=1 python benchmarks/paper_recall_bench.py --update-readme --track%0A"
+        f"and land the updated benchmarks/perf_history.json before tagging.%0A"
+        f"Versions on record: {', '.join(recent) or '(none)'}"
     )
-    return 1
 
 
 if __name__ == "__main__":
