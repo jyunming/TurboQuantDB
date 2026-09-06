@@ -5070,8 +5070,8 @@ fn check_slab_covers_slots(
     Err(format!(
         "corrupt store at {local_dir}: {file_name} holds {} slots ({} bytes) but live_ids.bin references {slot_count} slots ({} bytes at {stride} bytes/slot). The file was truncated or lost - restore it from a backup or re-ingest this collection.",
         slab.capacity(),
-        slab.capacity() * stride,
-        slot_count * stride,
+        slab.capacity().saturating_mul(stride),
+        slot_count.saturating_mul(stride),
     )
     .into())
 }
