@@ -140,12 +140,14 @@ jobs:
       - name: Run sprint perf gate
         run: python benchmarks/sprint_smoke.py
 
-  # ── Wheel size audit ─────────────────────────────────────────────────────────
+  # ── Wheel size audit (PR canary) ─────────────────────────────────────────────
   # The published wheel bundles two binaries: the Python extension module and the
   # tqdb-server executable. macOS universal2 carries both architectures, so it is
-  # the worst case and the only one worth gating on — if it fits the budget, every
-  # other target does. Mirrors the release workflow's macOS job so the number here
-  # is the number users download.
+  # the worst case worth catching early. One CPython version is enough here: this
+  # job exists to fail a PR that pushes the wheel over budget, not to certify a
+  # release. The authoritative gate runs in release.yml, which measures every
+  # wheel from every platform and Python version after they are all built and
+  # refuses to publish if any exceeds the budget.
   wheel-size:
     name: Wheel size audit (macOS universal2)
     runs-on: macos-latest

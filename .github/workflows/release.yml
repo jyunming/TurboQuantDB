@@ -171,8 +171,25 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: List dist contents
-        run: ls -lh dist/
+      - name: Wheel size audit (every wheel, every Python version)
+        env:
+          BUDGET_MB: "5"
+        run: |
+          set -euo pipefail
+          ls -lh dist/
+          echo "| wheel | MiB |"
+          echo "|---|---:|"
+          over=0
+          for whl in dist/*.whl; do
+            bytes=$(wc -c < "$whl")
+            python3 -c "print('| $(basename "$whl") | %.2f |' % ($bytes/1048576))"
+            python3 -c "import sys; sys.exit(0 if $bytes <= $BUDGET_MB*1048576 else 1)" || over=1
+          done
+          if [ "$over" -ne 0 ]; then
+            echo "::error::a wheel exceeds the ${BUDGET_MB} MiB budget — do not publish"
+            exit 1
+          fi
+          echo "all wheels within the ${BUDGET_MB} MiB budget"
 
       - name: Extract version from tag
         id: version
