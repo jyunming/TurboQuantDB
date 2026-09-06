@@ -14,6 +14,13 @@ crate-type = ["cdylib", "lib"]
 # strings users see from Python), so rustdoc must not try to compile them as Rust.
 doctest = false
 
+[profile.release]
+# Ship without debug symbols: they are dead weight in a wheel (the extension module
+# and the bundled tqdb-server binary are both published, so the symbols are paid for
+# twice) and nothing in the release path consumes them. No codegen change, so
+# quantizer and search performance are unaffected.
+strip = "symbols"
+
 [dependencies]
 # --- Core math (unchanged) ---
 nalgebra = { version = "0.32", features = ["serde-serialize"] }

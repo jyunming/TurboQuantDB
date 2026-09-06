@@ -139,3 +139,54 @@ jobs:
 
       - name: Run sprint perf gate
         run: python benchmarks/sprint_smoke.py
+
+  # ── Wheel size audit ─────────────────────────────────────────────────────────
+  # The published wheel bundles two binaries: the Python extension module and the
+  # tqdb-server executable. macOS universal2 carries both architectures, so it is
+  # the worst case and the only one worth gating on — if it fits the budget, every
+  # other target does. Mirrors the release workflow's macOS job so the number here
+  # is the number users download.
+  wheel-size:
+    name: Wheel size audit (macOS universal2)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build and bundle server binary
+        run: |
+          cargo build --release --manifest-path server/Cargo.toml
+          mkdir -p python/tqdb/_bin
+          cp server/target/release/tqdb-server python/tqdb/_bin/
+
+      - name: Build macOS wheel (universal2)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: universal2-apple-darwin
+          args: --release --out dist -i python
+          sccache: "true"
+
+      - name: Report and enforce the size budget
+        env:
+          BUDGET_MB: "5"
+        run: |
+          set -euo pipefail
+          echo "| wheel | MiB |"
+          echo "|---|---:|"
+          over=0
+          for whl in dist/*.whl; do
+            bytes=$(wc -c < "$whl")
+            mib=$(python -c "print(f'{$bytes/1048576:.2f}')")
+            echo "| $(basename "$whl") | $mib |"
+            python -c "import sys; sys.exit(0 if $bytes <= $BUDGET_MB*1048576 else 1)" || over=1
+          done
+          if [ "$over" -ne 0 ]; then
+            echo "::error::wheel exceeds the ${BUDGET_MB} MiB budget (roadmap: wheel size audit and binary stripping)"
+            exit 1
+          fi
+          echo "all wheels within the ${BUDGET_MB} MiB budget"

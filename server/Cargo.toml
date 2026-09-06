@@ -3,6 +3,13 @@ name = "tqdb-server"
 version = "0.2.0"
 edition = "2021"
 
+[profile.release]
+# Ship without debug symbols: they are dead weight in a wheel (the extension module
+# and the bundled tqdb-server binary are both published, so the symbols are paid for
+# twice) and nothing in the release path consumes them. No codegen change, so
+# quantizer and search performance are unaffected.
+strip = "symbols"
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
