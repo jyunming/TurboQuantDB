@@ -3,6 +3,19 @@ name = "tqdb-server"
 version = "0.2.0"
 edition = "2021"
 
+[profile.release]
+# Ship without debug symbols: they are dead weight in a wheel (the extension module
+# and the bundled tqdb-server binary are both published, so the symbols are paid for
+# twice) and nothing in the release path consumes them. No codegen change, so
+# quantizer and search performance are unaffected.
+strip = "symbols"
+# Cross-crate inlining and dead-code elimination: the wheel budget needs the last
+# few hundred KB, and thin LTO with a single codegen unit is the standard way to
+# get them without touching optimisation level (opt-level stays 3, so this trades
+# compile time for size, not speed — measured neutral-to-faster on the smoke gate).
+lto = "thin"
+codegen-units = 1
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
