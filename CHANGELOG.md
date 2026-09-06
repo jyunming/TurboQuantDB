@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`tqdb.open(path, dimension)`** — a zero-configuration entry point next to `Database.open`. Defaults (`bits=4`, `metric="ip"`, `fast_mode=True`) cover the common case, and reopening an existing store senses every parameter from its `manifest.json`, so `dimension` can be omitted. `Database.open`'s signature is untouched; `tqdb.open` forwards every keyword to it.
+- **`db.explain(query, text, ...)`** — the hybrid ranking with each retriever's verdict attached: `dense_score`, `dense_rank`, `sparse_score`, `sparse_rank` and the `fused_score`, per result. Ordering and fused scores are identical to `search(..., hybrid={...})` with the same arguments — `search_hybrid` is now a projection of the same code path — so the breakdown always explains the ranking you actually get. A `None` score/rank means that leg never surfaced the document.
+
+### Fixed
+
+- **Hybrid rankings are now reproducible.** `bm25::search` and `rrf_fuse` both collected candidates from a `HashMap` and sorted on score alone, so documents with equal scores came back in whatever order that map happened to iterate: the same query could return different rankings, different per-leg ranks, and different fused scores from one call to the next (observed as 3 distinct outputs across 8 identical calls). Ties now break on the internal slot id in both places. Only the order among exactly-tied documents changes.
+
 ---
 
 ## [0.8.5] — 2026-09-06

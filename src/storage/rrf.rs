@@ -54,13 +54,19 @@ pub fn rrf_fuse(lists: &[&[u32]], weights: &[f32], k: f32, top_k: usize) -> Vec<
     }
 
     let mut out: Vec<(u32, f32)> = accum.into_iter().collect();
+    // Ties break on slot so the ranking is reproducible: `accum` is a HashMap, whose
+    // iteration order differs between calls, and score-only comparison would let that
+    // randomness through to the caller (identical query, different ranking).
+    let by_score_then_slot = |a: &(u32, f32), b: &(u32, f32)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    };
     if out.len() > top_k {
-        out.select_nth_unstable_by(top_k - 1, |a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        out.select_nth_unstable_by(top_k - 1, by_score_then_slot);
         out.truncate(top_k);
     }
-    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(by_score_then_slot);
     out
 }
 
@@ -74,6 +80,38 @@ pub const DEFAULT_RRF_OVERSAMPLE: usize = 4;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tied_scores_break_on_slot_deterministically() {
+        // Two lists that give slots 7, 3 and 9 exactly the same RRF contribution.
+        // Without a tie-break the order would follow HashMap iteration and differ
+        // between calls; slots must come back ascending instead.
+        let a: Vec<u32> = vec![7];
+        let b: Vec<u32> = vec![3];
+        let c: Vec<u32> = vec![9];
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..32 {
+            let out = rrf_fuse(&[&a, &b, &c], &[1.0, 1.0, 1.0], 60.0, 3);
+            let ids: Vec<u32> = out.iter().map(|(s, _)| *s).collect();
+            assert_eq!(ids, vec![3, 7, 9], "ties must order by slot ascending");
+            seen.insert(ids);
+        }
+        assert_eq!(seen.len(), 1, "identical inputs must fuse identically");
+    }
+
+    #[test]
+    fn tie_break_also_applies_when_truncating() {
+        // top_k smaller than the tied set: the survivors must be the lowest slots,
+        // not whichever ones select_nth happened to land on.
+        let a: Vec<u32> = vec![5];
+        let b: Vec<u32> = vec![2];
+        let c: Vec<u32> = vec![8];
+        for _ in 0..32 {
+            let out = rrf_fuse(&[&a, &b, &c], &[1.0, 1.0, 1.0], 60.0, 2);
+            let ids: Vec<u32> = out.iter().map(|(s, _)| *s).collect();
+            assert_eq!(ids, vec![2, 5]);
+        }
+    }
 
     #[test]
     fn empty_inputs_return_empty() {

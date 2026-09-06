@@ -226,14 +226,20 @@ impl Bm25Index {
             return Vec::new();
         }
         let mut out: Vec<(u32, f32)> = accum.into_iter().collect();
+        // Ties break on slot: `accum` is a HashMap, so equal scores would otherwise
+        // come back in whatever order that map iterated this time, making the BM25
+        // leg — and every hybrid ranking built on it — differ between identical calls.
+        let by_score_then_slot = |a: &(u32, f32), b: &(u32, f32)| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        };
         // Partial sort: only the top_k entries need to be ordered.
         if out.len() > top_k {
-            out.select_nth_unstable_by(top_k - 1, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            out.select_nth_unstable_by(top_k - 1, by_score_then_slot);
             out.truncate(top_k);
         }
-        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(by_score_then_slot);
         out
     }
 

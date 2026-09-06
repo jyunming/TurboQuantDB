@@ -6,7 +6,7 @@ These stubs cover the Database class exposed via PyO3. Requires Python 3.10+.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -396,6 +396,28 @@ class Database:
             - ``delta_size`` — vectors inserted after last ``create_index()`` (delta overlay)
             - ``live_codes_bytes`` — size of the in-memory codes buffer
             - ``ram_estimate_bytes`` — estimated in-memory footprint
+        """
+        ...
+
+    def explain(
+        self,
+        query: object,
+        text: str,
+        top_k: int = 10,
+        weight: Optional[float] = None,
+        rrf_k: Optional[float] = None,
+        oversample: Optional[int] = None,
+        filter: Optional[Dict[str, Any]] = None,
+        _use_ann: Optional[bool] = None,
+        ann_search_list_size: Optional[int] = None,
+        rerank_factor: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Explain a hybrid query: fused ranking plus each retriever's own verdict.
+
+        Same ordering as ``search(..., hybrid={"text": text, "weight": weight})``.
+        Each dict carries ``id``, ``score``/``fused_score``, ``dense_score``,
+        ``dense_rank``, ``sparse_score``, ``sparse_rank``, ``metadata`` and
+        ``document``; a ``None`` score/rank means that leg never returned the doc.
         """
         ...
 

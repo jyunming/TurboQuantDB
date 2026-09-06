@@ -120,3 +120,111 @@ def test_query_all_empty_texts_falls_back(db):
     out = db.query(emb, n_results=1, hybrid={"texts": ["", ""]})
     assert isinstance(out, list)
     assert len(out) == 2
+
+
+# ---------------------------------------------------------------------------
+# db.explain() — per-retriever score breakdown for hybrid tuning
+# ---------------------------------------------------------------------------
+
+
+def _corpus(tmp, d=16):
+    """Three docs whose dense and sparse rankings deliberately disagree."""
+    instance = Database.open(tmp, dimension=d, bits=4, metric="ip")
+    instance.insert("a", np.ones(d, dtype=np.float32), document="rust vector database quantization")
+    instance.insert("b", (np.arange(d) / d).astype(np.float32), document="python sqlite embedded storage")
+    instance.insert("c", np.full(d, 0.5, dtype=np.float32), document="rust storage engine")
+    return instance
+
+
+def test_explain_returns_per_leg_breakdown():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_ = _corpus(tmp)
+        rows = db_.explain(np.ones(16, dtype=np.float32), text="rust storage", top_k=3)
+        assert len(rows) == 3
+        for r in rows:
+            for key in (
+                "id", "score", "fused_score", "dense_score", "dense_rank",
+                "sparse_score", "sparse_rank", "metadata", "document",
+            ):
+                assert key in r, f"missing {key}"
+            assert r["score"] == r["fused_score"]
+        # Fused scores are returned best-first.
+        assert [r["fused_score"] for r in rows] == sorted(
+            (r["fused_score"] for r in rows), reverse=True
+        )
+        db_.close()
+
+
+def test_explain_matches_search_ordering_and_scores():
+    """The card's contract: same params -> same ordering as search(hybrid=...)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_ = _corpus(tmp)
+        q = np.ones(16, dtype=np.float32)
+        explained = db_.explain(q, text="rust storage", top_k=3)
+        searched = db_.search(q, 3, hybrid={"text": "rust storage"})
+        assert [r["id"] for r in explained] == [r["id"] for r in searched]
+        for e, s in zip(explained, searched):
+            assert e["fused_score"] == s["score"]
+        db_.close()
+
+
+def test_hybrid_ranking_is_deterministic_across_calls():
+    """Regression: BM25 and RRF collected from HashMaps and sorted on score alone,
+    so tied documents came back in whatever order the map iterated — identical
+    queries produced different rankings and different fused scores."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_ = _corpus(tmp)
+        q = np.ones(16, dtype=np.float32)
+        seen = {
+            tuple(
+                (r["id"], round(r["fused_score"], 12), r["dense_rank"], r["sparse_rank"])
+                for r in db_.explain(q, text="rust storage", top_k=3)
+            )
+            for _ in range(20)
+        }
+        assert len(seen) == 1, f"hybrid ranking is not reproducible: {seen}"
+        db_.close()
+
+
+def test_explain_marks_missing_leg_as_none():
+    """A doc only the dense leg can reach has no sparse score, and vice versa."""
+    with tempfile.TemporaryDirectory() as tmp:
+        d = 16
+        db_ = Database.open(tmp, dimension=d, bits=4, metric="ip")
+        db_.insert("dense_only", np.ones(d, dtype=np.float32), document="alpha")
+        db_.insert("sparse_only", -np.ones(d, dtype=np.float32), document="zebra quokka")
+        rows = {r["id"]: r for r in db_.explain(np.ones(d, dtype=np.float32), text="zebra", top_k=2)}
+        assert rows["dense_only"]["sparse_score"] is None
+        assert rows["dense_only"]["sparse_rank"] is None
+        assert rows["dense_only"]["dense_rank"] == 1
+        assert rows["sparse_only"]["sparse_rank"] == 1
+        db_.close()
+
+
+def test_explain_rejects_weight_outside_unit_interval():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_ = _corpus(tmp)
+        with pytest.raises(ValueError, match="weight"):
+            db_.explain(np.ones(16, dtype=np.float32), text="rust", weight=1.5)
+        db_.close()
+
+
+def test_explain_dimension_mismatch_raises():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_ = _corpus(tmp)
+        with pytest.raises(ValueError, match="dimension mismatch"):
+            db_.explain(np.ones(4, dtype=np.float32), text="rust")
+        db_.close()
+
+
+def test_explain_honours_metadata_filter():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = 16
+        db_ = Database.open(tmp, dimension=d, bits=4, metric="ip")
+        db_.insert("keep", np.ones(d, dtype=np.float32), {"lang": "rust"}, document="storage engine")
+        db_.insert("drop", np.ones(d, dtype=np.float32), {"lang": "python"}, document="storage engine")
+        rows = db_.explain(
+            np.ones(d, dtype=np.float32), text="storage", top_k=5, filter={"lang": "rust"}
+        )
+        assert [r["id"] for r in rows] == ["keep"]
+        db_.close()

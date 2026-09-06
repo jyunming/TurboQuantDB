@@ -327,6 +327,27 @@ pub struct SearchResult {
     pub document: Option<String>,
 }
 
+/// A fused hybrid result together with where each retriever placed it.
+///
+/// `score` is the fused RRF score — identical to what `search_hybrid` returns for
+/// the same query. `dense_*` / `sparse_*` are `None` when that retriever did not
+/// return the document at all (RRF simply contributes nothing for it).
+#[derive(Debug, Clone)]
+pub struct HybridExplanation {
+    pub id: String,
+    pub score: f64,
+    pub metadata: HashMap<String, JsonValue>,
+    pub document: Option<String>,
+    /// Inner-product / cosine score from the dense leg.
+    pub dense_score: Option<f64>,
+    /// 1-based position within the dense leg's ranking.
+    pub dense_rank: Option<usize>,
+    /// BM25 score from the sparse leg.
+    pub sparse_score: Option<f32>,
+    /// 1-based position within the BM25 leg's ranking.
+    pub sparse_rank: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DbStats {
     pub vector_count: u64,
@@ -1042,6 +1063,7 @@ impl TurboQuantEngine {
     /// (`0.5` weight, `60.0` k, `4×` oversample) that match the documented hybrid
     /// behaviour.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn search_hybrid(
         &self,
         query_vec: &Array1<f64>,
@@ -1058,6 +1080,87 @@ impl TurboQuantEngine {
         include_metadata: bool,
         include_document: bool,
     ) -> Result<Vec<SearchResult>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .hybrid_ranked(
+                query_vec,
+                query_text,
+                top_k,
+                filter,
+                ann_search_list_size,
+                use_ann,
+                rerank_factor,
+                text_weight,
+                rrf_k,
+                oversample,
+                include_id,
+                include_metadata,
+                include_document,
+            )?
+            .into_iter()
+            .map(|e| SearchResult {
+                id: e.id,
+                score: e.score,
+                metadata: e.metadata,
+                document: e.document,
+            })
+            .collect())
+    }
+
+    /// Hybrid search with the per-retriever provenance of every fused result.
+    ///
+    /// Same ranking as [`search_hybrid`](Self::search_hybrid) — that method is a
+    /// projection of this one — plus, for each result, the score and 1-based rank
+    /// it held in the dense and BM25 legs. A `None` on either side means that
+    /// retriever did not surface the document at all, which is the thing hybrid
+    /// tuning most often needs to see.
+    #[allow(clippy::too_many_arguments)]
+    pub fn explain_hybrid(
+        &self,
+        query_vec: &Array1<f64>,
+        query_text: &str,
+        top_k: usize,
+        filter: Option<&HashMap<String, JsonValue>>,
+        ann_search_list_size: Option<usize>,
+        use_ann: bool,
+        rerank_factor: Option<usize>,
+        text_weight: Option<f32>,
+        rrf_k: Option<f32>,
+        oversample: Option<usize>,
+    ) -> Result<Vec<HybridExplanation>, Box<dyn std::error::Error + Send + Sync>> {
+        self.hybrid_ranked(
+            query_vec,
+            query_text,
+            top_k,
+            filter,
+            ann_search_list_size,
+            use_ann,
+            rerank_factor,
+            text_weight,
+            rrf_k,
+            oversample,
+            true,
+            true,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hybrid_ranked(
+        &self,
+        query_vec: &Array1<f64>,
+        query_text: &str,
+        top_k: usize,
+        filter: Option<&HashMap<String, JsonValue>>,
+        ann_search_list_size: Option<usize>,
+        use_ann: bool,
+        rerank_factor: Option<usize>,
+        text_weight: Option<f32>,
+        rrf_k: Option<f32>,
+        oversample: Option<usize>,
+        include_id: bool,
+        include_metadata: bool,
+        include_document: bool,
+    ) -> Result<Vec<HybridExplanation>, Box<dyn std::error::Error + Send + Sync>> {
         if top_k == 0 {
             return Ok(Vec::new());
         }
@@ -1101,6 +1204,22 @@ impl TurboQuantEngine {
         let bm25_slots: Vec<u32> = bm25_r
             .iter()
             .filter_map(|(id, _)| self.id_pool.get_slot(id))
+            .collect();
+
+        // Provenance for explain(): each leg's own score and 1-based rank, keyed by
+        // slot. Built from the same lists that feed rrf_fuse, so a rank here is
+        // exactly the rank the fusion saw. Cheap next to the retrieval itself.
+        let dense_provenance: HashMap<u32, (f64, usize)> = dense_r
+            .iter()
+            .filter_map(|r| self.id_pool.get_slot(&r.id).map(|slot| (slot, r.score)))
+            .enumerate()
+            .map(|(i, (slot, score))| (slot, (score, i + 1)))
+            .collect();
+        let sparse_provenance: HashMap<u32, (f32, usize)> = bm25_r
+            .iter()
+            .filter_map(|(id, score)| self.id_pool.get_slot(id).map(|slot| (slot, *score)))
+            .enumerate()
+            .map(|(i, (slot, score))| (slot, (score, i + 1)))
             .collect();
 
         let fused = rrf_fuse(
@@ -1154,7 +1273,9 @@ impl TurboQuantEngine {
                     continue;
                 }
             }
-            out.push(SearchResult {
+            let dense = dense_provenance.get(&slot).copied();
+            let sparse = sparse_provenance.get(&slot).copied();
+            out.push(HybridExplanation {
                 id: if include_id { id } else { String::new() },
                 score: fused_score as f64,
                 metadata: if include_metadata {
@@ -1163,6 +1284,10 @@ impl TurboQuantEngine {
                     HashMap::new()
                 },
                 document: if include_document { document } else { None },
+                dense_score: dense.map(|(score, _)| score),
+                dense_rank: dense.map(|(_, rank)| rank),
+                sparse_score: sparse.map(|(score, _)| score),
+                sparse_rank: sparse.map(|(_, rank)| rank),
             });
         }
         Ok(out)

@@ -1251,3 +1251,48 @@ class TestRecallQualityGate:
         finally:
             if real_mod is not None:
                 sys.modules["tqdb.tqdb"] = real_mod
+
+
+# ---------------------------------------------------------------------------
+# tqdb.open() — the one-liner entry point
+# ---------------------------------------------------------------------------
+
+
+def test_module_level_open_creates_and_reopens(tmp_path):
+    import tqdb
+
+    path = str(tmp_path / "one_liner")
+    db = tqdb.open(path, 16)
+    db.insert("a", np.ones(16, dtype=np.float32))
+    assert db.count() == 1
+    db.close()
+
+    # Reopen with no parameters at all — everything sensed from manifest.json.
+    reopened = tqdb.open(path)
+    assert reopened.count() == 1
+    assert reopened.stats()["dimension"] == 16
+    reopened.close()
+
+
+def test_module_level_open_forwards_kwargs(tmp_path):
+    import tqdb
+
+    db = tqdb.open(str(tmp_path / "kw"), 16, bits=8, metric="cosine")
+    stats = db.stats()
+    assert stats["bits"] == 8
+    assert stats["metric"] == "cosine"
+    db.close()
+
+
+def test_module_level_open_requires_dimension_for_new_db(tmp_path):
+    import tqdb
+
+    with pytest.raises(ValueError, match="dimension"):
+        tqdb.open(str(tmp_path / "missing_dim"))
+
+
+def test_module_level_open_is_exported():
+    import tqdb
+
+    assert "open" in tqdb.__all__
+    assert tqdb.open.__module__ == "tqdb"
