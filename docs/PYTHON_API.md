@@ -226,6 +226,16 @@ db.update_metadata(
     document=None,               # str | None — replaces document; None = keep existing
 )
 
+db.explain(                      # hybrid ranking + per-retriever provenance
+    query,                       # dense query vector
+    text,                        # BM25 query string
+    top_k=10,
+    weight=None,                 # BM25 weight in [0,1]; dense gets 1-weight (default 0.5)
+    rrf_k=None,                  # RRF smoothing constant (default 60.0)
+    oversample=None,             # per-leg fan-out multiplier before fusion (default 4)
+    filter=None,                 # same filter syntax as search()
+)                                # -> list of dicts, best-first
+
 db.stats()                       # dict — see Stats Keys below
 db.flush()                       # flush WAL to a segment file immediately
 db.close()                       # flush, release every file handle and memory map;
@@ -245,6 +255,26 @@ len(db)                          # int — number of active vectors
 files can be resized, moved or deleted as soon as it returns. This matters most
 on Windows, where a live mapping makes a resize fail with `[Errno 22]` /
 os error 1224.
+
+### Explaining a hybrid ranking
+
+`search(..., hybrid={...})` returns only the fused score, which makes tuning `weight`
+guesswork. `explain()` runs the identical query — same ordering, same fused scores —
+and keeps the provenance instead of discarding it:
+
+```python
+for r in db.explain(qvec, text="WAL replay error", top_k=3, weight=0.3):
+    print(r["id"], r["fused_score"], r["dense_score"], r["dense_rank"],
+          r["sparse_score"], r["sparse_rank"])
+```
+
+Each row carries `id`, `score` (also as `fused_score`), `dense_score`, `dense_rank`,
+`sparse_score`, `sparse_rank`, `metadata` and `document`. Ranks are 1-based within
+their own leg. A `None` score/rank means that retriever never returned the document,
+so RRF contributed nothing for it — the usual explanation for a surprising result.
+
+Rankings are reproducible: documents with identical scores break ties on their
+internal slot, so the same query returns the same order every time.
 
 ### Crash Recovery Playbook (WAL)
 

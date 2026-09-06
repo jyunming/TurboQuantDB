@@ -10,6 +10,9 @@ homepage = "https://github.com/jyunming/TurboQuantDB"
 [lib]
 name = "tqdb"
 crate-type = ["cdylib", "lib"]
+# The doc examples in src/python/mod.rs are Python (they become the PyO3 __doc__
+# strings users see from Python), so rustdoc must not try to compile them as Rust.
+doctest = false
 
 [dependencies]
 # --- Core math (unchanged) ---

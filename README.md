@@ -38,6 +38,19 @@ Optional integration extras: `tqdb[langchain]`, `tqdb[llamaindex]`, `tqdb[migrat
 
 ## Quick Start
 
+Five lines, no domain knowledge — `tqdb.open` picks the defaults:
+
+```python
+import numpy as np, tqdb
+
+embedding = np.random.rand(1536).astype("f4")   # your embedding model's output
+db = tqdb.open("./my_db", 1536)                 # reopen later with just tqdb.open("./my_db")
+db.insert("doc1", embedding, document="Rust uses ownership for memory safety.")
+print(db.search(embedding, top_k=5))
+```
+
+The full version, with a real embedding model and every knob spelled out:
+
 ```python
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -189,6 +202,15 @@ results = db.search(
 ```
 
 Omit `hybrid=` for pure dense search — behaviour is unchanged. The BM25 index builds incrementally as documents are inserted; no separate `train()` or `build_text_index()` call required.
+
+Tuning `weight` blind is guesswork, so `explain()` returns the same ranking with each retriever's own verdict attached — which leg found the document, and where it placed it:
+
+```python
+for r in db.explain(query_vec, text="error message WAL replay", top_k=3):
+    print(r["id"], r["fused_score"], r["dense_rank"], r["sparse_rank"])
+```
+
+A `None` rank means that retriever never surfaced the document at all — usually the first thing worth knowing when a result looks wrong.
 
 ---
 

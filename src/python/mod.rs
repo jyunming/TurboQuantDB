@@ -944,6 +944,126 @@ impl Database {
         })
     }
 
+    /// Explain a hybrid query: the fused ranking plus each retriever's own verdict.
+    ///
+    /// Ordering is identical to ``search(..., hybrid={"text": ...})`` with the same
+    /// arguments — this is that call with the provenance kept instead of discarded.
+    ///
+    /// Args:
+    ///     query: Dense query vector.
+    ///     text: Query string for the BM25 leg.
+    ///     top_k: Number of fused results to return. Default ``10``.
+    ///     weight: BM25 weight in ``[0, 1]``; the dense leg gets ``1 - weight``.
+    ///         Default ``0.5``, matching ``hybrid={"weight": ...}``.
+    ///     rrf_k: RRF smoothing constant. Default ``60.0``.
+    ///     oversample: Per-leg fan-out multiplier before fusion. Default ``4``.
+    ///     filter: Metadata filter, same syntax as :meth:`search`.
+    ///
+    /// Returns:
+    ///     A list of dicts, best-first, each with ``id``, ``score`` (the fused
+    ///     score, also exposed as ``fused_score``), ``dense_score``, ``dense_rank``,
+    ///     ``sparse_score``, ``sparse_rank``, ``metadata`` and ``document``.
+    ///     A ``None`` score/rank means that retriever never surfaced the document.
+    ///
+    /// Example::
+    ///
+    ///     for r in db.explain(qvec, text="rust vector database", top_k=3):
+    ///         print(r["id"], r["fused_score"], r["dense_rank"], r["sparse_rank"])
+    #[pyo3(signature = (query, text, top_k=10, weight=None, rrf_k=None, oversample=None, filter=None, _use_ann=None, ann_search_list_size=None, rerank_factor=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn explain(
+        &self,
+        py: Python<'_>,
+        query: PyObject,
+        text: String,
+        top_k: usize,
+        weight: Option<f32>,
+        rrf_k: Option<f32>,
+        oversample: Option<usize>,
+        filter: Option<&Bound<'_, PyDict>>,
+        _use_ann: Option<bool>,
+        ann_search_list_size: Option<usize>,
+        rerank_factor: Option<usize>,
+    ) -> PyResult<PyObject> {
+        // Same validation as `hybrid={...}` in search(): reject out-of-range knobs
+        // here rather than letting the engine silently clamp them, so a typo in a
+        // tuning session surfaces immediately.
+        if let Some(w) = weight {
+            if !(0.0..=1.0).contains(&w) || !w.is_finite() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "weight must be between 0.0 and 1.0, got {w}"
+                )));
+            }
+        }
+        if let Some(k) = rrf_k {
+            if k < 1.0 || !k.is_finite() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "rrf_k must be >= 1.0, got {k}"
+                )));
+            }
+        }
+        if oversample == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "oversample must be >= 1",
+            ));
+        }
+        let q = extract_vec1d(py, &query)?;
+        let parsed_filter = parse_pydict(filter)?;
+        if !parsed_filter.is_empty() {
+            crate::storage::engine::filter::validate_filter_operators(&parsed_filter)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        }
+        let filter_ref = if parsed_filter.is_empty() {
+            None
+        } else {
+            Some(&parsed_filter)
+        };
+        let explained = py.allow_threads(|| {
+            let engine = self.read_engine()?;
+            if q.len() != engine.d {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "query dimension mismatch: expected {}, got {}",
+                    engine.d,
+                    q.len()
+                )));
+            }
+            let use_ann = _use_ann.unwrap_or_else(|| engine.auto_use_ann());
+            engine
+                .explain_hybrid(
+                    &q,
+                    &text,
+                    top_k,
+                    filter_ref,
+                    ann_search_list_size,
+                    use_ann,
+                    rerank_factor,
+                    weight,
+                    rrf_k,
+                    oversample,
+                )
+                .map_err(to_py_runtime)
+        })?;
+        let out = PyList::empty_bound(py);
+        for e in explained {
+            let d = PyDict::new_bound(py);
+            d.set_item("id", &e.id)?;
+            d.set_item("score", e.score)?;
+            d.set_item("fused_score", e.score)?;
+            d.set_item("dense_score", e.dense_score)?;
+            d.set_item("dense_rank", e.dense_rank)?;
+            d.set_item("sparse_score", e.sparse_score)?;
+            d.set_item("sparse_rank", e.sparse_rank)?;
+            let meta = PyDict::new_bound(py);
+            for (k, v) in &e.metadata {
+                meta.set_item(k, json_to_py(py, v)?)?;
+            }
+            d.set_item("metadata", meta)?;
+            d.set_item("document", e.document)?;
+            out.append(d)?;
+        }
+        Ok(out.into())
+    }
+
     /// Search with multiple query vectors in one call.
     ///
     /// Args:
