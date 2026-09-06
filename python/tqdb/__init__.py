@@ -7,8 +7,9 @@ with provably unbiased inner-product estimation via QJL transforms.
 
 Quick start::
 
-    import tqdb
+    import numpy as np, tqdb
 
+    vector = np.random.rand(1536).astype("f4")   # your embedding model's output
     db = tqdb.open("mydb", 1536)
     db.insert("doc1", vector)
     results = db.search(vector, top_k=5)

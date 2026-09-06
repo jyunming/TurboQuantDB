@@ -1063,7 +1063,6 @@ impl TurboQuantEngine {
     /// (`0.5` weight, `60.0` k, `4×` oversample) that match the documented hybrid
     /// behaviour.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn search_hybrid(
         &self,
         query_vec: &Array1<f64>,

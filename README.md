@@ -41,9 +41,10 @@ Optional integration extras: `tqdb[langchain]`, `tqdb[llamaindex]`, `tqdb[migrat
 Five lines, no domain knowledge — `tqdb.open` picks the defaults:
 
 ```python
-import tqdb
+import numpy as np, tqdb
 
-db = tqdb.open("./my_db", 1536)          # reopen later with just tqdb.open("./my_db")
+embedding = np.random.rand(1536).astype("f4")   # your embedding model's output
+db = tqdb.open("./my_db", 1536)                 # reopen later with just tqdb.open("./my_db")
 db.insert("doc1", embedding, document="Rust uses ownership for memory safety.")
 print(db.search(embedding, top_k=5))
 ```
