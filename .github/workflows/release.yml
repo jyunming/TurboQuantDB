@@ -202,6 +202,12 @@ jobs:
       - name: Require a benchmark history entry for this version
         run: python3 scripts/ci/check_perf_history.py "${{ steps.version.outputs.VERSION }}"
 
+      # A change that existing databases cannot survive untouched is not a patch.
+      # v0.8.4 shipped exactly that (dense rotation f32 -> bf16) as z+1, and every
+      # store written by 0.8.3 or earlier failed to open — see issue #110.
+      - name: Reject a Migration section in a patch release
+        run: python3 scripts/ci/check_migration_bump.py "${{ steps.version.outputs.VERSION }}"
+
       - name: Extract release notes from CHANGELOG.md
         run: |
           VERSION="${{ steps.version.outputs.VERSION }}"
