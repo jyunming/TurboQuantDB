@@ -137,12 +137,33 @@ impl TextAnalyzer {
         let stemmer = algorithm_for(&config.language).map(Stemmer::create);
         // An explicit list always wins, including an explicit empty one; `None`
         // falls back to the bundled list for the language (empty if there is none).
-        let stopwords: HashSet<String> = match &config.stopwords {
-            Some(words) => words.iter().map(|w| w.to_lowercase()).collect(),
+        let raw: Vec<String> = match &config.stopwords {
+            Some(words) => words.clone(),
             None => stopwords::for_language(&config.language)
                 .map(|list| list.iter().map(|w| (*w).to_string()).collect())
                 .unwrap_or_default(),
         };
+        // Stopwords are matched against produced tokens, so they must be split the
+        // same way documents are. Without this an entry like "aren't" could never
+        // match: the tokenizer yields "aren" and "t", and both would end up indexed
+        // as ordinary terms. Splitting here also lets a caller pass contractions or
+        // phrases and get what they meant.
+        let split_on_punctuation = config.split_on_punctuation;
+        let stopwords: HashSet<String> = raw
+            .iter()
+            .flat_map(|word| {
+                word.split(move |c: char| {
+                    if split_on_punctuation {
+                        !c.is_alphanumeric()
+                    } else {
+                        c.is_whitespace()
+                    }
+                })
+                .filter(|piece| !piece.is_empty())
+                .map(|piece| piece.to_lowercase())
+                .collect::<Vec<_>>()
+            })
+            .collect();
         Self {
             config,
             stemmer,
@@ -247,7 +268,16 @@ mod tests {
 
     #[test]
     fn unicode_words_kept() {
-        assert_eq!(plain().analyze("cafe resume naive").len(), 3);
+        // Non-ASCII alphanumerics are part of tokens, not separators, and they
+        // exercise the lowercase path that pure-ASCII input skips.
+        let a = plain();
+        assert_eq!(a.analyze("café résumé naïve").len(), 3);
+        assert_eq!(
+            a.analyze("CAFÉ"),
+            a.analyze("café"),
+            "non-ASCII uppercase must fold to the same token"
+        );
+        assert_ne!(a.analyze("café"), a.analyze("cafe"));
     }
 
     #[test]
@@ -336,6 +366,28 @@ mod tests {
         let a = TextAnalyzer::new(cfg);
         // "quick" is a stopword now, and "the" - bundled but not listed - is not.
         assert_eq!(a.analyze("the quick fox"), a.analyze("the fox"));
+    }
+
+    #[test]
+    fn contraction_stopwords_match_the_tokens_they_produce() {
+        // "aren't" tokenizes to "aren" + "t"; both must be dropped, or the list
+        // entry is dead weight and the fragments get indexed as real terms.
+        let a = english();
+        assert!(a.analyze("aren't").is_empty());
+        assert!(a.analyze("AREN'T").is_empty());
+        assert_eq!(a.analyze("they aren't going"), a.analyze("going"));
+    }
+
+    #[test]
+    fn user_supplied_contractions_are_split_too() {
+        let cfg = AnalyzerConfig {
+            language: "none".into(),
+            stopwords: Some(vec!["don't".into()]),
+            split_on_punctuation: true,
+        };
+        let a = TextAnalyzer::new(cfg);
+        assert!(a.analyze("don't").is_empty());
+        assert!(a.analyze("don").is_empty());
     }
 
     #[test]
