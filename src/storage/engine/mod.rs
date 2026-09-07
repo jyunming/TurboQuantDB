@@ -28,6 +28,13 @@ use filter::{
 };
 
 const QUANTIZER_STATE_FILE: &str = "quantizer.bin";
+/// Magic prefix for `quantizer.bin`. Files written before 0.9.1 have no header at
+/// all; see `load_quantizer_state` for how those are told apart from damage.
+const QUANTIZER_MAGIC: &[u8; 4] = b"TQQZ";
+/// Layout version of the bincode payload that follows the magic. Bump this
+/// whenever a field's on-disk representation changes, so the next incompatible
+/// change is reported as a version mismatch instead of a decode failure.
+const QUANTIZER_FORMAT_VERSION: u32 = 1;
 const INDEX_IDS_FILE: &str = "graph_ids.json";
 const DELTA_IDS_FILE: &str = "delta_ids.json";
 const ID_POOL_FILE: &str = "live_ids.bin";
@@ -5111,10 +5118,63 @@ fn save_quantizer_state(
     backend: &Arc<StorageBackend>,
     quantizer: &ProdQuantizer,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let bytes = bincode::serialize(quantizer)?;
+    let payload = bincode::serialize(quantizer)?;
+    let mut bytes = Vec::with_capacity(payload.len() + 8);
+    bytes.extend_from_slice(QUANTIZER_MAGIC);
+    bytes.extend_from_slice(&QUANTIZER_FORMAT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&payload);
     std::fs::write(format!("{}/{}", local_dir, QUANTIZER_STATE_FILE), &bytes)?;
     backend.write(QUANTIZER_STATE_FILE, &bytes)?;
     Ok(())
+}
+
+/// Decode `quantizer.bin`, turning an incompatible layout into a diagnosis.
+///
+/// Three cases:
+/// - **Header present** — check the version, then decode the payload after it.
+/// - **No header, decodes cleanly** — written by 0.8.4 through 0.9.0, still valid.
+/// - **No header, fails to decode** — almost always a database from 0.8.3 or
+///   earlier: 0.8.4 changed the dense Haar QR rotation matrix from f32 to bf16 and
+///   the two layouts are not interchangeable. bincode reports that as
+///   "unexpected end of file", which reads exactly like a truncated file, so say
+///   which one it is instead of leaving the caller to guess.
+fn decode_quantizer_state(
+    bytes: &[u8],
+    path: &str,
+) -> Result<ProdQuantizer, Box<dyn std::error::Error + Send + Sync>> {
+    if bytes.len() >= 8 && &bytes[..4] == QUANTIZER_MAGIC {
+        let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes checked above"));
+        if version > QUANTIZER_FORMAT_VERSION {
+            return Err(format!(
+                "{path} is quantizer format v{version}, but this build of tqdb reads v{QUANTIZER_FORMAT_VERSION}. The database was written by a newer tqdb — upgrade tqdb to open it."
+            )
+            .into());
+        }
+        return Ok(bincode::deserialize(&bytes[8..])?);
+    }
+    bincode::deserialize(bytes).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        quantizer_decode_message(path, &e).into()
+    })
+}
+
+/// Explain a failed decode of a headerless `quantizer.bin`.
+///
+/// Only a short read points at the 0.8.4 layout change: bincode walks the struct
+/// and runs out of bytes where f32 was expected but bf16 was written. Any other
+/// bincode error means the bytes are wrong in some other way, and blaming the
+/// format change would send the reader off to regenerate a database that is
+/// actually damaged.
+fn quantizer_decode_message(path: &str, e: &bincode::Error) -> String {
+    let short_read = matches!(&**e, bincode::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof);
+    if short_read {
+        format!(
+            "could not decode {path}: the file ends before the layout does ({e}). This usually means the database was written by tqdb 0.8.3 or earlier — 0.8.4 changed the dense Haar QR rotation matrix from f32 to bf16 on disk, and the two layouts are not interchangeable. Regenerate the database from its source vectors; see the \"Migration\" section of CHANGELOG 0.8.4. If it was written by 0.8.4 or later, the file is truncated and should be restored from a backup."
+        )
+    } else {
+        format!(
+            "could not decode {path}: {e}. The file is not a valid quantizer state — restore it from a backup, or regenerate the database from its source vectors."
+        )
+    }
 }
 
 fn load_quantizer_state(
@@ -5123,11 +5183,11 @@ fn load_quantizer_state(
 ) -> Result<ProdQuantizer, Box<dyn std::error::Error + Send + Sync>> {
     let local = format!("{}/{}", local_dir, QUANTIZER_STATE_FILE);
     if Path::new(&local).exists() {
-        return Ok(bincode::deserialize(&std::fs::read(&local)?)?);
+        return decode_quantizer_state(&std::fs::read(&local)?, &local);
     }
     if let Ok(bytes) = backend.read(QUANTIZER_STATE_FILE) {
         std::fs::write(&local, &bytes)?;
-        return Ok(bincode::deserialize(&bytes)?);
+        return decode_quantizer_state(&bytes, &local);
     }
     Err("Quantizer state not found".into())
 }

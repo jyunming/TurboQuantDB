@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "d": 8,
+  "b": 4,
+  "seed": 42,
+  "vector_count": 4,
+  "storage_uri": "legacy_fixture",
+  "metric": "ip",
+  "index_state": null,
+  "fast_mode": true,
+  "rerank_enabled": false,
+  "rerank_precision": "disabled",
+  "normalize": false,
+  "quantizer_type": "dense"
+}

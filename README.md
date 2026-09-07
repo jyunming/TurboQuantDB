@@ -442,6 +442,9 @@ Two common causes:
 1. *Forgot to L2-normalize embeddings before insert* — for `metric="ip"` (default), most embedding models expect normalized inputs to make IP scores meaningful (`<a, b> = cos(a, b)` only for unit vectors). Use `model.encode(..., normalize_embeddings=True)` or normalize manually.
 2. *Mixed `metric=` between insert and query* — the metric is fixed at `Database.open` time and cannot be changed without rebuilding.
 
+**`io error: unexpected end of file` when opening a database written by tqdb ≤ 0.8.3**
+The store is not damaged. v0.8.4 changed how the dense rotation matrix is stored in `quantizer.bin` (f32 → bf16) and the layouts are not interchangeable, so the database has to be regenerated from its source vectors. Since v0.9.1 the error says this outright instead of reporting EOF. Note that 0.8.3 used the dense quantizer at every dimension, so every pre-0.8.4 store is affected — not only those below d=1024.
+
 **`[Errno 22] Invalid argument` / os error 1224 when resizing or replacing a DB file on Windows (pre-v0.8.5)**
 `close()` used to leave the memory mapping of `live_codes.bin` in place until the `Database` object was garbage-collected, so a still-referenced closed database blocked any resize of its files. Fixed in v0.8.5 — `close()` now releases every handle immediately, and `Database` is a context manager:
 ```python

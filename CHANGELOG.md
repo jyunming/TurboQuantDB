@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.9.1] — 2026-09-07
+
+### Fixed
+
+- **A database written by tqdb 0.8.3 or earlier now says so instead of reporting EOF** ([#110](https://github.com/jyunming/TurboQuantDB/issues/110)). 0.8.4 changed the dense Haar QR rotation matrix from f32 to bf16 in `quantizer.bin`, and nothing checked the format: opening an older store failed with `RuntimeError: io error: unexpected end of file`, which is indistinguishable from a truncated file. Downstream this was investigated as data corruption across twelve stores, none of which were damaged. `quantizer.bin` now carries a magic and a format version, and a file that cannot be decoded is reported as the format change it almost always is — naming the file, the release that changed it, and the fact that the database must be regenerated, while still allowing that a 0.8.4-or-later file failing to decode really is damaged. Note the affected set is wider than first reported: 0.8.3 defaulted to the dense quantizer at **every** dimension, so all pre-0.8.4 stores are affected, not only those below the d=1024 SRHT threshold.
+
+### Changed
+
+- **A release whose changelog section has a Migration heading can no longer ship as a PATCH.** That is what 0.8.4 did, which is why users met the break without reading release notes. `scripts/ci/check_migration_bump.py` runs in the release workflow and refuses the tag; run against this repository's own history it flags 0.8.4 and passes every other release.
+
+---
+
 ## [0.9.0] — 2026-09-07
 
 ### Added
