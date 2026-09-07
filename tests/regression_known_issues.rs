@@ -175,14 +175,21 @@ fn pre_0_8_4_store_reports_the_format_change_not_an_eof() {
         Err(e) => e.to_string(),
     };
     assert!(msg.contains("quantizer.bin"), "must name the file: {msg}");
-    assert!(msg.contains("0.8.4"), "must name the release that changed it: {msg}");
+    assert!(
+        msg.contains("0.8.4"),
+        "must name the release that changed it: {msg}"
+    );
     assert!(
         msg.contains("Regenerate"),
         "must say what to do about it: {msg}"
     );
     assert!(
-        msg.contains("damaged"),
-        "must acknowledge the corruption case too: {msg}"
+        msg.contains("truncated") && msg.contains("backup"),
+        "must acknowledge the damage case too: {msg}"
+    );
+    assert!(
+        msg.contains("usually means"),
+        "must not assert the cause it cannot prove: {msg}"
     );
 }
 

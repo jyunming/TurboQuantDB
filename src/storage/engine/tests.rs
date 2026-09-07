@@ -3867,3 +3867,39 @@ fn search_batch_many_queries_returns_correct_count() {
         assert_eq!(results.len(), 5, "query {i} must have top_k=5 results");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #110 follow-up: only a short read points at the 0.8.4 layout change.
+// Any other bincode failure means the bytes are wrong some other way, and
+// blaming the format change would send the reader to regenerate a database that
+// is actually damaged.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn short_read_is_blamed_on_the_0_8_4_layout_change() {
+    let err: bincode::Error = Box::new(bincode::ErrorKind::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "unexpected end of file",
+    )));
+    let msg = super::quantizer_decode_message("db/quantizer.bin", &err);
+    assert!(msg.contains("0.8.4"), "{msg}");
+    assert!(msg.contains("Regenerate"), "{msg}");
+    assert!(msg.contains("usually means"), "must not over-assert: {msg}");
+    assert!(msg.contains("truncated"), "must cover the damage case too: {msg}");
+}
+
+#[test]
+fn other_decode_failures_are_reported_as_damage() {
+    for err in [
+        bincode::Error::from(bincode::ErrorKind::SizeLimit),
+        bincode::Error::from(bincode::ErrorKind::InvalidBoolEncoding(7)),
+        bincode::Error::from(bincode::ErrorKind::Io(std::io::Error::other("disk fell over"))),
+    ] {
+        let msg = super::quantizer_decode_message("db/quantizer.bin", &err);
+        assert!(
+            !msg.contains("0.8.4"),
+            "a non-EOF failure must not be blamed on the format change: {msg}"
+        );
+        assert!(msg.contains("not a valid quantizer state"), "{msg}");
+    }
+}

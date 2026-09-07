@@ -5153,11 +5153,28 @@ fn decode_quantizer_state(
         return Ok(bincode::deserialize(&bytes[8..])?);
     }
     bincode::deserialize(bytes).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        format!(
-            "could not decode {path} ({e}). This is what a database written by tqdb 0.8.3 or earlier looks like to this build: 0.8.4 changed the dense Haar QR rotation matrix from f32 to bf16 on disk, and the two layouts are not interchangeable. Regenerate the database from its source vectors — see the \"Migration\" section of CHANGELOG 0.8.4. If it was written by 0.8.4 or later, then quantizer.bin is damaged and should be restored from a backup."
-        )
-        .into()
+        quantizer_decode_message(path, &e).into()
     })
+}
+
+/// Explain a failed decode of a headerless `quantizer.bin`.
+///
+/// Only a short read points at the 0.8.4 layout change: bincode walks the struct
+/// and runs out of bytes where f32 was expected but bf16 was written. Any other
+/// bincode error means the bytes are wrong in some other way, and blaming the
+/// format change would send the reader off to regenerate a database that is
+/// actually damaged.
+fn quantizer_decode_message(path: &str, e: &bincode::Error) -> String {
+    let short_read = matches!(&**e, bincode::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof);
+    if short_read {
+        format!(
+            "could not decode {path}: the file ends before the layout does ({e}). This usually means the database was written by tqdb 0.8.3 or earlier — 0.8.4 changed the dense Haar QR rotation matrix from f32 to bf16 on disk, and the two layouts are not interchangeable. Regenerate the database from its source vectors; see the \"Migration\" section of CHANGELOG 0.8.4. If it was written by 0.8.4 or later, the file is truncated and should be restored from a backup."
+        )
+    } else {
+        format!(
+            "could not decode {path}: {e}. The file is not a valid quantizer state — restore it from a backup, or regenerate the database from its source vectors."
+        )
+    }
 }
 
 fn load_quantizer_state(
