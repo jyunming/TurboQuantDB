@@ -24,12 +24,16 @@ class Database:
         bits: int = 4,
         seed: int = 42,
         metric: str = "ip",
-        rerank: bool = True,
-        fast_mode: bool = False,
+        rerank: bool = False,
+        fast_mode: bool = True,
         rerank_precision: str | None = None,
         collection: str | None = None,
         wal_flush_threshold: int | None = None,
         normalize: bool = False,
+        quantizer_type: str | None = None,
+        text_language: str | None = None,
+        stopwords: List[str] | None = None,
+        split_on_punctuation: bool | None = None,
     ) -> Database:
         """Open or create a database at *path*.
 

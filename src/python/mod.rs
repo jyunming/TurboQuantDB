@@ -10,6 +10,7 @@ use crate::storage::engine::{
     BatchWriteItem, BatchWriteMode, DistanceMetric, GetResult, Manifest, RerankPrecision,
     TurboQuantEngine,
 };
+use crate::storage::tokenizer::AnalyzerConfig;
 
 /// Thread-safe handle to a TurboQuantDB database.
 ///
@@ -72,6 +73,22 @@ impl Database {
     ///           power-of-two of d. O(d log d) ingest; pads to the next pow2
     ///           in storage at non-pow2 d.
     ///         See `docs/QUANTIZER_MODES.md` for a full CPU/RAM/disk/recall comparison.
+    ///     text_language: Language for BM25 text analysis — Snowball stemming plus the
+    ///         bundled stopword list. ``"english"`` (default for a new database),
+    ///         ``"french"``, ``"german"``, ``"spanish"``, ``"portuguese"``, and the
+    ///         other Snowball languages; ``"none"`` disables stemming and stopwords
+    ///         (the pre-0.9 behaviour). Stemming is what makes ``"running shoes"``
+    ///         match a document about ``"run shoe"``.
+    ///     stopwords: Words to drop from documents and queries, replacing the bundled
+    ///         list for ``text_language``. Pass ``[]`` to keep every token.
+    ///     split_on_punctuation: When ``True`` (default) any non-alphanumeric character
+    ///         splits tokens. ``False`` splits on whitespace only, keeping ``foo-bar``
+    ///         and ``error_code`` as single tokens.
+    ///
+    ///     The three text options are persisted in ``manifest.json``. Passing a
+    ///     different value on reopen re-analyses the stored documents, so the BM25
+    ///     index always matches the settings in force; omit them to keep whatever the
+    ///     database was created with.
     ///
     /// Returns:
     ///     An open :class:`Database` instance.
@@ -84,7 +101,8 @@ impl Database {
     ///     # Equivalent cosine-via-IP with auto-normalization:
     ///     db = Database.open("mydb", dimension=1536, bits=4, metric="ip", normalize=True)
     #[staticmethod]
-    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=false, fast_mode=true, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None))]
+    #[pyo3(signature = (path, dimension=None, bits=4, seed=42, metric="ip", rerank=false, fast_mode=true, rerank_precision=None, collection=None, wal_flush_threshold=None, normalize=false, quantizer_type=None, text_language=None, stopwords=None, split_on_punctuation=None))]
+    #[allow(clippy::too_many_arguments)]
     fn open(
         path: String,
         dimension: Option<usize>,
@@ -98,6 +116,9 @@ impl Database {
         wal_flush_threshold: Option<usize>,
         normalize: bool,
         quantizer_type: Option<String>,
+        text_language: Option<String>,
+        stopwords: Option<Vec<String>>,
+        split_on_punctuation: Option<bool>,
     ) -> PyResult<Self> {
         let engine_path = match collection {
             Some(col) if !col.is_empty() => {
@@ -244,6 +265,27 @@ impl Database {
                 ));
             }
         }
+        // Only build an analyzer when the caller actually asked for one: passing
+        // None lets a reopened database keep the analyzer recorded in its manifest
+        // instead of silently reverting it to the default and reindexing.
+        let analyzer =
+            if text_language.is_some() || stopwords.is_some() || split_on_punctuation.is_some() {
+                let mut cfg = AnalyzerConfig::default();
+                if let Some(lang) = text_language {
+                    cfg.language = lang;
+                }
+                if let Some(words) = stopwords {
+                    cfg.stopwords = Some(words);
+                }
+                if let Some(split) = split_on_punctuation {
+                    cfg.split_on_punctuation = split;
+                }
+                cfg.validate()
+                    .map_err(pyo3::exceptions::PyValueError::new_err)?;
+                Some(cfg)
+            } else {
+                None
+            };
         let engine = TurboQuantEngine::open_with_options(
             &engine_path,
             &engine_path,
@@ -257,6 +299,7 @@ impl Database {
             wal_flush_threshold,
             normalize,
             quantizer_type,
+            analyzer,
         )
         .map_err(to_py_runtime)?;
         Ok(Self {

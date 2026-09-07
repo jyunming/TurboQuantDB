@@ -256,6 +256,43 @@ files can be resized, moved or deleted as soon as it returns. This matters most
 on Windows, where a live mapping makes a resize fail with `[Errno 22]` /
 os error 1224.
 
+### Text analysis for BM25
+
+The sparse leg analyses text before indexing it: split, lowercase, drop stopwords,
+then stem. Stemming is what lets a query for "running shoes" retrieve a document that
+says "run shoe"; stopwords keep terms like "the" from matching everything.
+
+```python
+db = Database.open(
+    "./my_db",
+    dimension=1536,
+    text_language="english",     # Snowball stemming + bundled stopword list (default)
+    stopwords=None,              # replace the bundled list; [] keeps every token
+    split_on_punctuation=True,   # False splits on whitespace only ("error-code" stays whole)
+)
+```
+
+`text_language` accepts `english`, `french`, `german`, `spanish`, `portuguese`,
+`italian`, `dutch`, `swedish`, `norwegian`, `danish`, `russian`, or `"none"` to
+disable stemming and stopwords entirely (the pre-0.9 behaviour). The first five ship
+a bundled stopword list; the others stem only unless you pass `stopwords=`.
+
+All three settings are recorded in `manifest.json`, because postings are only
+meaningful to a query analysed the same way. Passing a different value on reopen
+re-analyses the documents already stored; omitting them keeps whatever the database
+was created with. A database created before 0.9 has no analyzer recorded, so its
+first 0.9 open re-analyses it once — BM25 only, the dense index is untouched.
+
+Measured on BEIR/scifact (5,183 documents, 300 judged queries, BM25 only):
+
+| analyzer | R@10 | query p50 |
+|---|---:|---:|
+| pre-0.9: split + lowercase | 0.7729 | 1.50 ms |
+| stemming only | 0.7876 | 1.47 ms |
+| **0.9 default: stemming + stopwords** | **0.8083** | **0.79 ms** |
+
+Reproduce with `python benchmarks/bench_bm25_beir.py`.
+
 ### Explaining a hybrid ranking
 
 `search(..., hybrid={...})` returns only the fused score, which makes tuning `weight`

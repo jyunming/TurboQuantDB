@@ -17,6 +17,7 @@ use super::live_codes::LiveCodesFile;
 use super::metadata::{MetadataStore, VectorMetadata};
 use super::rrf::{DEFAULT_RRF_K, DEFAULT_RRF_OVERSAMPLE, rrf_fuse};
 use super::segment::{SegmentManager, SegmentRecord};
+use super::tokenizer::AnalyzerConfig;
 use super::wal::{Wal, WalEntry};
 use crate::quantizer::CodeIndex;
 use crate::quantizer::prod::ProdQuantizer;
@@ -214,6 +215,12 @@ pub struct Manifest {
     /// Persisted so reopened DBs load the correct `quantizer.bin`.
     #[serde(default)]
     pub quantizer_type: String,
+    /// How document and query text is analysed for BM25 (stemming, stopwords,
+    /// tokenizer split). Absent in pre-0.9 manifests, where the analyzer was
+    /// always plain split+lowercase. Persisted because postings are only
+    /// meaningful to a query analysed the same way.
+    #[serde(default)]
+    pub analyzer: Option<AnalyzerConfig>,
 }
 
 fn default_rerank_enabled() -> bool {
@@ -486,6 +493,7 @@ impl TurboQuantEngine {
         };
         Self::open_with_options(
             uri, local_dir, d, b, seed, metric, rerank, fast_mode, precision, None, false, None,
+            None,
         )
     }
 
@@ -502,15 +510,22 @@ impl TurboQuantEngine {
         wal_flush_threshold: Option<usize>,
         normalize: bool,
         quantizer_type: Option<String>,
+        analyzer: Option<AnalyzerConfig>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(local_dir)?;
+        // Validate before anything is created on disk: an unknown language should
+        // not leave a half-initialised store behind.
+        let requested_analyzer = analyzer.clone().unwrap_or_default();
+        requested_analyzer
+            .validate()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let manifest_path = format!("{}/manifest.json", local_dir);
         let wal_path = format!("{}/wal.log", local_dir);
         let metadata_path = format!("{}/metadata.bin", local_dir);
 
         let backend = Arc::new(StorageBackend::from_uri(uri)?);
 
-        let (manifest, quantizer) = if Path::new(&manifest_path).exists() {
+        let (mut manifest, quantizer) = if Path::new(&manifest_path).exists() {
             let m = Manifest::load(&manifest_path)?;
             if m.d != d {
                 return Err(format!(
@@ -589,6 +604,7 @@ impl TurboQuantEngine {
                 rerank_precision,
                 normalize,
                 quantizer_type: qt.to_string(),
+                analyzer: Some(requested_analyzer.clone()),
             };
             save_quantizer_state(local_dir, &backend, &q)?;
             m.save(&manifest_path)?;
@@ -611,7 +627,26 @@ impl TurboQuantEngine {
         let segments = SegmentManager::open(backend.clone())?;
         let metadata = MetadataStore::open(&metadata_path)?;
         let bm25_path = Path::new(local_dir).join("bm25.idx");
-        let mut bm25 = Bm25Index::open(bm25_path)?;
+        // A caller-supplied analyzer wins over the stored one — that is how a user
+        // changes language or stopwords — but it has to be recorded, because the
+        // postings are only meaningful to a query analysed the same way. Pre-0.9
+        // manifests carry no analyzer at all; those indexes were plain
+        // split+lowercase, and `Bm25Index::open` drops postings that disagree with
+        // the configuration in force, which lets the rebuild below repopulate them.
+        let effective_analyzer = analyzer
+            .clone()
+            .or_else(|| manifest.analyzer.clone())
+            .unwrap_or_default();
+        effective_analyzer
+            .validate()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let analyzer_changed = manifest.analyzer.as_ref() != Some(&effective_analyzer);
+        if analyzer_changed {
+            manifest.analyzer = Some(effective_analyzer.clone());
+            manifest.save(&manifest_path)?;
+            backend.write("manifest.json", &serde_json::to_vec_pretty(&manifest)?)?;
+        }
+        let mut bm25 = Bm25Index::open(bm25_path, effective_analyzer.clone())?;
         // Cold-start fallback: if the sidecar was missing/corrupt but the metadata
         // store already has documents (e.g. an upgrade from a pre-BM25 release),
         // rebuild from those docs. After `Database.open()` returns, BM25 is always
@@ -3442,6 +3477,7 @@ impl TurboQuantEngine {
             RerankPrecision::Disabled,
             None,
             false,
+            None,
             None,
         )
     }
