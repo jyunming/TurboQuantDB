@@ -23,5 +23,6 @@ pub mod live_codes;
 pub mod metadata;
 pub mod rrf;
 pub mod segment;
+pub mod stopwords;
 pub mod tokenizer;
 pub mod wal;

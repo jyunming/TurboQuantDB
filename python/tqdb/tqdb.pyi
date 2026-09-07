@@ -30,6 +30,10 @@ class Database:
         collection: str | None = None,
         wal_flush_threshold: int | None = None,
         normalize: bool = False,
+        quantizer_type: str | None = None,
+        text_language: str | None = None,
+        stopwords: List[str] | None = None,
+        split_on_punctuation: bool | None = None,
     ) -> Database:
         """Open or create a database at *path*.
 

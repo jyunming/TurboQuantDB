@@ -203,6 +203,12 @@ results = db.search(
 
 Omit `hybrid=` for pure dense search — behaviour is unchanged. The BM25 index builds incrementally as documents are inserted; no separate `train()` or `build_text_index()` call required.
 
+Text is analysed before indexing — Snowball stemming plus a stopword list — so "running shoes" retrieves a document that says "run shoe". On BEIR/scifact that lifts BM25 recall@10 from 0.773 to 0.808 and halves query latency (stopwords remove the highest-frequency postings). Configure or disable it at open time:
+
+```python
+db = Database.open("./my_db", dimension=1536, text_language="german")   # or "none"
+```
+
 Tuning `weight` blind is guesswork, so `explain()` returns the same ranking with each retriever's own verdict attached — which leg found the document, and where it placed it:
 
 ```python

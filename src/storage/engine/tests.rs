@@ -327,6 +327,7 @@ fn f16_rerank_precision_stores_and_retrieves_vectors() {
         None,
         false,
         None,
+        None,
     )
     .unwrap();
     let mut v = vec![0.0f64; d];
@@ -360,6 +361,7 @@ fn f16_roundtrip_within_half_precision_tolerance() {
         RerankPrecision::F16,
         None,
         false,
+        None,
         None,
     )
     .unwrap();
@@ -402,6 +404,7 @@ fn int8_rerank_stores_and_retrieves_vectors() {
         None,
         false,
         None,
+        None,
     )
     .unwrap();
     let v: Vec<f64> = (1..=d).map(|i| i as f64 * 0.1).collect();
@@ -442,6 +445,7 @@ fn int8_rerank_returns_correct_nearest_neighbour() {
         RerankPrecision::Int8,
         None,
         false,
+        None,
         None,
     )
     .unwrap();
@@ -486,6 +490,7 @@ fn int4_rerank_stores_and_retrieves_vectors() {
         None,
         false,
         None,
+        None,
     )
     .unwrap();
     let v: Vec<f64> = (1..=d).map(|i| i as f64 * 0.1).collect();
@@ -527,6 +532,7 @@ fn int4_rerank_odd_dimension_packing() {
         None,
         false,
         None,
+        None,
     )
     .unwrap();
     let v: Vec<f64> = vec![0.5, -0.3, 0.8, -0.1, 0.6, -0.4, 0.2, -0.7, 0.9];
@@ -563,6 +569,7 @@ fn residual_int4_rerank_roundtrip() {
         RerankPrecision::ResidualInt4,
         None,
         false,
+        None,
         None,
     )
     .unwrap();
@@ -607,6 +614,7 @@ fn residual_int4_record_size_matches_int4() {
         None,
         false,
         None,
+        None,
     )
     .unwrap();
     // d=32 → (32+1)/2 + 4 = 16 + 4 = 20 bytes per slot
@@ -635,6 +643,7 @@ fn residual_int4_reload_preserves_recall() {
             None,
             false,
             None,
+            None,
         )
         .unwrap();
         e.insert("v1".into(), &Array1::from_vec(v.clone()), no_meta())
@@ -653,6 +662,7 @@ fn residual_int4_reload_preserves_recall() {
         RerankPrecision::ResidualInt4,
         None,
         false,
+        None,
         None,
     )
     .unwrap();
@@ -918,6 +928,7 @@ fn disabled_rerank_search_returns_results() {
         None,
         false,
         None,
+        None,
     )
     .unwrap();
     for i in 0..5u32 {
@@ -1073,6 +1084,7 @@ fn l2_index_without_rerank_uses_dequantized_path() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
         None,
     )
     .unwrap();
@@ -1316,6 +1328,7 @@ fn delete_triggers_wal_flush_at_threshold() {
         Some(100),
         false,
         None,
+        None,
     )
     .unwrap();
     for i in 0..100 {
@@ -1373,6 +1386,7 @@ fn f16_rerank_cosine_ann_index_covers_f16_build_scorer_paths() {
         None,
         false,
         None,
+        None,
     )
     .unwrap();
     for i in 0..30u32 {
@@ -1409,6 +1423,7 @@ fn f16_rerank_ip_ann_index_covers_f16_ip_build_scorer_path() {
         RerankPrecision::F16,
         None,
         false,
+        None,
         None,
     )
     .unwrap();
@@ -1448,6 +1463,7 @@ fn l2_ann_index_without_raw_vectors_uses_precomputed_l2_path() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
         None,
     )
     .unwrap();
@@ -1494,6 +1510,7 @@ fn l2_exhaustive_search_with_raw_f32_vectors_reranks_correctly() {
         RerankPrecision::F32,
         None,
         false,
+        None,
         None,
     )
     .unwrap();
@@ -1573,6 +1590,7 @@ fn l2_exhaustive_rerank_without_raw_vectors_uses_dequant_path() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
         None,
     )
     .unwrap();
@@ -2065,6 +2083,7 @@ fn cosine_ann_rerank_without_raw_vecs_uses_deq_path() {
         RerankPrecision::Disabled, // no raw vecs → live_vraw=None
         None,
         false,
+        None,
         None,
     )
     .unwrap();

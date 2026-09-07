@@ -29,7 +29,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::storage::tokenizer::tokenize;
+use crate::storage::tokenizer::{AnalyzerConfig, TextAnalyzer};
 
 const IDX_MAGIC: &[u8; 4] = b"M2BX";
 
@@ -43,6 +43,12 @@ pub const DEFAULT_B: f32 = 0.75;
 /// are added (`#[serde(default)]` on additions keeps old files readable).
 #[derive(Serialize, Deserialize, Default)]
 struct Bm25Snapshot {
+    /// Analyzer the postings were produced with. `None` marks a pre-0.9 index,
+    /// which was always plain split+lowercase. Postings are only meaningful to a
+    /// query analysed the same way, so the engine rebuilds when this disagrees
+    /// with the configuration it was opened with.
+    #[serde(default)]
+    analyzer: Option<AnalyzerConfig>,
     /// token hash → sorted Vec<(slot, term_freq)>.
     postings: HashMap<u64, Vec<(u32, u32)>>,
     /// slot → total token count for that doc (used for length normalization).
@@ -58,12 +64,20 @@ pub struct Bm25Index {
     dirty: bool,
     k1: f32,
     b: f32,
+    analyzer: TextAnalyzer,
 }
 
 impl Bm25Index {
-    /// Open or create the index at `idx_path`. Missing files yield an empty index.
-    pub fn open(idx_path: PathBuf) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let snap = if idx_path.exists() {
+    /// Open or create the index at `idx_path`, analysing text with `config`.
+    ///
+    /// Missing files yield an empty index. A stored index whose analyzer differs
+    /// from `config` is discarded: its postings answer a different question, and
+    /// the engine rebuilds from the documents it still holds.
+    pub fn open(
+        idx_path: PathBuf,
+        config: AnalyzerConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let mut snap = if idx_path.exists() {
             match Self::load(&idx_path) {
                 Ok(s) => s,
                 Err(_) => Bm25Snapshot::default(), // corrupt → treat as empty; engine will rebuild
@@ -71,13 +85,26 @@ impl Bm25Index {
         } else {
             Bm25Snapshot::default()
         };
+        // `None` is a pre-0.9 index: plain split+lowercase, so it only survives if
+        // that is exactly what was asked for.
+        let stored = snap.analyzer.clone().unwrap_or_else(AnalyzerConfig::plain);
+        if stored != config {
+            snap = Bm25Snapshot::default();
+        }
+        snap.analyzer = Some(config.clone());
         Ok(Self {
             idx_path,
             snap,
             dirty: false,
             k1: DEFAULT_K1,
             b: DEFAULT_B,
+            analyzer: TextAnalyzer::new(config),
         })
+    }
+
+    /// The analyzer configuration this index reads and writes with.
+    pub fn analyzer_config(&self) -> &AnalyzerConfig {
+        self.analyzer.config()
     }
 
     pub fn n_docs(&self) -> u32 {
@@ -105,7 +132,7 @@ impl Bm25Index {
         // covers both "first put" and "update" cases.
         self.delete(slot);
 
-        let tokens = tokenize(text);
+        let tokens = self.analyzer.analyze(text);
         if tokens.is_empty() {
             return;
         }
@@ -188,7 +215,7 @@ impl Bm25Index {
         let avgdl = self.avg_doc_len().max(1.0);
         let n_f = n as f32;
 
-        let q_tokens = tokenize(query);
+        let q_tokens = self.analyzer.analyze(query);
         if q_tokens.is_empty() {
             return Vec::new();
         }
@@ -299,7 +326,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn open_empty(dir: &std::path::Path) -> Bm25Index {
-        Bm25Index::open(dir.join("bm25.idx")).unwrap()
+        Bm25Index::open(dir.join("bm25.idx"), AnalyzerConfig::plain()).unwrap()
     }
 
     #[test]
@@ -423,7 +450,7 @@ mod tests {
         let p = d.path().join("bm25.idx");
         std::fs::write(&p, b"garbage").unwrap();
         // Should not panic; should yield an empty index.
-        let idx = Bm25Index::open(p).unwrap();
+        let idx = Bm25Index::open(p, AnalyzerConfig::plain()).unwrap();
         assert_eq!(idx.n_docs(), 0);
     }
 
@@ -440,7 +467,7 @@ mod tests {
         // Final file does NOT exist yet — this simulates the dead-process state.
         assert!(!final_path.exists());
 
-        let idx = Bm25Index::open(final_path.clone()).unwrap();
+        let idx = Bm25Index::open(final_path.clone(), AnalyzerConfig::plain()).unwrap();
         assert_eq!(
             idx.n_docs(),
             0,
@@ -471,7 +498,7 @@ mod tests {
         bytes.extend_from_slice(b"abcd");
         std::fs::write(&p, &bytes).unwrap();
 
-        let idx = Bm25Index::open(p).unwrap();
+        let idx = Bm25Index::open(p, AnalyzerConfig::plain()).unwrap();
         assert_eq!(idx.n_docs(), 0);
     }
 
@@ -551,5 +578,98 @@ mod tests {
         let r = idx.search("alpha", 10, None);
         assert_eq!(r.len(), 1);
         assert!(r[0].1.is_finite(), "score must be finite, got {}", r[0].1);
+    }
+}
+
+#[cfg(test)]
+mod analyzer_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn english() -> AnalyzerConfig {
+        AnalyzerConfig::default()
+    }
+
+    #[test]
+    fn stemming_makes_inflections_retrievable() {
+        let dir = tempdir().unwrap();
+        let mut idx = Bm25Index::open(dir.path().join("bm25.idx"), english()).unwrap();
+        idx.put(0, "We sell a comfortable run shoe for athletes");
+        idx.put(1, "Waterproof hiking boots and jackets");
+
+        let hits = idx.search("running shoes", 10, None);
+        assert_eq!(hits.len(), 1, "only the shoe document should match");
+        assert_eq!(hits[0].0, 0);
+    }
+
+    #[test]
+    fn stopwords_do_not_match_documents() {
+        let dir = tempdir().unwrap();
+        let mut idx = Bm25Index::open(dir.path().join("bm25.idx"), english()).unwrap();
+        idx.put(0, "the quick brown fox");
+        // "the" is a bundled stopword: it is in no posting list, so a query made
+        // only of stopwords retrieves nothing rather than the whole corpus.
+        assert!(idx.search("the", 10, None).is_empty());
+        assert_eq!(idx.search("quick", 10, None).len(), 1);
+    }
+
+    #[test]
+    fn reopening_with_a_different_analyzer_drops_stale_postings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bm25.idx");
+
+        let mut idx = Bm25Index::open(path.clone(), AnalyzerConfig::plain()).unwrap();
+        idx.put(0, "running shoes");
+        idx.flush().unwrap();
+        assert_eq!(idx.n_docs(), 1);
+
+        // Postings hashed by a different analyzer answer a different question, so
+        // the index comes back empty and the engine rebuilds it from the documents.
+        let reopened = Bm25Index::open(path.clone(), english()).unwrap();
+        assert_eq!(reopened.n_docs(), 0, "stale postings must not survive");
+
+        // Same config: the index is reused as-is.
+        let same = Bm25Index::open(path, AnalyzerConfig::plain()).unwrap();
+        assert_eq!(same.n_docs(), 1);
+    }
+
+    #[test]
+    fn pre_0_9_index_without_analyzer_is_treated_as_plain() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bm25.idx");
+
+        // Write a snapshot the way a pre-0.9 release would: no analyzer recorded.
+        let mut idx = Bm25Index::open(path.clone(), AnalyzerConfig::plain()).unwrap();
+        idx.put(0, "running shoes");
+        idx.snap.analyzer = None;
+        idx.dirty = true;
+        idx.flush().unwrap();
+
+        // Opening it as plain keeps the postings; opening it as English discards them.
+        assert_eq!(
+            Bm25Index::open(path.clone(), AnalyzerConfig::plain())
+                .unwrap()
+                .n_docs(),
+            1
+        );
+        assert_eq!(Bm25Index::open(path, english()).unwrap().n_docs(), 0);
+    }
+
+    #[test]
+    fn analyzer_config_is_persisted_in_the_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bm25.idx");
+        let cfg = AnalyzerConfig {
+            language: "french".into(),
+            stopwords: Some(vec!["le".into()]),
+            split_on_punctuation: false,
+        };
+        let mut idx = Bm25Index::open(path.clone(), cfg.clone()).unwrap();
+        idx.put(0, "le cheval");
+        idx.flush().unwrap();
+
+        let reopened = Bm25Index::open(path, cfg.clone()).unwrap();
+        assert_eq!(reopened.analyzer_config(), &cfg);
+        assert_eq!(reopened.n_docs(), 1);
     }
 }

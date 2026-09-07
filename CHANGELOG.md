@@ -6,13 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+---
+
+## [0.9.0] — 2026-09-07
+
 ### Added
 
+- **Production-grade BM25 text analysis.** Documents and queries now go through a configurable analyzer — split, lowercase, drop stopwords, stem — instead of raw split+lowercase. Snowball stemming ships for English, French, German, Spanish, Portuguese, Italian, Dutch, Swedish, Norwegian, Danish and Russian, with bundled stopword lists for the first five. Configure it at open time with `text_language=`, `stopwords=` and `split_on_punctuation=`; `text_language="none"` restores the previous behaviour. On BEIR/scifact (5,183 docs, 300 judged queries) BM25 recall@10 goes from 0.773 to 0.808 (+4.6%) and query p50 halves from 1.50 ms to 0.79 ms, because stopwords remove the highest-frequency posting lists. Reproduce with `benchmarks/bench_bm25_beir.py`.
 - **`tqdb.open(path, dimension)`** — a zero-configuration entry point next to `Database.open`. Defaults (`bits=4`, `metric="ip"`, `fast_mode=True`) cover the common case, and reopening an existing store senses every parameter from its `manifest.json`, so `dimension` can be omitted. `Database.open`'s signature is untouched; `tqdb.open` forwards every keyword to it.
 - **`db.explain(query, text, ...)`** — the hybrid ranking with each retriever's verdict attached: `dense_score`, `dense_rank`, `sparse_score`, `sparse_rank` and the `fused_score`, per result. Ordering and fused scores are identical to `search(..., hybrid={...})` with the same arguments — `search_hybrid` is now a projection of the same code path — so the breakdown always explains the ranking you actually get. A `None` score/rank means that leg never surfaced the document.
 
 ### Changed
 
+- **The BM25 index is re-analysed once when the analyzer changes.** The analyzer is recorded in `manifest.json` and in `bm25.idx`; opening a database with different text settings — including a pre-0.9 database, which recorded none — rebuilds the sparse index from the documents already stored. Hybrid results change accordingly (for the better, per the BEIR numbers above); dense search, vectors and metadata are untouched, and no re-ingest is required.
 - **Releases now require a benchmark history entry.** `benchmarks/perf_history.json` is appended by a local `TQDB_TRACK=1` benchmark run, and nothing enforced that it happened — v0.8.4 shipped with no entry at all, leaving a four-month hole in the trend data. The release workflow now refuses to publish a version that has no entry (pre-releases exempt). Wheels are also measured against the 5 MiB budget there, so every published artifact is checked in one place.
 
 ### Fixed

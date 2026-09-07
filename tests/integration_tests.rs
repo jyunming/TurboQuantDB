@@ -875,6 +875,7 @@ fn test_rerank_disabled_behavior() {
         None,
         false,
         None,
+        None,
     )
     .unwrap();
 
@@ -969,6 +970,7 @@ fn test_rerank_precision_f16_roundtrip() {
         None,
         false,
         None,
+        None,
     )
     .unwrap();
 
@@ -1031,6 +1033,7 @@ fn test_rerank_precision_f32_file_size() {
         None,
         false,
         None,
+        None,
     )
     .unwrap();
 
@@ -1087,6 +1090,7 @@ fn test_rerank_precision_f16_vs_f32_size_ratio() {
             None,
             false,
             None,
+            None,
         )
         .unwrap();
 
@@ -1139,6 +1143,7 @@ fn test_rerank_precision_disabled_no_file() {
         RerankPrecision::Disabled,
         None,
         false,
+        None,
         None,
     )
     .unwrap();
